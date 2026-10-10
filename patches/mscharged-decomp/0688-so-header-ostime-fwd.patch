@@ -1,0 +1,24 @@
+Subject: Declare only the OS time types in so.h
+Upstream-base: f75ccf1ad20e5bd7585962990db08067c0ae498a
+
+so.h needs OSTime only for the SOPoll timeout. OSTime.h also includes
+OSHardware.h, whose native OSContext and OSThread headers forward to
+Aurora's <dolphin/os/...>. A host translation unit that only wants the
+SO declarations, such as the socket backend, then needs Aurora's
+prepared headers and fails without them ('dolphin/os/OSContext.h' file
+not found). OSTime_fwd.h declares the time types alone; the SO
+declarations are unchanged.
+
+diff --git a/libs/RVL_SDK/include/revolution/so.h b/libs/RVL_SDK/include/revolution/so.h
+index 6a7dbdd..18cacb2 100644
+--- a/libs/RVL_SDK/include/revolution/so.h
++++ b/libs/RVL_SDK/include/revolution/so.h
+@@ -3,7 +3,7 @@
+ #include <revolution/types.h>
+ #include <revolution/so_fwd.h>
+ 
+-#include <revolution/os/OSTime.h>
++#include <revolution/os/OSTime_fwd.h>
+ 
+ #ifdef __cplusplus
+ extern "C" {
