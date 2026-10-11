@@ -7,8 +7,11 @@ the LAN session and pushes the original lobby (scene 24, NetworkStartScene)
 instead of the DWC login; its back button shuts the session down and returns
 to Main Menu. The lobby and the two network draft scenes leave their gated
 blocks, split only at case boundaries; hub, login, Mii selection and every
-DWC scene keep their gates. After a LAN match the frontend returns to Main
-Menu like a friendly match instead of pushing the unadmitted online hub.
+DWC scene keep their gates. The LAN session starts ranked matches, but
+without a stats server or the online ranking overlay (scene 93): after each
+game the post-game results continue the series directly, like an unranked
+network game, and a finished series returns to Main Menu like a friendly
+match instead of pushing the unadmitted online hub.
 
 The admission prints the original DC_NETWORK debug channel to stderr.
 SHOnlinePlayerCount's button context words are narrowed through
@@ -210,3 +213,25 @@ index 3f58812..bd8adbd 100644
      switch (item)
      {
      case ButtonOneLocalPlayer:
+diff --git a/src/Game/SH/SHPausePostGame.cpp b/src/Game/SH/SHPausePostGame.cpp
+index 3cd4e11..43263a9 100644
+--- a/src/Game/SH/SHPausePostGame.cpp
++++ b/src/Game/SH/SHPausePostGame.cpp
+@@ -210,6 +210,17 @@ void PausePostGameScene::OnDoneTransitionComplete()
+                 FEPopupMenu* popup = static_cast<FEPopupMenu*>(g_pOverlayManager->Push(SCENE_POPUP_MENU, SCREEN_NOTHING, false));
+                 popup->Create(POPUP_E3_THANKS_FOR_PLAYING, Function<FnVoidVoid>(OnSelectQuit));
+             }
++#if defined(MSCHARGED_NATIVE) && defined(MSCHARGED_DIAGNOSTIC_FRONTEND_LAN)
++            else if (mIsNetworkGame && IsOnlineRankedMatch()
++                     && g_pNetworkSession->GetSessionMode() != NET_MODE_ONLINE)
++            {
++                // The LAN admission starts ranked matches but has no stats
++                // server or ranking overlay: continue the series the way an
++                // unranked network game does.
++                g_pOverlayManager->Pop();
++                ContinuePostGame(mIsNetworkGame);
++            }
++#endif
+             else if (mIsNetworkGame && IsOnlineRankedMatch())
+             {
+                 SetPointerEnabled(true);

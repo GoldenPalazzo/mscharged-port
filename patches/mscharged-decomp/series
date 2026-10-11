@@ -495,3 +495,4 @@
 0691-clear-native-variant-data.patch
 0692-read-native-physics-event-data.patch
 0693-trace-lockstep-divergence.patch
+0694-convert-native-time-up-checks.patch
