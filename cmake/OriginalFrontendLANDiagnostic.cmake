@@ -39,7 +39,9 @@ function(mscharged_select_original_frontend_lan target)
             src/Game/SH/SHNetworkStart.cpp
             src/Game/SH/SHOnlineFriendsDraft.cpp
             # InitializeOnlineMatch, which prepares the match for the lobby
-            src/Game/SH/SHOnlinePlayerCount.cpp)
+            src/Game/SH/SHOnlinePlayerCount.cpp
+            # UpdateOnlinePlayerRow, which both draft scenes call when created
+            src/Game/FE/feOnlinePlayerRow.cpp)
         set(_source "${MSCHARGED_PREPARED}/${_relative}")
         if(NOT _source IN_LIST _lan_known)
             target_sources("${target}" PRIVATE "${_source}")
