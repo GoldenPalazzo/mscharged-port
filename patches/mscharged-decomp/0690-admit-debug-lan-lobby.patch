@@ -6,10 +6,10 @@ online ones.
 Fixed some casts to u32 pointers.
 
 diff --git a/include/Game/NetworkRandomSeed.h b/include/Game/NetworkRandomSeed.h
-index 7df5bec..859a44a 100644
+index 7df5bec..61207e8 100644
 --- a/include/Game/NetworkRandomSeed.h
 +++ b/include/Game/NetworkRandomSeed.h
-@@ -9,4 +9,12 @@ u32 GetNetworkRandomSeed();
+@@ -9,4 +9,13 @@ u32 GetNetworkRandomSeed();
  void SetNetworkRandomSeed(u32 seed);
  void OnInputSessionReset();
  
@@ -19,6 +19,7 @@ index 7df5bec..859a44a 100644
 +void TraceNetworkFrame(u32 frame);
 +void TraceNetworkFloats(const char* label, int index, const float* values, int count);
 +void TraceNetworkWords(const char* label, int index, const u32* values, int count);
++void TraceNetworkStack(const char* label);
 +#endif
 +
  #endif // GAME_NETWORK_RANDOM_SEED_H
@@ -58,7 +59,7 @@ index 11f42ad..8b3a9c2 100644
  }
  
 diff --git a/src/Game/AI/Scripts/FuzzyAIRuntime_interp.cpp b/src/Game/AI/Scripts/FuzzyAIRuntime_interp.cpp
-index cf12415..ae47fd1 100644
+index cf12415..0c9b450 100644
 --- a/src/Game/AI/Scripts/FuzzyAIRuntime_interp.cpp
 +++ b/src/Game/AI/Scripts/FuzzyAIRuntime_interp.cpp
 @@ -14,6 +14,9 @@
@@ -71,13 +72,16 @@ index cf12415..ae47fd1 100644
  extern "C" unsigned long FuzzyAIStringHash(const char* value)
  {
      return nlStringHash(value);
-@@ -3132,6 +3135,10 @@ void FuzzyAIRuntime::DoFunctionCall(unsigned int function)
+@@ -3132,6 +3135,13 @@ void FuzzyAIRuntime::DoFunctionCall(unsigned int function)
          nlBreak();
          break;
      }
 +#if defined(MSCHARGED_NATIVE) && defined(MSCHARGED_DIAGNOSTIC_FRONTEND_LAN)
 +    // Every AI script question and its result word, for the lockstep trace
 +    TraceNetworkWords("fn", (int)function, &m_SP[-1], 1);
++    // BeginActionQueue opens each script block: record who runs the script
++    if (function == 149)
++        TraceNetworkStack("fnstack");
 +#endif
  }
  
@@ -209,10 +213,10 @@ index e75c20b..a60c978 100644
      SendPlayerVisibility();
      UpdateCachedGameData(fDeltaT);
 diff --git a/src/Game/NetworkRandomSeed.cpp b/src/Game/NetworkRandomSeed.cpp
-index d5d2128..07be9cc 100644
+index d5d2128..99451e4 100644
 --- a/src/Game/NetworkRandomSeed.cpp
 +++ b/src/Game/NetworkRandomSeed.cpp
-@@ -2,6 +2,86 @@
+@@ -2,6 +2,106 @@
  
  #include "NL/nlMath.h"
  
@@ -276,6 +280,26 @@ index d5d2128..07be9cc 100644
 +    std::fputc('\n', trace);
 +}
 +
++// The module offsets of the code that called the caller of this function
++__attribute__((noinline)) void TraceNetworkStack(const char* label)
++{
++    FILE* trace = NetworkTraceFile();
++    if (trace == 0)
++        return;
++    void* frames[12];
++    int count = backtrace(frames, 12);
++    std::fprintf(trace, "%s", label);
++    for (int i = 2; i < count; ++i)
++    {
++        Dl_info info;
++        unsigned long offset = 0;
++        if (dladdr(frames[i], &info) && info.dli_fbase != 0)
++            offset = (unsigned long)((char*)frames[i] - (char*)info.dli_fbase);
++        std::fprintf(trace, " 0x%lx", offset);
++    }
++    std::fputc('\n', trace);
++}
++
 +static void TraceNetworkRandom(const char* kind, u32 range, u32 before, u32 after)
 +{
 +    FILE* sTrace = NetworkTraceFile();
@@ -299,7 +323,7 @@ index d5d2128..07be9cc 100644
  u32 gNetworkRandomSeed = 0x12345678;
  
  u32 GetNetworkRandomSeed()
-@@ -11,6 +91,9 @@ u32 GetNetworkRandomSeed()
+@@ -11,6 +111,9 @@ u32 GetNetworkRandomSeed()
  
  void SetNetworkRandomSeed(u32 seed)
  {
@@ -309,7 +333,7 @@ index d5d2128..07be9cc 100644
      gNetworkRandomSeed = seed;
  }
  
-@@ -20,10 +103,24 @@ void OnInputSessionReset()
+@@ -20,10 +123,24 @@ void OnInputSessionReset()
  
  u32 nlRandom(u32 range)
  {
