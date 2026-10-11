@@ -493,4 +493,5 @@
 0689-change-debug-lan-ports.patch
 0690-admit-debug-lan-lobby.patch
 0691-clear-native-variant-data.patch
-0692-read-native-shell-and-egg-end-events.patch
+0692-read-native-physics-event-data.patch
+0693-trace-lockstep-divergence.patch
