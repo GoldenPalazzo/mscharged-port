@@ -57,6 +57,31 @@ index 11f42ad..8b3a9c2 100644
      return channel;
  }
  
+diff --git a/src/Game/AI/Scripts/FuzzyAIRuntime_interp.cpp b/src/Game/AI/Scripts/FuzzyAIRuntime_interp.cpp
+index cf12415..ae47fd1 100644
+--- a/src/Game/AI/Scripts/FuzzyAIRuntime_interp.cpp
++++ b/src/Game/AI/Scripts/FuzzyAIRuntime_interp.cpp
+@@ -14,6 +14,9 @@
+ #define MSCHARGED_FUZZY_VM_OPAQUE(Type, word) (Type*)(word)
+ #define MSCHARGED_FUZZY_VM_OPAQUE_WORD(pointer) (u32)(pointer)
+ #endif
++#if defined(MSCHARGED_NATIVE) && defined(MSCHARGED_DIAGNOSTIC_FRONTEND_LAN)
++#include "Game/NetworkRandomSeed.h"
++#endif
+ extern "C" unsigned long FuzzyAIStringHash(const char* value)
+ {
+     return nlStringHash(value);
+@@ -3132,6 +3135,10 @@ void FuzzyAIRuntime::DoFunctionCall(unsigned int function)
+         nlBreak();
+         break;
+     }
++#if defined(MSCHARGED_NATIVE) && defined(MSCHARGED_DIAGNOSTIC_FRONTEND_LAN)
++    // Every AI script question and its result word, for the lockstep trace
++    TraceNetworkWords("fn", (int)function, &m_SP[-1], 1);
++#endif
+ }
+ 
+ extern "C" bool FuzzyAIIsUndoingCall(InterpreterCore* value)
 diff --git a/src/Game/FE/BaseGameSceneManager.cpp b/src/Game/FE/BaseGameSceneManager.cpp
 index b9e2d39..876af04 100644
 --- a/src/Game/FE/BaseGameSceneManager.cpp
