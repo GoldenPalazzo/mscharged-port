@@ -124,10 +124,10 @@ index e75c20b..4d0270c 100644
      SendPlayerVisibility();
      UpdateCachedGameData(fDeltaT);
 diff --git a/src/Game/NetworkRandomSeed.cpp b/src/Game/NetworkRandomSeed.cpp
-index d5d2128..716b5a5 100644
+index d5d2128..6f58a82 100644
 --- a/src/Game/NetworkRandomSeed.cpp
 +++ b/src/Game/NetworkRandomSeed.cpp
-@@ -2,6 +2,65 @@
+@@ -2,6 +2,75 @@
  
  #include "NL/nlMath.h"
  
@@ -136,11 +136,12 @@ index d5d2128..716b5a5 100644
 +#include <cstdlib>
 +#include <cstring>
 +#include <dlfcn.h>
++#include <execinfo.h>
 +
 +// Lockstep needs every machine to draw the same numbers in the same order.
-+// MSCHARGED_RNG_TRACE=<file> writes every seed change with the offset of its
-+// caller in the module, so the traces of two machines can be diffed to find
-+// the first draw that differs (addr2line -f -C -e <module> <offset>).
++// MSCHARGED_RNG_TRACE=<file> writes every seed change with the module offsets
++// of its first five callers, so the traces of two machines can be diffed to
++// find the first draw that differs (addr2line -f -C -e <module> <offsets>).
 +static FILE* NetworkTraceFile()
 +{
 +    static FILE* sTrace = 0;
@@ -177,40 +178,49 @@ index d5d2128..716b5a5 100644
 +    std::fputc('\n', trace);
 +}
 +
-+static void TraceNetworkRandom(const char* kind, u32 range, u32 before, u32 after, void* caller)
++// Not inlined, so the stack always starts here and then in the nlRandom
++// wrapper: entry 2 is the code that asked for the number.
++__attribute__((noinline)) static void TraceNetworkRandom(const char* kind, u32 range, u32 before, u32 after)
 +{
 +    FILE* sTrace = NetworkTraceFile();
 +    if (sTrace == 0)
 +        return;
-+    Dl_info info;
-+    unsigned long offset = 0;
-+    if (dladdr(caller, &info) && info.dli_fbase != 0)
-+        offset = (unsigned long)((char*)caller - (char*)info.dli_fbase);
-+    std::fprintf(sTrace, "%s %u %08x %08x 0x%lx\n", kind, range, before, after, offset);
++    void* frames[7];
++    int count = backtrace(frames, 7);
++    std::fprintf(sTrace, "%s %u %08x %08x", kind, range, before, after);
++    for (int i = 2; i < count; ++i)
++    {
++        Dl_info info;
++        unsigned long offset = 0;
++        if (dladdr(frames[i], &info) && info.dli_fbase != 0)
++            offset = (unsigned long)((char*)frames[i] - (char*)info.dli_fbase);
++        std::fprintf(sTrace, " 0x%lx", offset);
++    }
++    std::fputc('\n', sTrace);
 +}
 +#endif
 +
  u32 gNetworkRandomSeed = 0x12345678;
  
  u32 GetNetworkRandomSeed()
-@@ -11,6 +70,9 @@ u32 GetNetworkRandomSeed()
+@@ -11,6 +80,9 @@ u32 GetNetworkRandomSeed()
  
  void SetNetworkRandomSeed(u32 seed)
  {
 +#if defined(MSCHARGED_NATIVE) && defined(MSCHARGED_DIAGNOSTIC_FRONTEND_LAN)
-+    TraceNetworkRandom("set", 0, gNetworkRandomSeed, seed, __builtin_return_address(0));
++    TraceNetworkRandom("set", 0, gNetworkRandomSeed, seed);
 +#endif
      gNetworkRandomSeed = seed;
  }
  
-@@ -20,10 +82,24 @@ void OnInputSessionReset()
+@@ -20,10 +92,24 @@ void OnInputSessionReset()
  
  u32 nlRandom(u32 range)
  {
 +#if defined(MSCHARGED_NATIVE) && defined(MSCHARGED_DIAGNOSTIC_FRONTEND_LAN)
 +    u32 before = gNetworkRandomSeed;
 +    u32 value = nlRandom(range, &gNetworkRandomSeed);
-+    TraceNetworkRandom("int", range, before, gNetworkRandomSeed, __builtin_return_address(0));
++    TraceNetworkRandom("int", range, before, gNetworkRandomSeed);
 +    return value;
 +#else
      return nlRandom(range, &gNetworkRandomSeed);
@@ -222,7 +232,7 @@ index d5d2128..716b5a5 100644
 +#if defined(MSCHARGED_NATIVE) && defined(MSCHARGED_DIAGNOSTIC_FRONTEND_LAN)
 +    u32 before = gNetworkRandomSeed;
 +    float value = nlRandomf(maximum, &gNetworkRandomSeed);
-+    TraceNetworkRandom("float", 0, before, gNetworkRandomSeed, __builtin_return_address(0));
++    TraceNetworkRandom("float", 0, before, gNetworkRandomSeed);
 +    return value;
 +#else
      return nlRandomf(maximum, &gNetworkRandomSeed);
