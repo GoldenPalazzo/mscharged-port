@@ -492,3 +492,4 @@
 0688-so-header-ostime-fwd.patch
 0689-change-debug-lan-ports.patch
 0690-admit-debug-lan-lobby.patch
+0691-clear-native-variant-data.patch
