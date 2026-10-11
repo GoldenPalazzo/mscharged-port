@@ -113,7 +113,7 @@ index b9e2d39..876af04 100644
          newHandler = new (nlMalloc(sizeof(SHOnlineLogin), 8, false)) SHOnlineLogin();
          break;
 diff --git a/src/Game/Game.cpp b/src/Game/Game.cpp
-index e75c20b..cc41164 100644
+index e75c20b..a60c978 100644
 --- a/src/Game/Game.cpp
 +++ b/src/Game/Game.cpp
 @@ -70,6 +70,11 @@
@@ -128,7 +128,7 @@ index e75c20b..cc41164 100644
  #include "Game/Terrain.h"
  #include "Game/CrowdRiot.h"
  #include "Game/ScriptTuning.h"
-@@ -1438,6 +1443,62 @@ void cGame::Update(float fDeltaT)
+@@ -1438,6 +1443,79 @@ void cGame::Update(float fDeltaT)
          return;
      }
  
@@ -168,6 +168,23 @@ index e75c20b..cc41164 100644
 +                words[count++] = concurrent != 0 && concurrent->IsActive() ? concurrent->mAgeTimer.m_uPackedTime : 0xFFFFFFFFu;
 +            }
 +            TraceNetworkWords("ai", team * 4 + i, words, count);
++        }
++        // The team's own AI, same layout
++        ScriptMachine* machine = g_pTeams[team]->m_pAIContext != 0 ? g_pTeams[team]->m_pAIContext->mScriptMachine : 0;
++        if (machine != 0)
++        {
++            u32 words[3 + 32];
++            int count = 0;
++            shdStateMachine* active = machine->mActiveState;
++            words[count++] = active != 0 ? (u32)active->mState : 0xFFFFFFFFu;
++            words[count++] = active != 0 ? active->mAgeTimer.m_uPackedTime : 0;
++            words[count++] = (u32)machine->mPendingState;
++            for (int state = 0; state < machine->mStateCount && count < 3 + 32; state++)
++            {
++                shdStateMachine* concurrent = machine->mConcurrentStates[state];
++                words[count++] = concurrent != 0 && concurrent->IsActive() ? concurrent->mAgeTimer.m_uPackedTime : 0xFFFFFFFFu;
++            }
++            TraceNetworkWords("teamai", team, words, count);
 +        }
 +    }
 +    // The synchronized input every machine simulates with, per player
