@@ -1,0 +1,76 @@
+Subject: Read the native Koopa shell and Birdo egg end events by member
+Upstream-base: f75ccf1ad20e5bd7585962990db08067c0ae498a
+
+HandleCollisionKoopaShellEnd and HandleCollisionBirdoEggEnd read their event
+through Wii byte offsets: the cracked flag at 4 and the shell owner or egg
+shooter at 0x2C/0x3C inside the object. The producers fill the declared
+CollisionKoopaShellEndData/CollisionBirdoEggEndData members. Natively the
+leading object pointer is 8 bytes, so offset 4 is the pointer's upper half
+(non-zero for user addresses) and the object offsets fall inside other
+fields. Every end then took the cracked branch with a garbage shooter, and
+fn_800156F8 faulted the first time Birdo's super shot egg ended.
+
+On native builds both handlers read the event and the object through their
+members (cracked, KoopaShellObject::mOwner, BirdoEggObject::mShooter). The
+other handlers in this file still use Wii offsets for powerup and Waluigi
+wall data and need the same review.
+
+diff --git a/src/Game/Physics/PhysicsEventQueue.cpp b/src/Game/Physics/PhysicsEventQueue.cpp
+index c75cd7d..fc1c499 100644
+--- a/src/Game/Physics/PhysicsEventQueue.cpp
++++ b/src/Game/Physics/PhysicsEventQueue.cpp
+@@ -330,6 +330,21 @@ void HandleCollisionCrackEgg(void* data)
+ 
+ void HandleCollisionKoopaShellEnd(void* data)
+ {
++#if defined(MSCHARGED_NATIVE)
++    // Native pointers are 8 bytes: Wii offsets 4 (cracked) and 0x2C (mOwner)
++    // fall inside other fields. Read the event and the shell by member.
++    CollisionKoopaShellEndData* event = (CollisionKoopaShellEndData*)data;
++    KoopaShellObject* shell = (KoopaShellObject*)event->shell;
++    if (event->cracked != false)
++    {
++        fn_800156F8(g_pBall, shell->mOwner);
++    }
++    else
++    {
++        fn_80015B38(g_pBall, 0);
++    }
++    shell->Deactivate(false);
++#else
+     unsigned char* bytes = (unsigned char*)data;
+     if (bytes[4] != false)
+     {
+@@ -341,10 +356,24 @@ void HandleCollisionKoopaShellEnd(void* data)
+         fn_80015B38(g_pBall, 0);
+     }
+     (*(KoopaShellObject**)bytes)->Deactivate(false);
++#endif
+ }
+ 
+ void HandleCollisionBirdoEggEnd(void* data)
+ {
++#if defined(MSCHARGED_NATIVE)
++    // As for the Koopa shell: Wii offsets 4 (cracked) and 0x3C (mShooter).
++    CollisionBirdoEggEndData* event = (CollisionBirdoEggEndData*)data;
++    if (event->cracked != false)
++    {
++        fn_800156F8(g_pBall, event->egg->mShooter);
++    }
++    else
++    {
++        fn_80015B38(g_pBall, 0);
++    }
++    event->egg->Hide(false);
++#else
+     unsigned char* bytes = (unsigned char*)data;
+     if (bytes[4] != false)
+     {
+@@ -356,6 +385,7 @@ void HandleCollisionBirdoEggEnd(void* data)
+         fn_80015B38(g_pBall, 0);
+     }
+     (*(BirdoEggObject**)bytes)->Hide(false);
++#endif
+ }
+ 
+ void HandleCollisionShockwave(CollisionShockwaveData* data)
