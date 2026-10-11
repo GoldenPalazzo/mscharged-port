@@ -506,6 +506,25 @@ int main()
     so_test_peer_close(nb_peer);
     so_test_peer_close(listener);
 
+    // Broadcast. The Wii stack lets any UDP socket send to 255.255.255.255;
+    // Linux answers EACCES unless SO_BROADCAST is set, which SOSocket2 does.
+    // The effect is checked rather than the option: so.h and <sys/socket.h>
+    // both define SO_BROADCAST (9 in the SDK, 6 on Linux), and with the SDK
+    // value setsockopt would still succeed, turning on SO_KEEPALIVE instead.
+    // Only the send is checked: the local copy of a broadcast re-enters through
+    // the network interface, so a host firewall may drop it.
+    int bc = check_gte(SOSocket2(SO_PF_INET, SO_SOCK_DGRAM, 0), 0, "broadcast: SOSocket2 for the sender");
+    SOSockAddrIn bc_everyone = loopback(6770);
+    bc_everyone.addr.addr = 0xffffffff;
+    int bc_sent = SOSendTo(bc, payload, sizeof(payload), 0, &bc_everyone);
+    if (bc_sent == SO_ENETUNREACH)
+        // Without a default route (sandbox, no network) there is nowhere to send it
+        std::cerr << "broadcast: skipped, this machine has no route for 255.255.255.255\n";
+    else
+        check_eq(bc_sent, (int)sizeof(payload),
+                 "broadcast: SOSendTo 255.255.255.255 (SO_EACCES: SO_BROADCAST missing or set with the SDK value)");
+    check_eq(SOClose(bc), SO_SUCCESS, "broadcast: SOClose on the sender");
+
     check_eq(SOCleanup(), SO_SUCCESS, "post tests: SOCleanup while ACTIVE (ACTIVE -> READY)");
     check_eq(SOGetHostID(), 0l, "post tests: SOGetHostID after SOCleanup (READY)");
     check_eq(SOPoll(pfd, 1, 0), SO_EINVAL, "post tests: SOPoll after SOCleanup (READY)");

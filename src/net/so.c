@@ -1,7 +1,8 @@
 #include <revolution/so.h>
 #include <errno.h>
 #include <stdarg.h>
-#include <sys/socket.h>
+#include <sys/socket.h> // needs to be imported after so.h to avoid
+                        // redefinitions of symbols SO_BROADCAST
 #include <unistd.h>
 #include <netinet/in.h>
 #include <fcntl.h>
@@ -330,6 +331,15 @@ int SOSocket2(int pf, int type, int protocol)
         return so_error_from_errno(errno);
     }
 #endif
+    if (type == SO_SOCK_DGRAM)
+    {
+        int enable = 1;
+        if (setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &enable, sizeof(enable)) < 0)
+        {
+            close(sock);
+            return so_error_from_errno(errno);
+        }
+    }
     return trsock_new_socket(sock);
 }
 
