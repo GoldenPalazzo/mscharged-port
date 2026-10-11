@@ -1,0 +1,43 @@
+Subject: Clear native AI variant data before narrow scalar stores
+Upstream-base: f75ccf1ad20e5bd7585962990db08067c0ae498a
+
+Variant's typed constructor stores a scalar through a cast of its data union,
+writing only sizeof(T) bytes. CopyFrom then copies all 12 union bytes, and
+ScriptState::Update runs a state's Update script only while the copied
+DesireUpdate's mData.pointer is zero. On the Wii the pointer member is 4 bytes
+and coincides with the int; natively it spans 8 bytes, so that test also reads
+4 bytes the narrow store left from the stack. The Update script was then
+skipped or run depending on stack contents: AI behaviour drifted from the
+original and two LAN machines lost lockstep within seconds.
+
+On native builds the constructor now clears the union before the store, so a
+pointer-width read of an int result sees the int with zero upper bytes, as on
+the console. Wii builds are unchanged.
+
+diff --git a/include/Game/AI/Variant.h b/include/Game/AI/Variant.h
+index c4e73ee..fb9c332 100644
+--- a/include/Game/AI/Variant.h
++++ b/include/Game/AI/Variant.h
+@@ -2,6 +2,9 @@
+ #define _VARIANT_H_
+ 
+ #include <stddef.h>
++#if defined(MSCHARGED_NATIVE)
++#include <string.h>
++#endif
+ 
+ #include "NL/nlBasicString.h"
+ #include "NL/nlMath.h"
+@@ -50,6 +53,12 @@ public:
+     template <typename T>
+     Variant(eVariantType type, T value)
+     {
++#if defined(MSCHARGED_NATIVE)
++        // A native pointer spans 8 bytes, more than the 4-byte scalars: clear
++        // the union so CopyFrom's 12-byte copy and pointer-width zero tests
++        // never read bytes this narrow store left from the stack.
++        memset(&mData, 0, sizeof(mData));
++#endif
+         *(T*)&mData = value;
+         mType = type;
+     }
