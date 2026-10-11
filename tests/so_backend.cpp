@@ -1,9 +1,13 @@
 #include <iostream>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 
 #include <revolution/so.h>
+
+#include "so_test_peer.h"
 
 int main()
 {
@@ -390,10 +394,124 @@ int main()
     check_eq(SOStartup(), SO_SUCCESS, "hostid: SOStartup with the original environment");
     check_eq((u32)SOGetHostID(), host, "hostid: with the original environment the first detected address comes back");
 
+    // TCP. The backend has no SOListen/SOAccept, so the server side is a plain
+    // POSIX socket (so_test_peer.cpp) on 127.0.0.1 with a port chosen by the kernel.
+    u16 listen_port = 0;
+    int listener = check_gte(so_test_peer_listen(&listen_port), 0, "tcp: POSIX listener on 127.0.0.1:0");
+    SOSockAddrIn server = loopback(0);
+    server.port = listen_port;
+
+    int c = check_gte(SOSocket2(SO_PF_INET, SO_SOCK_STREAM, 0), 0, "tcp: SOSocket2 for the stream client");
+
+    // Argument validation, same as SOConnect in soBasic.c
+    SOSockAddrIn bad_server = server;
+    bad_server.len = 100;
+    check_eq(SOConnect(c, NULL), SO_EINVAL, "tcp: SOConnect with a NULL address");
+    check_eq(SOConnect(c, &bad_server), SO_EINVAL, "tcp: SOConnect with len=100 address");
+    check_eq(SOConnect(invalid_s, &server), SO_EBADF, "tcp: SOConnect on a closed descriptor");
+
+    // A blocking connect returns once the handshake is done; the connection
+    // waits in the listen backlog, so accept can come afterwards
+    check_eq(SOConnect(c, &server), SO_SUCCESS, "tcp: blocking SOConnect to the listener");
+    check_eq(SOConnect(c, &server), SO_EISCONN, "tcp: second SOConnect on a connected socket");
+
+    u16 peer_port = 0;
+    u32 peer_host = 0;
+    int peer = check_gte(so_test_peer_accept(listener, &peer_port, &peer_host), 0, "tcp: POSIX accept of the SO client");
+
+    // Both ends must agree on the client's address: catches byte order slips
+    // in the sockaddr conversion
+    SOSockAddrIn local = { .len = sizeof(SOSockAddrIn) };
+    check_eq(SOGetSockName(c, &local), SO_SUCCESS, "tcp: SOGetSockName on the connected client");
+    check_eq(local.port, peer_port, "tcp: client port seen by SOGetSockName and by accept");
+    check_eq(local.addr.addr, peer_host, "tcp: client address seen by SOGetSockName and by accept");
+
+    u8 peer_buf[64];
+    check_eq(SOSend(c, payload, sizeof(payload), 0), (int)sizeof(payload), "tcp: SOSend returns the bytes sent");
+    long peer_got = so_test_peer_recv(peer, peer_buf, sizeof(payload));
+    check(peer_got == (long)sizeof(payload) && std::memcmp(peer_buf, payload, sizeof(payload)) == 0,
+          "tcp: bytes received by the peer differ from the SOSend payload");
+
+    // In soBasic.c SOSend is SendTo(..., NULL): SOSendTo with a NULL address is the same call
+    check_eq(SOSendTo(c, payload, sizeof(payload), 0, NULL), (int)sizeof(payload), "tcp: SOSendTo with a NULL address (SOSend path)");
+    peer_got = so_test_peer_recv(peer, peer_buf, sizeof(payload));
+    check(peer_got == (long)sizeof(payload) && std::memcmp(peer_buf, payload, sizeof(payload)) == 0,
+          "tcp: bytes received by the peer differ from the SOSendTo(NULL) payload");
+
+    check_eq(SOSend(c, NULL, 0, 0), 0, "tcp: SOSend of zero bytes");
+    check_eq(SOSend(c, payload, sizeof(payload), 1), SO_EINVAL, "tcp: SOSend with flags != 0");
+    check_eq(SOSend(c, payload, -1, 0), SO_EINVAL, "tcp: SOSend with negative len");
+    check_eq(SOSend(c, NULL, 4, 0), SO_EINVAL, "tcp: SOSend with NULL buf and len > 0");
+    check_eq(SOSend(invalid_s, payload, sizeof(payload), 0), SO_EBADF, "tcp: SOSend on a closed descriptor");
+
+    // The other direction, as NetworkStats reads the HTTP reply
+    const char reply[] = "HTTP/1.0 200 OK\r\n\r\n";
+    check_eq(so_test_peer_send(peer, reply, sizeof(reply) - 1), (long)(sizeof(reply) - 1), "tcp: POSIX send of the reply");
+    check_eq(SORecvFrom(c, buf, sizeof(buf), 0, NULL), (int)(sizeof(reply) - 1), "tcp: SORecvFrom of the reply on the stream");
+    check(std::memcmp(buf, reply, sizeof(reply) - 1) == 0, "tcp: received reply differs from what the peer sent");
+
+    // NetworkStats: non-blocking socket, SOConnect must answer -26 and the
+    // connection completes later. SOPoll with WRNORM tells when.
+    int nb = check_gte(SOSocket2(SO_PF_INET, SO_SOCK_STREAM, 0), 0, "tcp: SOSocket2 for the non-blocking client");
+    check_eq(SOFcntl(nb, SO_F_SETFL, SO_O_NONBLOCK), SO_SUCCESS, "tcp: make the client non-blocking");
+    check_eq(SOConnect(nb, &server), SO_EINPROGRESS, "tcp: non-blocking SOConnect (NetworkStats requires -26)");
+    pfd[0] = { .fd = nb, .events = SO_POLLWRNORM, .revents = 0 };
+    check_eq(SOPoll(pfd, 1, SO_INFTIM), 1, "tcp: SOPoll until the non-blocking connect completes");
+    check_eq(pfd[0].revents, SO_POLLWRNORM, "tcp: a completed connect is writable, without ERR/HUP");
+    // Linux answers the first connect after completion with 0 (it reports the
+    // finished connect), BSD/macOS with EISCONN. From then on it's EISCONN.
+    int again = SOConnect(nb, &server);
+    check(again == SO_SUCCESS || again == SO_EISCONN,
+          ("tcp: SOConnect after the non-blocking connect completed | actual: " + std::to_string(again)
+           + " | expected: SO_SUCCESS (Linux) or SO_EISCONN").c_str());
+    check_eq(SOConnect(nb, &server), SO_EISCONN, "tcp: SOConnect on the established non-blocking socket");
+    int nb_peer = check_gte(so_test_peer_accept(listener, NULL, NULL), 0, "tcp: POSIX accept of the non-blocking client");
+
+    // Closing a listener frees its port: nobody is listening there now
+    u16 dead_port = 0;
+    int dead = check_gte(so_test_peer_listen(&dead_port), 0, "tcp: second listener, closed right away");
+    so_test_peer_close(dead);
+    SOSockAddrIn dead_addr = loopback(0);
+    dead_addr.port = dead_port;
+    int refused = check_gte(SOSocket2(SO_PF_INET, SO_SOCK_STREAM, 0), 0, "tcp: SOSocket2 for the refused client");
+    check_eq(SOConnect(refused, &dead_addr), SO_ECONNREFUSED, "tcp: SOConnect to a port with no listener");
+
+    // Writing to a dead TCP connection raises SIGPIPE, whose default action
+    // kills the process. The backend must suppress it (MSG_NOSIGNAL): if the
+    // suite dies here with SIGPIPE, that is the bug.
+    int unconnected = check_gte(SOSocket2(SO_PF_INET, SO_SOCK_STREAM, 0), 0, "tcp: SOSocket2 for the never connected client");
+    int sent = SOSend(unconnected, payload, sizeof(payload), 0);
+    check(sent == SO_EPIPE || sent == SO_ENOTCONN,
+          ("tcp: SOSend on a never connected stream | actual: " + std::to_string(sent)
+           + " | expected: SO_EPIPE (Linux) or SO_ENOTCONN").c_str());
+
+    // After the peer closes, the first send usually still succeeds; the
+    // peer's RST arrives a moment later and the next one fails
+    so_test_peer_close(peer);
+    sent = 0;
+    for (int i = 0; i < 100 && sent >= 0; ++i)
+    {
+        sent = SOSend(c, payload, sizeof(payload), 0);
+        if (sent >= 0)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    check(sent == SO_EPIPE || sent == SO_ECONNRESET,
+          ("tcp: SOSend after the peer closed | actual: " + std::to_string(sent)
+           + " | expected: SO_EPIPE or SO_ECONNRESET").c_str());
+
+    check_eq(SOClose(unconnected), SO_SUCCESS, "tcp: SOClose on the never connected client");
+    check_eq(SOClose(refused), SO_SUCCESS, "tcp: SOClose on the refused client");
+    check_eq(SOClose(nb), SO_SUCCESS, "tcp: SOClose on the non-blocking client");
+    check_eq(SOClose(c), SO_SUCCESS, "tcp: SOClose on the blocking client");
+    so_test_peer_close(nb_peer);
+    so_test_peer_close(listener);
+
     check_eq(SOCleanup(), SO_SUCCESS, "post tests: SOCleanup while ACTIVE (ACTIVE -> READY)");
     check_eq(SOGetHostID(), 0l, "post tests: SOGetHostID after SOCleanup (READY)");
     check_eq(SOPoll(pfd, 1, 0), SO_EINVAL, "post tests: SOPoll after SOCleanup (READY)");
     check_eq(SOGetSockName(rx, &name), SO_EINVAL, "post tests: SOGetSockName after SOCleanup (READY)");
+    check_eq(SOConnect(0, &server), SO_EINVAL, "post tests: SOConnect after SOCleanup (READY)");
+    check_eq(SOSend(0, payload, sizeof(payload), 0), SO_EINVAL, "post tests: SOSend after SOCleanup (READY)");
     check_eq(SOFinish(), SO_SUCCESS, "post tests: SOFinish after SOCleanup (READY -> TERMINATED)");
     check_eq(SOGetHostID(), 0l, "post tests: SOGetHostID after SOFinish (TERMINATED)");
     

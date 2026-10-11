@@ -208,6 +208,7 @@ static int so_error_from_errno(int error)
     case ENOTCONN: return SO_ENOTCONN;
     case ENOTSOCK: return SO_ENOTSOCK;
     case EOPNOTSUPP: return SO_EOPNOTSUPP;
+    case EPIPE: return SO_EPIPE;
     case EPROTONOSUPPORT: return SO_EPROTONOSUPPORT;
     case EPROTOTYPE: return SO_EPROTOTYPE;
     default: return SO_EFATAL;
@@ -321,6 +322,14 @@ int SOSocket2(int pf, int type, int protocol)
     int sock = socket(to_native_family(pf), to_native_type(type), protocol);
     if (sock < 0)
         return so_error_from_errno(errno);
+#ifndef MSG_NOSIGNAL
+    int optval = 1;
+    if (setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE, &optval, sizeof(optval)) < 0)
+    {
+        close(sock);
+        return so_error_from_errno(errno);
+    }
+#endif
     return trsock_new_socket(sock);
 }
 
@@ -425,29 +434,50 @@ u16 SONtoHs(u16 netshort)
     return ntohs(netshort);
 }
 
-int SOSendTo(int s, const void* buf, int len, int flags, const void* sockTo)
+static int so_send_to(int s, const void* buf, int len, int flags, const void* sockTo)
 {
-    // no game path requires flags, fail loudly instead of accepting silently
     int result = so_check_active();
     if (result != SO_SUCCESS)
         return result;
+    // no game path requires flags, fail loudly instead of accepting silently
     if (flags != 0)
         return SO_EINVAL;
-    if (sockTo == NULL)
-        return SO_EINVAL;
+    #ifdef MSG_NOSIGNAL
+    // don't let Linux's kernel kill the game with EPIPE, let it bubble up
+    // to the caller
+    flags |= MSG_NOSIGNAL;
+    #endif
     const SOSockAddr* to = sockTo;
-    if (sizeof(SOSockAddr) < to->len || to->len < sizeof(SOSockAddr))
+    if (to != NULL && (sizeof(SOSockAddr) < to->len || to->len < sizeof(SOSockAddr)))
         return SO_EINVAL;
     if (len < 0 || (len > 0 && buf == NULL))
         return SO_EINVAL;
     int real_fd = trsock_get_fd(s);
     if (real_fd == -1)
         return SO_EBADF;
-    struct sockaddr_in addrnative = to_native_sockaddr((const SOSockAddrIn*)to);
-    ssize_t sent = sendto(real_fd, buf, (size_t)len, 0, (struct sockaddr *)&addrnative, sizeof(struct sockaddr_in));
+    ssize_t sent;
+    if (sockTo != NULL)
+    {
+        struct sockaddr_in addrnative = to_native_sockaddr((const SOSockAddrIn*)to);
+        sent = sendto(real_fd, buf, (size_t)len, flags, (struct sockaddr *)&addrnative, sizeof(struct sockaddr_in));
+    }
+    else
+    {
+        sent = send(real_fd, buf, (size_t)len, flags);
+    }
     if (sent == -1)
         return so_error_from_errno(errno);
     return (int)sent;
+}
+
+int SOSendTo(int s, const void* buf, int len, int flags, const void* sockTo)
+{
+    return so_send_to(s, buf, len, flags, sockTo);
+}
+
+int SOSend(int s, const void *buf, int len, int flags)
+{
+    return so_send_to(s, buf, len, flags, NULL);
 }
 
 int SORecvFrom(int s, void* buf, int len, int flags, void* sockFrom)
@@ -534,4 +564,22 @@ long SOGetHostID(void)
     if (soState != SO_INTERNAL_STATE_ACTIVE)
         return 0;
     return (long)soHostId;
+}
+
+int SOConnect(int s, const void* sockAddr)
+{
+    int result = so_check_active();
+    if (result != SO_SUCCESS)
+        return result;
+    const SOSockAddr* addr = sockAddr;
+    if (addr == NULL || sizeof(SOSockAddr) < addr->len || addr->len < sizeof(SOSockAddr))
+        return SO_EINVAL;
+    int real_fd = trsock_get_fd(s);
+    if (real_fd == -1)
+        return SO_EBADF;
+    struct sockaddr_in addrnative = to_native_sockaddr((const SOSockAddrIn*)addr);
+    int ret = connect(real_fd, (struct sockaddr*)&addrnative, sizeof(addrnative));
+    if (ret == -1)
+        return so_error_from_errno(errno);
+    return SO_SUCCESS;
 }
