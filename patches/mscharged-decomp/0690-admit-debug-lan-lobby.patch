@@ -5,6 +5,57 @@ Enabling only the blocks needed to handle the network scene but disable the
 online ones.
 Fixed some casts to u32 pointers.
 
+diff --git a/include/Game/NetworkRandomSeed.h b/include/Game/NetworkRandomSeed.h
+index 7df5bec..c4eda76 100644
+--- a/include/Game/NetworkRandomSeed.h
++++ b/include/Game/NetworkRandomSeed.h
+@@ -9,4 +9,11 @@ u32 GetNetworkRandomSeed();
+ void SetNetworkRandomSeed(u32 seed);
+ void OnInputSessionReset();
+ 
++#if defined(MSCHARGED_NATIVE) && defined(MSCHARGED_DIAGNOSTIC_FRONTEND_LAN)
++// Lockstep trace (MSCHARGED_RNG_TRACE): a game frame marker and raw float
++// state, written next to the random draws so two machines can be diffed.
++void TraceNetworkFrame(u32 frame);
++void TraceNetworkFloats(const char* label, int index, const float* values, int count);
++#endif
++
+ #endif // GAME_NETWORK_RANDOM_SEED_H
+diff --git a/include/Game/Sys/debug.h b/include/Game/Sys/debug.h
+index 11f42ad..8b3a9c2 100644
+--- a/include/Game/Sys/debug.h
++++ b/include/Game/Sys/debug.h
+@@ -1,6 +1,11 @@
+ #ifndef _DEBUG_H_
+ #define _DEBUG_H_
+ 
++#if defined(MSCHARGED_NATIVE) && defined(MSCHARGED_DIAGNOSTIC_FRONTEND_LAN)
++#include <cstdarg>
++#include <cstdio>
++#endif
++
+ enum eDEBUG_CHANNEL
+ {
+     DC_STARTUP = 0,
+@@ -31,6 +36,18 @@ namespace tDebugPrintManager
+ 
+ inline int Print(eDEBUG_CHANNEL channel, const char* format, ...)
+ {
++#if defined(MSCHARGED_NATIVE) && defined(MSCHARGED_DIAGNOSTIC_FRONTEND_LAN)
++    // Retail strips debug output. The LAN admission keeps the original network
++    // channel, printed to stderr and so also kept in the session log.
++    if (channel == DC_NETWORK)
++    {
++        va_list args;
++        va_start(args, format);
++        std::fputs("[net] ", stderr);
++        std::vfprintf(stderr, format, args);
++        va_end(args);
++    }
++#endif
+     return channel;
+ }
+ 
 diff --git a/src/Game/FE/BaseGameSceneManager.cpp b/src/Game/FE/BaseGameSceneManager.cpp
 index b9e2d39..876af04 100644
 --- a/src/Game/FE/BaseGameSceneManager.cpp
@@ -35,6 +86,148 @@ index b9e2d39..876af04 100644
      case SCENE_ONLINE_LOGIN:
          newHandler = new (nlMalloc(sizeof(SHOnlineLogin), 8, false)) SHOnlineLogin();
          break;
+diff --git a/src/Game/Game.cpp b/src/Game/Game.cpp
+index e75c20b..4d0270c 100644
+--- a/src/Game/Game.cpp
++++ b/src/Game/Game.cpp
+@@ -70,6 +70,9 @@
+ #include "Game/Task/FixedUpdateTask.h"
+ #include "Game/Task/ParticleUpdateTask.h"
+ #include "Game/Team.h"
++#if defined(MSCHARGED_NATIVE) && defined(MSCHARGED_DIAGNOSTIC_FRONTEND_LAN)
++#include "Game/NetworkRandomSeed.h"
++#endif
+ #include "Game/Terrain.h"
+ #include "Game/CrowdRiot.h"
+ #include "Game/ScriptTuning.h"
+@@ -1438,6 +1441,22 @@ void cGame::Update(float fDeltaT)
+         return;
+     }
+ 
++#if defined(MSCHARGED_NATIVE) && defined(MSCHARGED_DIAGNOSTIC_FRONTEND_LAN)
++    // The state each simulation step starts from, for the lockstep trace
++    TraceNetworkFrame(gInputManager->mFrameProvider->GetFrame());
++    TraceNetworkFloats("ball", 0, (const float*)&g_pBall->m_v3Position, 3);
++    TraceNetworkFloats("ballv", 0, (const float*)&g_pBall->m_v3Velocity, 3);
++    for (int team = 0; team < 2; team++)
++    {
++        for (int i = 0; i < 5; i++)
++        {
++            cPlayer* player = g_pTeams[team]->GetPlayer(i);
++            TraceNetworkFloats("pos", team * 5 + i, (const float*)&player->GetPosition(), 3);
++            TraceNetworkFloats("vel", team * 5 + i, (const float*)&player->GetVelocity(), 3);
++        }
++    }
++#endif
++
+     AIPadManager::UpdateAccelerationHistory();
+     SendPlayerVisibility();
+     UpdateCachedGameData(fDeltaT);
+diff --git a/src/Game/NetworkRandomSeed.cpp b/src/Game/NetworkRandomSeed.cpp
+index d5d2128..716b5a5 100644
+--- a/src/Game/NetworkRandomSeed.cpp
++++ b/src/Game/NetworkRandomSeed.cpp
+@@ -2,6 +2,65 @@
+ 
+ #include "NL/nlMath.h"
+ 
++#if defined(MSCHARGED_NATIVE) && defined(MSCHARGED_DIAGNOSTIC_FRONTEND_LAN)
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <dlfcn.h>
++
++// Lockstep needs every machine to draw the same numbers in the same order.
++// MSCHARGED_RNG_TRACE=<file> writes every seed change with the offset of its
++// caller in the module, so the traces of two machines can be diffed to find
++// the first draw that differs (addr2line -f -C -e <module> <offset>).
++static FILE* NetworkTraceFile()
++{
++    static FILE* sTrace = 0;
++    static bool sOpened = false;
++    if (!sOpened)
++    {
++        sOpened = true;
++        const char* path = std::getenv("MSCHARGED_RNG_TRACE");
++        if (path != 0 && (sTrace = std::fopen(path, "w")) != 0)
++            std::setvbuf(sTrace, 0, _IOLBF, 0);
++    }
++    return sTrace;
++}
++
++void TraceNetworkFrame(u32 frame)
++{
++    if (FILE* trace = NetworkTraceFile())
++        std::fprintf(trace, "frame %u\n", frame);
++}
++
++// Bit patterns, not decimals: a difference in the last bit must show.
++void TraceNetworkFloats(const char* label, int index, const float* values, int count)
++{
++    FILE* trace = NetworkTraceFile();
++    if (trace == 0)
++        return;
++    std::fprintf(trace, "%s %d", label, index);
++    for (int i = 0; i < count; ++i)
++    {
++        u32 bits;
++        std::memcpy(&bits, &values[i], sizeof(bits));
++        std::fprintf(trace, " %08x", bits);
++    }
++    std::fputc('\n', trace);
++}
++
++static void TraceNetworkRandom(const char* kind, u32 range, u32 before, u32 after, void* caller)
++{
++    FILE* sTrace = NetworkTraceFile();
++    if (sTrace == 0)
++        return;
++    Dl_info info;
++    unsigned long offset = 0;
++    if (dladdr(caller, &info) && info.dli_fbase != 0)
++        offset = (unsigned long)((char*)caller - (char*)info.dli_fbase);
++    std::fprintf(sTrace, "%s %u %08x %08x 0x%lx\n", kind, range, before, after, offset);
++}
++#endif
++
+ u32 gNetworkRandomSeed = 0x12345678;
+ 
+ u32 GetNetworkRandomSeed()
+@@ -11,6 +70,9 @@ u32 GetNetworkRandomSeed()
+ 
+ void SetNetworkRandomSeed(u32 seed)
+ {
++#if defined(MSCHARGED_NATIVE) && defined(MSCHARGED_DIAGNOSTIC_FRONTEND_LAN)
++    TraceNetworkRandom("set", 0, gNetworkRandomSeed, seed, __builtin_return_address(0));
++#endif
+     gNetworkRandomSeed = seed;
+ }
+ 
+@@ -20,10 +82,24 @@ void OnInputSessionReset()
+ 
+ u32 nlRandom(u32 range)
+ {
++#if defined(MSCHARGED_NATIVE) && defined(MSCHARGED_DIAGNOSTIC_FRONTEND_LAN)
++    u32 before = gNetworkRandomSeed;
++    u32 value = nlRandom(range, &gNetworkRandomSeed);
++    TraceNetworkRandom("int", range, before, gNetworkRandomSeed, __builtin_return_address(0));
++    return value;
++#else
+     return nlRandom(range, &gNetworkRandomSeed);
++#endif
+ }
+ 
+ float nlRandomf(float maximum)
+ {
++#if defined(MSCHARGED_NATIVE) && defined(MSCHARGED_DIAGNOSTIC_FRONTEND_LAN)
++    u32 before = gNetworkRandomSeed;
++    float value = nlRandomf(maximum, &gNetworkRandomSeed);
++    TraceNetworkRandom("float", 0, before, gNetworkRandomSeed, __builtin_return_address(0));
++    return value;
++#else
+     return nlRandomf(maximum, &gNetworkRandomSeed);
++#endif
+ }
 diff --git a/src/Game/SH/SHMainMenu.cpp b/src/Game/SH/SHMainMenu.cpp
 index 8fa7aff..6c2fbd2 100644
 --- a/src/Game/SH/SHMainMenu.cpp
@@ -144,114 +337,3 @@ index 3f58812..bd8adbd 100644
      switch (item)
      {
      case ButtonOneLocalPlayer:
-diff --git a/include/Game/Sys/debug.h b/include/Game/Sys/debug.h
-index 11f42ad..8b3a9c2 100644
---- a/include/Game/Sys/debug.h
-+++ b/include/Game/Sys/debug.h
-@@ -1,6 +1,11 @@
- #ifndef _DEBUG_H_
- #define _DEBUG_H_
- 
-+#if defined(MSCHARGED_NATIVE) && defined(MSCHARGED_DIAGNOSTIC_FRONTEND_LAN)
-+#include <cstdarg>
-+#include <cstdio>
-+#endif
-+
- enum eDEBUG_CHANNEL
- {
-     DC_STARTUP = 0,
-@@ -31,6 +36,18 @@ namespace tDebugPrintManager
- 
- inline int Print(eDEBUG_CHANNEL channel, const char* format, ...)
- {
-+#if defined(MSCHARGED_NATIVE) && defined(MSCHARGED_DIAGNOSTIC_FRONTEND_LAN)
-+    // Retail strips debug output. The LAN admission keeps the original network
-+    // channel, printed to stderr and so also kept in the session log.
-+    if (channel == DC_NETWORK)
-+    {
-+        va_list args;
-+        va_start(args, format);
-+        std::fputs("[net] ", stderr);
-+        std::vfprintf(stderr, format, args);
-+        va_end(args);
-+    }
-+#endif
-     return channel;
- }
- 
-diff --git a/src/Game/NetworkRandomSeed.cpp b/src/Game/NetworkRandomSeed.cpp
-index d5d2128..a25be9f 100644
---- a/src/Game/NetworkRandomSeed.cpp
-+++ b/src/Game/NetworkRandomSeed.cpp
-@@ -2,6 +2,36 @@
- 
- #include "NL/nlMath.h"
- 
-+#if defined(MSCHARGED_NATIVE) && defined(MSCHARGED_DIAGNOSTIC_FRONTEND_LAN)
-+#include <cstdio>
-+#include <cstdlib>
-+#include <dlfcn.h>
-+
-+// Lockstep needs every machine to draw the same numbers in the same order.
-+// MSCHARGED_RNG_TRACE=<file> writes every seed change with the offset of its
-+// caller in the module, so the traces of two machines can be diffed to find
-+// the first draw that differs (addr2line -f -C -e <module> <offset>).
-+static void TraceNetworkRandom(const char* kind, u32 range, u32 before, u32 after, void* caller)
-+{
-+    static FILE* sTrace = 0;
-+    static bool sOpened = false;
-+    if (!sOpened)
-+    {
-+        sOpened = true;
-+        const char* path = std::getenv("MSCHARGED_RNG_TRACE");
-+        if (path != 0 && (sTrace = std::fopen(path, "w")) != 0)
-+            std::setvbuf(sTrace, 0, _IOLBF, 0);
-+    }
-+    if (sTrace == 0)
-+        return;
-+    Dl_info info;
-+    unsigned long offset = 0;
-+    if (dladdr(caller, &info) && info.dli_fbase != 0)
-+        offset = (unsigned long)((char*)caller - (char*)info.dli_fbase);
-+    std::fprintf(sTrace, "%s %u %08x %08x 0x%lx\n", kind, range, before, after, offset);
-+}
-+#endif
-+
- u32 gNetworkRandomSeed = 0x12345678;
- 
- u32 GetNetworkRandomSeed()
-@@ -11,6 +41,9 @@ u32 GetNetworkRandomSeed()
- 
- void SetNetworkRandomSeed(u32 seed)
- {
-+#if defined(MSCHARGED_NATIVE) && defined(MSCHARGED_DIAGNOSTIC_FRONTEND_LAN)
-+    TraceNetworkRandom("set", 0, gNetworkRandomSeed, seed, __builtin_return_address(0));
-+#endif
-     gNetworkRandomSeed = seed;
- }
- 
-@@ -20,10 +53,24 @@ void OnInputSessionReset()
- 
- u32 nlRandom(u32 range)
- {
-+#if defined(MSCHARGED_NATIVE) && defined(MSCHARGED_DIAGNOSTIC_FRONTEND_LAN)
-+    u32 before = gNetworkRandomSeed;
-+    u32 value = nlRandom(range, &gNetworkRandomSeed);
-+    TraceNetworkRandom("int", range, before, gNetworkRandomSeed, __builtin_return_address(0));
-+    return value;
-+#else
-     return nlRandom(range, &gNetworkRandomSeed);
-+#endif
- }
- 
- float nlRandomf(float maximum)
- {
-+#if defined(MSCHARGED_NATIVE) && defined(MSCHARGED_DIAGNOSTIC_FRONTEND_LAN)
-+    u32 before = gNetworkRandomSeed;
-+    float value = nlRandomf(maximum, &gNetworkRandomSeed);
-+    TraceNetworkRandom("float", 0, before, gNetworkRandomSeed, __builtin_return_address(0));
-+    return value;
-+#else
-     return nlRandomf(maximum, &gNetworkRandomSeed);
-+#endif
- }
