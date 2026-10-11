@@ -6,10 +6,10 @@ online ones.
 Fixed some casts to u32 pointers.
 
 diff --git a/include/Game/NetworkRandomSeed.h b/include/Game/NetworkRandomSeed.h
-index 7df5bec..c4eda76 100644
+index 7df5bec..859a44a 100644
 --- a/include/Game/NetworkRandomSeed.h
 +++ b/include/Game/NetworkRandomSeed.h
-@@ -9,4 +9,11 @@ u32 GetNetworkRandomSeed();
+@@ -9,4 +9,12 @@ u32 GetNetworkRandomSeed();
  void SetNetworkRandomSeed(u32 seed);
  void OnInputSessionReset();
  
@@ -18,6 +18,7 @@ index 7df5bec..c4eda76 100644
 +// state, written next to the random draws so two machines can be diffed.
 +void TraceNetworkFrame(u32 frame);
 +void TraceNetworkFloats(const char* label, int index, const float* values, int count);
++void TraceNetworkWords(const char* label, int index, const u32* values, int count);
 +#endif
 +
  #endif // GAME_NETWORK_RANDOM_SEED_H
@@ -87,7 +88,7 @@ index b9e2d39..876af04 100644
          newHandler = new (nlMalloc(sizeof(SHOnlineLogin), 8, false)) SHOnlineLogin();
          break;
 diff --git a/src/Game/Game.cpp b/src/Game/Game.cpp
-index e75c20b..4d0270c 100644
+index e75c20b..8bbdf37 100644
 --- a/src/Game/Game.cpp
 +++ b/src/Game/Game.cpp
 @@ -70,6 +70,9 @@
@@ -100,7 +101,7 @@ index e75c20b..4d0270c 100644
  #include "Game/Terrain.h"
  #include "Game/CrowdRiot.h"
  #include "Game/ScriptTuning.h"
-@@ -1438,6 +1441,22 @@ void cGame::Update(float fDeltaT)
+@@ -1438,6 +1441,38 @@ void cGame::Update(float fDeltaT)
          return;
      }
  
@@ -118,16 +119,32 @@ index e75c20b..4d0270c 100644
 +            TraceNetworkFloats("vel", team * 5 + i, (const float*)&player->GetVelocity(), 3);
 +        }
 +    }
++    // The synchronized input every machine simulates with, per player
++    for (int machine = 0; machine < g_pNetworkSessionBase->GetNumMachines(); machine++)
++    {
++        NetworkPeer* peer = g_pNetworkSessionBase->GetPeer((s8)machine);
++        for (int channel = 0; channel < (int)peer->mPlayerCount; channel++)
++        {
++            DetInput* input = peer->GetNetworkPeerChannel(channel)->GetNetworkPeerChannelInput();
++            int id = machine * 4 + channel;
++            u32 words[5] = { input->m_ButtonBitfield, input->m_nConnected, input->m_LeftTrigger,
++                             input->m_RightTrigger, input->m_aRemapAngle };
++            TraceNetworkWords("input", id, words, 5);
++            TraceNetworkFloats("axes", id, &input->m_AnalogLeftX, 4);
++            TraceNetworkFloats("acc", id, (const float*)&input->m_v3RevRemoteAccel, 3);
++            TraceNetworkFloats("fsacc", id, (const float*)&input->m_v3RevFreeStyleAccel, 3);
++        }
++    }
 +#endif
 +
      AIPadManager::UpdateAccelerationHistory();
      SendPlayerVisibility();
      UpdateCachedGameData(fDeltaT);
 diff --git a/src/Game/NetworkRandomSeed.cpp b/src/Game/NetworkRandomSeed.cpp
-index d5d2128..6f58a82 100644
+index d5d2128..07be9cc 100644
 --- a/src/Game/NetworkRandomSeed.cpp
 +++ b/src/Game/NetworkRandomSeed.cpp
-@@ -2,6 +2,75 @@
+@@ -2,6 +2,86 @@
  
  #include "NL/nlMath.h"
  
@@ -180,7 +197,18 @@ index d5d2128..6f58a82 100644
 +
 +// Not inlined, so the stack always starts here and then in the nlRandom
 +// wrapper: entry 2 is the code that asked for the number.
-+__attribute__((noinline)) static void TraceNetworkRandom(const char* kind, u32 range, u32 before, u32 after)
++__attribute__((noinline)) void TraceNetworkWords(const char* label, int index, const u32* values, int count)
++{
++    FILE* trace = NetworkTraceFile();
++    if (trace == 0)
++        return;
++    std::fprintf(trace, "%s %d", label, index);
++    for (int i = 0; i < count; ++i)
++        std::fprintf(trace, " %x", values[i]);
++    std::fputc('\n', trace);
++}
++
++static void TraceNetworkRandom(const char* kind, u32 range, u32 before, u32 after)
 +{
 +    FILE* sTrace = NetworkTraceFile();
 +    if (sTrace == 0)
@@ -203,7 +231,7 @@ index d5d2128..6f58a82 100644
  u32 gNetworkRandomSeed = 0x12345678;
  
  u32 GetNetworkRandomSeed()
-@@ -11,6 +80,9 @@ u32 GetNetworkRandomSeed()
+@@ -11,6 +91,9 @@ u32 GetNetworkRandomSeed()
  
  void SetNetworkRandomSeed(u32 seed)
  {
@@ -213,7 +241,7 @@ index d5d2128..6f58a82 100644
      gNetworkRandomSeed = seed;
  }
  
-@@ -20,10 +92,24 @@ void OnInputSessionReset()
+@@ -20,10 +103,24 @@ void OnInputSessionReset()
  
  u32 nlRandom(u32 range)
  {
