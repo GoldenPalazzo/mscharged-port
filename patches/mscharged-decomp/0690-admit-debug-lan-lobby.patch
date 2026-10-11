@@ -113,20 +113,22 @@ index b9e2d39..876af04 100644
          newHandler = new (nlMalloc(sizeof(SHOnlineLogin), 8, false)) SHOnlineLogin();
          break;
 diff --git a/src/Game/Game.cpp b/src/Game/Game.cpp
-index e75c20b..8bbdf37 100644
+index e75c20b..cc41164 100644
 --- a/src/Game/Game.cpp
 +++ b/src/Game/Game.cpp
-@@ -70,6 +70,9 @@
+@@ -70,6 +70,11 @@
  #include "Game/Task/FixedUpdateTask.h"
  #include "Game/Task/ParticleUpdateTask.h"
  #include "Game/Team.h"
 +#if defined(MSCHARGED_NATIVE) && defined(MSCHARGED_DIAGNOSTIC_FRONTEND_LAN)
 +#include "Game/NetworkRandomSeed.h"
++#include "Game/AI/ScriptMachine.h"
++#include "Game/AI/shdStateMachine.h"
 +#endif
  #include "Game/Terrain.h"
  #include "Game/CrowdRiot.h"
  #include "Game/ScriptTuning.h"
-@@ -1438,6 +1441,38 @@ void cGame::Update(float fDeltaT)
+@@ -1438,6 +1443,62 @@ void cGame::Update(float fDeltaT)
          return;
      }
  
@@ -142,6 +144,30 @@ index e75c20b..8bbdf37 100644
 +            cPlayer* player = g_pTeams[team]->GetPlayer(i);
 +            TraceNetworkFloats("pos", team * 5 + i, (const float*)&player->GetPosition(), 3);
 +            TraceNetworkFloats("vel", team * 5 + i, (const float*)&player->GetVelocity(), 3);
++        }
++    }
++    // Each fielder's AI: active state, its age, the pending state, then the age
++    // of every active concurrent state (ffffffff when inactive)
++    for (int team = 0; team < 2; team++)
++    {
++        for (int i = 0; i < 4; i++)
++        {
++            cFielder* fielder = g_pTeams[team]->GetFielder(i);
++            ScriptMachine* machine = fielder != 0 && fielder->m_pAIContext != 0 ? fielder->m_pAIContext->mScriptMachine : 0;
++            if (machine == 0)
++                continue;
++            u32 words[3 + 32];
++            int count = 0;
++            shdStateMachine* active = machine->mActiveState;
++            words[count++] = active != 0 ? (u32)active->mState : 0xFFFFFFFFu;
++            words[count++] = active != 0 ? active->mAgeTimer.m_uPackedTime : 0;
++            words[count++] = (u32)machine->mPendingState;
++            for (int state = 0; state < machine->mStateCount && count < 3 + 32; state++)
++            {
++                shdStateMachine* concurrent = machine->mConcurrentStates[state];
++                words[count++] = concurrent != 0 && concurrent->IsActive() ? concurrent->mAgeTimer.m_uPackedTime : 0xFFFFFFFFu;
++            }
++            TraceNetworkWords("ai", team * 4 + i, words, count);
 +        }
 +    }
 +    // The synchronized input every machine simulates with, per player
