@@ -11,7 +11,11 @@ DWC scene keep their gates. The LAN session starts ranked matches, but
 without a stats server or the online ranking overlay (scene 93): after each
 game the post-game results continue the series directly, like an unranked
 network game, and a finished series returns to Main Menu like a friendly
-match instead of pushing the unadmitted online hub.
+match instead of pushing the unadmitted online hub. The online lobby does not
+exist outside NET_MODE_ONLINE, so a peer lost during the draft (captain,
+sidekick or matchmaking draft scene) ends the LAN session instead of closing
+the online lobby's connections, and its popup returns to Main Menu instead
+of the unadmitted online menus.
 
 The admission prints the original DC_NETWORK debug channel to stderr.
 SHOnlinePlayerCount's button context words are narrowed through
@@ -104,6 +108,84 @@ index b9e2d39..876af04 100644
      case SCENE_ONLINE_LOGIN:
          newHandler = new (nlMalloc(sizeof(SHOnlineLogin), 8, false)) SHOnlineLogin();
          break;
+diff --git a/src/Game/SH/SHChooseCaptains.cpp b/src/Game/SH/SHChooseCaptains.cpp
+index 371aeb9..c3d9d3c 100644
+--- a/src/Game/SH/SHChooseCaptains.cpp
++++ b/src/Game/SH/SHChooseCaptains.cpp
+@@ -1327,6 +1327,17 @@ void ChooseCaptainsSceneV2::ReleaseController(int index)
+ void ChooseCaptainsSceneV2::OnDisconnectDismissed()
+ {
+     mPopupActive = false;
++#if defined(MSCHARGED_NATIVE) && defined(MSCHARGED_DIAGNOSTIC_FRONTEND_LAN)
++    if (g_pNetworkSessionBase->GetSessionMode() != NET_MODE_ONLINE)
++    {
++        // The LAN admission has no online menu: leave the network draft for
++        // Main Menu the way the online error popups do.
++        GameSceneManager::Instance()->Pop();
++        FEAudio::PlayAnimAudioEvent(0x4430B152, 0, 0, 1);
++        FrontEndPresentation::GetInstance()->Call("TransitionOnlineMatchToMainMenu");
++        return;
++    }
++#endif
+     FEAudio::PlayAnimAudioEvent(0x37A9934D, 0, 0, 1);
+     GameSceneManager::Instance()->Push(SCENE_ONLINE_MENU, SCREEN_BACK, true);
+ }
+@@ -1370,7 +1381,16 @@ void ChooseCaptainsSceneV2::SetSelectButtonBounds(int side)
+ 
+ inline void ChooseCaptainsSceneV2::ShowDisconnectedError()
+ {
++#if defined(MSCHARGED_NATIVE) && defined(MSCHARGED_DIAGNOSTIC_FRONTEND_LAN)
++    // GetOnlineLobby() is 0 outside NET_MODE_ONLINE: the LAN admission ends
++    // its session instead of closing the online lobby's connections.
++    if (g_pNetworkSessionBase->GetSessionMode() != NET_MODE_ONLINE)
++        g_pNetworkSessionBase->Shutdown();
++    else
++        g_pNetworkSession->GetOnlineLobby()->CloseConnectionsAndReset();
++#else
+     g_pNetworkSession->GetOnlineLobby()->CloseConnectionsAndReset();
++#endif
+     NetworkDraft::Instance()->UnregisterMessageReceivers();
+     if (GameSceneManager::Instance()->GetSceneType(GameSceneManager::Instance()->GetCurrentScene()) != SCENE_POPUP_MENU)
+     {
+diff --git a/src/Game/SH/SHChooseSidekicks.cpp b/src/Game/SH/SHChooseSidekicks.cpp
+index bfab3d5..2732b0e 100644
+--- a/src/Game/SH/SHChooseSidekicks.cpp
++++ b/src/Game/SH/SHChooseSidekicks.cpp
+@@ -1510,6 +1510,17 @@ bool ChooseSidekicksSceneV2::AreImagesLoaded()
+ void ChooseSidekicksSceneV2::OnDisconnectDismissed()
+ {
+     mPopupActive = false;
++#if defined(MSCHARGED_NATIVE) && defined(MSCHARGED_DIAGNOSTIC_FRONTEND_LAN)
++    if (g_pNetworkSessionBase->GetSessionMode() != NET_MODE_ONLINE)
++    {
++        // The LAN admission has no online menu: leave the network draft for
++        // Main Menu the way the online error popups do.
++        GameSceneManager::Instance()->Pop();
++        FEAudio::PlayAnimAudioEvent(0x4430B152, 0, 0, 1);
++        FrontEndPresentation::GetInstance()->Call("TransitionOnlineMatchToMainMenu");
++        return;
++    }
++#endif
+     FEAudio::PlayAnimAudioEvent(0x37A9934D, 0, 0, 1);
+     GameSceneManager::Instance()->Push(SCENE_ONLINE_MENU, SCREEN_BACK, true);
+ }
+@@ -1531,7 +1542,16 @@ void ChooseSidekicksSceneV2::ReleaseController(int index)
+ 
+ inline void ChooseSidekicksSceneV2::ShowDisconnectedError()
+ {
++#if defined(MSCHARGED_NATIVE) && defined(MSCHARGED_DIAGNOSTIC_FRONTEND_LAN)
++    // GetOnlineLobby() is 0 outside NET_MODE_ONLINE: the LAN admission ends
++    // its session instead of closing the online lobby's connections.
++    if (g_pNetworkSessionBase->GetSessionMode() != NET_MODE_ONLINE)
++        g_pNetworkSessionBase->Shutdown();
++    else
++        g_pNetworkSession->GetOnlineLobby()->CloseConnectionsAndReset();
++#else
+     g_pNetworkSession->GetOnlineLobby()->CloseConnectionsAndReset();
++#endif
+     NetworkDraft::Instance()->UnregisterMessageReceivers();
+     if (GameSceneManager::Instance()->GetSceneType(GameSceneManager::Instance()->GetCurrentScene()) != SCENE_POPUP_MENU)
+     {
 diff --git a/src/Game/SH/SHMainMenu.cpp b/src/Game/SH/SHMainMenu.cpp
 index 8fa7aff..6c2fbd2 100644
 --- a/src/Game/SH/SHMainMenu.cpp
@@ -154,6 +236,30 @@ index 47f72f0..c288725 100644
              g_pNetworkSessionBase->SetSessionState(NET_SESSION_NONE);
          }
      }
+diff --git a/src/Game/SH/SHOnlineMatchmakingDraft.cpp b/src/Game/SH/SHOnlineMatchmakingDraft.cpp
+index e421f5e..a59af49 100644
+--- a/src/Game/SH/SHOnlineMatchmakingDraft.cpp
++++ b/src/Game/SH/SHOnlineMatchmakingDraft.cpp
+@@ -363,7 +363,19 @@ void SHOnlineMatchmakingDraft::Update(float fDeltaT)
+         UpdateDraftStatuses();
+         if (NetworkDraft::Instance()->mState == NET_DRAFT_DISCONNECTED)
+         {
++#if defined(MSCHARGED_NATIVE) && defined(MSCHARGED_DIAGNOSTIC_FRONTEND_LAN)
++            // The LAN admission has no online lobby or ranked menu: end the
++            // LAN session and return to Main Menu once the popup is dismissed.
++            if (g_pNetworkSession->GetSessionMode() != NET_MODE_ONLINE)
++            {
++                g_pNetworkSession->Shutdown();
++                mReturnScene = SCENE_MAIN_MENU;
++            }
++            else
++                g_pNetworkSession->GetOnlineLobby()->CloseConnectionsAndReset();
++#else
+             g_pNetworkSession->GetOnlineLobby()->CloseConnectionsAndReset();
++#endif
+             ShowError(0x60);
+             return;
+         }
 diff --git a/src/Game/SH/SHOnlinePlayerCount.cpp b/src/Game/SH/SHOnlinePlayerCount.cpp
 index 3f58812..bd8adbd 100644
 --- a/src/Game/SH/SHOnlinePlayerCount.cpp
