@@ -15,7 +15,10 @@ match instead of pushing the unadmitted online hub. The online lobby does not
 exist outside NET_MODE_ONLINE, so a peer lost during the draft (captain,
 sidekick or matchmaking draft scene) ends the LAN session instead of closing
 the online lobby's connections, and its popup returns to Main Menu instead
-of the unadmitted online menus.
+of the unadmitted online menus. The lobby is entered from Main Menu without
+the online camera transition, so that return is the lobby back button's plain
+Main Menu push, not TransitionOnlineMatchToMainMenu (which pops a camera this
+flow never pushed and crashed from the sidekick draft).
 
 The admission prints the original DC_NETWORK debug channel to stderr.
 SHOnlinePlayerCount's button context words are narrowed through
@@ -109,27 +112,27 @@ index b9e2d39..876af04 100644
          newHandler = new (nlMalloc(sizeof(SHOnlineLogin), 8, false)) SHOnlineLogin();
          break;
 diff --git a/src/Game/SH/SHChooseCaptains.cpp b/src/Game/SH/SHChooseCaptains.cpp
-index 371aeb9..c3d9d3c 100644
+index 371aeb9..d1edd04 100644
 --- a/src/Game/SH/SHChooseCaptains.cpp
 +++ b/src/Game/SH/SHChooseCaptains.cpp
-@@ -1327,6 +1327,17 @@ void ChooseCaptainsSceneV2::ReleaseController(int index)
- void ChooseCaptainsSceneV2::OnDisconnectDismissed()
+@@ -1328,6 +1328,17 @@ void ChooseCaptainsSceneV2::OnDisconnectDismissed()
  {
      mPopupActive = false;
+     FEAudio::PlayAnimAudioEvent(0x37A9934D, 0, 0, 1);
 +#if defined(MSCHARGED_NATIVE) && defined(MSCHARGED_DIAGNOSTIC_FRONTEND_LAN)
++    // The LAN admission has no online menu. Its lobby is entered from Main
++    // Menu without the online camera transition, so return there the way the
++    // lobby's back button does, not through TransitionOnlineMatchToMainMenu
++    // (which pops a camera this flow never pushed).
 +    if (g_pNetworkSessionBase->GetSessionMode() != NET_MODE_ONLINE)
 +    {
-+        // The LAN admission has no online menu: leave the network draft for
-+        // Main Menu the way the online error popups do.
-+        GameSceneManager::Instance()->Pop();
-+        FEAudio::PlayAnimAudioEvent(0x4430B152, 0, 0, 1);
-+        FrontEndPresentation::GetInstance()->Call("TransitionOnlineMatchToMainMenu");
++        GameSceneManager::Instance()->Push(SCENE_MAIN_MENU, SCREEN_BACK, true);
 +        return;
 +    }
 +#endif
-     FEAudio::PlayAnimAudioEvent(0x37A9934D, 0, 0, 1);
      GameSceneManager::Instance()->Push(SCENE_ONLINE_MENU, SCREEN_BACK, true);
  }
+ 
 @@ -1370,7 +1381,16 @@ void ChooseCaptainsSceneV2::SetSelectButtonBounds(int side)
  
  inline void ChooseCaptainsSceneV2::ShowDisconnectedError()
@@ -148,27 +151,27 @@ index 371aeb9..c3d9d3c 100644
      if (GameSceneManager::Instance()->GetSceneType(GameSceneManager::Instance()->GetCurrentScene()) != SCENE_POPUP_MENU)
      {
 diff --git a/src/Game/SH/SHChooseSidekicks.cpp b/src/Game/SH/SHChooseSidekicks.cpp
-index bfab3d5..2732b0e 100644
+index bfab3d5..eeaefc0 100644
 --- a/src/Game/SH/SHChooseSidekicks.cpp
 +++ b/src/Game/SH/SHChooseSidekicks.cpp
-@@ -1510,6 +1510,17 @@ bool ChooseSidekicksSceneV2::AreImagesLoaded()
- void ChooseSidekicksSceneV2::OnDisconnectDismissed()
+@@ -1511,6 +1511,17 @@ void ChooseSidekicksSceneV2::OnDisconnectDismissed()
  {
      mPopupActive = false;
+     FEAudio::PlayAnimAudioEvent(0x37A9934D, 0, 0, 1);
 +#if defined(MSCHARGED_NATIVE) && defined(MSCHARGED_DIAGNOSTIC_FRONTEND_LAN)
++    // The LAN admission has no online menu. Its lobby is entered from Main
++    // Menu without the online camera transition, so return there the way the
++    // lobby's back button does, not through TransitionOnlineMatchToMainMenu
++    // (which pops a camera this flow never pushed).
 +    if (g_pNetworkSessionBase->GetSessionMode() != NET_MODE_ONLINE)
 +    {
-+        // The LAN admission has no online menu: leave the network draft for
-+        // Main Menu the way the online error popups do.
-+        GameSceneManager::Instance()->Pop();
-+        FEAudio::PlayAnimAudioEvent(0x4430B152, 0, 0, 1);
-+        FrontEndPresentation::GetInstance()->Call("TransitionOnlineMatchToMainMenu");
++        GameSceneManager::Instance()->Push(SCENE_MAIN_MENU, SCREEN_BACK, true);
 +        return;
 +    }
 +#endif
-     FEAudio::PlayAnimAudioEvent(0x37A9934D, 0, 0, 1);
      GameSceneManager::Instance()->Push(SCENE_ONLINE_MENU, SCREEN_BACK, true);
  }
+ 
 @@ -1531,7 +1542,16 @@ void ChooseSidekicksSceneV2::ReleaseController(int index)
  
  inline void ChooseSidekicksSceneV2::ShowDisconnectedError()
@@ -237,21 +240,17 @@ index 47f72f0..c288725 100644
          }
      }
 diff --git a/src/Game/SH/SHOnlineMatchmakingDraft.cpp b/src/Game/SH/SHOnlineMatchmakingDraft.cpp
-index e421f5e..a59af49 100644
+index e421f5e..e93a94b 100644
 --- a/src/Game/SH/SHOnlineMatchmakingDraft.cpp
 +++ b/src/Game/SH/SHOnlineMatchmakingDraft.cpp
-@@ -363,7 +363,19 @@ void SHOnlineMatchmakingDraft::Update(float fDeltaT)
+@@ -363,7 +363,15 @@ void SHOnlineMatchmakingDraft::Update(float fDeltaT)
          UpdateDraftStatuses();
          if (NetworkDraft::Instance()->mState == NET_DRAFT_DISCONNECTED)
          {
 +#if defined(MSCHARGED_NATIVE) && defined(MSCHARGED_DIAGNOSTIC_FRONTEND_LAN)
-+            // The LAN admission has no online lobby or ranked menu: end the
-+            // LAN session and return to Main Menu once the popup is dismissed.
++            // The LAN admission has no online lobby: end the LAN session.
 +            if (g_pNetworkSession->GetSessionMode() != NET_MODE_ONLINE)
-+            {
 +                g_pNetworkSession->Shutdown();
-+                mReturnScene = SCENE_MAIN_MENU;
-+            }
 +            else
 +                g_pNetworkSession->GetOnlineLobby()->CloseConnectionsAndReset();
 +#else
@@ -260,6 +259,23 @@ index e421f5e..a59af49 100644
              ShowError(0x60);
              return;
          }
+@@ -432,6 +440,16 @@ void SHOnlineMatchmakingDraft::Update(float fDeltaT)
+ void SHOnlineMatchmakingDraft::OnErrorDismissed()
+ {
+     mErrorPopupOpen = false;
++#if defined(MSCHARGED_NATIVE) && defined(MSCHARGED_DIAGNOSTIC_FRONTEND_LAN)
++    // The LAN admission has no ranked menu, and its lobby is entered from Main
++    // Menu without the online camera transition: return there the way the
++    // lobby's back button does.
++    if (g_pNetworkSession->GetSessionMode() != NET_MODE_ONLINE)
++    {
++        GameSceneManager::Instance()->Push(SCENE_MAIN_MENU, SCREEN_BACK, true);
++        return;
++    }
++#endif
+     if (mReturnScene == SCENE_MAIN_MENU)
+     {
+         GameSceneManager::Instance()->Pop();
 diff --git a/src/Game/SH/SHOnlinePlayerCount.cpp b/src/Game/SH/SHOnlinePlayerCount.cpp
 index 3f58812..bd8adbd 100644
 --- a/src/Game/SH/SHOnlinePlayerCount.cpp
