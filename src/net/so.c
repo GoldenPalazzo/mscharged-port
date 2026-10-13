@@ -6,6 +6,7 @@
 #include <netinet/in.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <unistd.h>
 
 #include "so_convert.h"
 #include "so_host.h"
@@ -255,17 +256,7 @@ static int so_send_to(int s, const void* buf, int len, int flags, const void* so
     return so_backend_release_io(s, sent == -1 ? so_error_from_errno(errno) : (int)sent);
 }
 
-int SOSendTo(int s, const void* buf, int len, int flags, const void* sockTo)
-{
-    return so_send_to(s, buf, len, flags, sockTo);
-}
-
-int SOSend(int s, const void *buf, int len, int flags)
-{
-    return so_send_to(s, buf, len, flags, NULL);
-}
-
-int SORecvFrom(int s, void* buf, int len, int flags, void* sockFrom)
+static int so_recv_from(int s, void* buf, int len, int flags, void* sockFrom)
 {
     int result = so_backend_check_active();
     if (result != SO_SUCCESS)
@@ -281,13 +272,35 @@ int SORecvFrom(int s, void* buf, int len, int flags, void* sockFrom)
     result = so_backend_acquire(s, &real_fd);
     if (result != SO_SUCCESS)
         return result;
+    ssize_t received;
     struct sockaddr_in addr;
     socklen_t addrlen = sizeof(addr);
-    ssize_t received = recvfrom(real_fd, buf, (size_t)len, 0, (struct sockaddr *)&addr, &addrlen);
+    received = recvfrom(real_fd, buf, (size_t)len, 0, (struct sockaddr *)&addr, &addrlen);
     result = so_backend_release_io(s, received == -1 ? so_error_from_errno(errno) : (int)received);
     if (result >= 0 && sockFrom != NULL)
         from_native_sockaddr(sockFrom, &addr);
+    
     return result;
+}
+
+int SOSendTo(int s, const void* buf, int len, int flags, const void* sockTo)
+{
+    return so_send_to(s, buf, len, flags, sockTo);
+}
+
+int SOSend(int s, const void *buf, int len, int flags)
+{
+    return so_send_to(s, buf, len, flags, NULL);
+}
+
+int SORecv(int s, void* buf, int len, int flags)
+{
+    return so_recv_from(s, buf, len, flags, NULL);
+}
+
+int SORecvFrom(int s, void* buf, int len, int flags, void* sockFrom)
+{
+    return so_recv_from(s, buf, len, flags, sockFrom);
 }
 
 int SOGetSockName(int s, void* sockAddr)
@@ -376,4 +389,54 @@ int SOConnect(int s, const void* sockAddr)
     if (connect(real_fd, (struct sockaddr*)&addrnative, sizeof(addrnative)) == -1)
         result = so_error_from_errno(errno);
     return so_backend_release_io(s, result);
+}
+
+
+int SOListen(int s, int backlog)
+{
+    int result = so_backend_check_active();
+    if (result != SO_SUCCESS)
+        return result;
+    int real_fd;
+    result = so_backend_acquire(s, &real_fd);
+    if (result != SO_SUCCESS)
+        return result;
+    if (listen(real_fd, backlog) == -1)
+        result = so_error_from_errno(errno);
+    so_backend_release(s);
+    return result;
+}
+
+int SOAccept(int s, void* sockAddr)
+{
+    int result = so_backend_check_active();
+    if (result != SO_SUCCESS)
+        return result;
+
+    const SOSockAddr* nlAddr = sockAddr;
+    if (sockAddr != NULL
+        && nlAddr->len != sizeof(SOSockAddr))
+        return SO_EINVAL;
+
+    int real_fd;
+    result = so_backend_acquire(s, &real_fd);
+    if (result != SO_SUCCESS)
+        return result;
+    struct sockaddr_in addr;
+    socklen_t size = sizeof(addr);
+    int new_conn = accept(real_fd, (struct sockaddr*)&addr, &size);
+    result = so_backend_release_io(s, new_conn == -1 ? so_error_from_errno(errno) : SO_SUCCESS);
+    if (result >= 0)
+    {
+        result = so_backend_insert_accepted(new_conn);
+        if (result >= 0 && sockAddr != NULL)
+        {
+            from_native_sockaddr(sockAddr, &addr);
+        }
+    }
+    else if (new_conn >= 0)
+    {
+        close(new_conn);
+    }
+    return result;
 }

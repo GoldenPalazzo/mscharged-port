@@ -18,6 +18,7 @@ int so_backend_check_active_locked(void);
 int so_backend_check_active(void);
 
 int so_backend_open(int pf, int type, int protocol);
+int so_backend_insert_accepted(int fd);
 int so_backend_close_locked(int s);
 void so_backend_close_all_locked(void);
 

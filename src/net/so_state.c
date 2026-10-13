@@ -82,32 +82,37 @@ static int slot_find_free_locked(void)
     return SO_EMFILE;
 }
 
-static int so_open_native_socket(int pf, int type, int protocol)
+static int so_configure_native_socket(int sock, int type)
 {
-    // protocol is safe since it's always called with protocol=0
-    int sock = socket(to_native_family(pf), to_native_type(type), protocol);
-    if (sock < 0)
-        return so_error_from_errno(errno);
+    int result = sock;
+    int enable = 1;
 #ifndef MSG_NOSIGNAL
-    int optval = 1;
-    if (setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE, &optval, sizeof(optval)) < 0)
+    if (setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE, &enable, sizeof(enable)) < 0)
     {
-        int result = so_error_from_errno(errno);
+        result = so_error_from_errno(errno);
         close(sock);
         return result;
     }
 #endif
     if (type == SO_SOCK_DGRAM)
     {
-        int enable = 1;
         if (setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &enable, sizeof(enable)) < 0)
         {
-            int result = so_error_from_errno(errno);
+            result = so_error_from_errno(errno);
             close(sock);
             return result;
         }
     }
-    return sock;
+    return result;
+}
+
+static int so_open_native_socket(int pf, int type, int protocol)
+{
+    // protocol is safe since it's always called with protocol=0
+    int sock = socket(to_native_family(pf), to_native_type(type), protocol);
+    if (sock < 0)
+        return so_error_from_errno(errno);
+    return so_configure_native_socket(sock, type);
 }
 
 // socket() and setsockopt() never block, so creating the descriptor under the
@@ -125,6 +130,27 @@ int so_backend_open(int pf, int type, int protocol)
             result = sock;
         else
             slots[result] = (struct slot){ .fd = sock, .refs = 0, .state = SLOT_OPEN };
+    }
+    pthread_mutex_unlock(&so_lock);
+    return result;
+}
+
+int so_backend_insert_accepted(int fd)
+{
+    fd = so_configure_native_socket(fd, SO_SOCK_STREAM);
+    if (fd < 0)
+        return fd;
+    pthread_mutex_lock(&so_lock);
+    int result = so_backend_check_active_locked();
+    if (result == SO_SUCCESS)
+        result = slot_find_free_locked();
+    if (result >= 0)
+    {
+        slots[result] = (struct slot){ .fd = fd, .refs = 0, .state = SLOT_OPEN };
+    }
+    else
+    {
+        close(fd);
     }
     pthread_mutex_unlock(&so_lock);
     return result;
