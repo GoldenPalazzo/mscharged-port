@@ -1,3 +1,6 @@
+#include <arpa/inet.h>
+#include <stdio.h>
+#include <netdb.h>
 #include <revolution/so.h>
 #include <errno.h>
 #include <stdarg.h>
@@ -529,3 +532,85 @@ int SOGetSockOpt(int s, int level, int optname, void* optval, int* optlen)
     *optlen = (int)length;
     return result;
 }
+
+
+int SOInetAtoN(const char* cp, SOInAddr* inp)
+{
+    struct in_addr inaddr;
+    int res = inet_aton(cp, &inaddr);
+    if (res >= 0 && inp != NULL)
+        inp->addr = inaddr.s_addr;
+    return res;
+}
+
+static char addressBuffer[40];
+char* SOInetNtoA(SOInAddr in)
+{
+    u8* addr = (u8*)&in;
+    sprintf(addressBuffer, "%d.%d.%d.%d", addr[0], addr[1], addr[2], addr[3]);
+    return addressBuffer;
+}
+
+// The SDK fills one 0x460-byte buffer allocated by SOInit (soWork._unk10) and
+// returns it, so a result is valid until the next call. Callers only read the
+// SOHostEnt fields, so this keeps a native layout instead of the IOS one. It
+// is per thread: GameSpy resolves both on its resolver thread and on the main
+// thread, and reads the result after the call returns.
+#define SO_HOSTENT_MAX_ADDRS 16
+
+struct so_hostent_storage
+{
+    SOHostEnt host;
+    char name[256];
+    char* aliases[1];
+    u8* addr_list[SO_HOSTENT_MAX_ADDRS + 1];
+    SOInAddr addrs[SO_HOSTENT_MAX_ADDRS];
+};
+static _Thread_local struct so_hostent_storage so_hostent;
+
+SOHostEnt* SOGetHostByName(const char* name)
+{
+    if (so_backend_check_active() != SO_SUCCESS || name == NULL)
+        return NULL;
+
+    struct addrinfo hints = {
+        .ai_family = AF_INET,
+        .ai_socktype = SOCK_STREAM,
+        .ai_flags = AI_CANONNAME,
+    };
+    struct addrinfo* res;
+    if (getaddrinfo(name, NULL, &hints, &res) != 0)
+        return NULL;
+
+    struct so_hostent_storage* storage = &so_hostent;
+    size_t count = 0;
+    for (const struct addrinfo* ai = res; ai != NULL && count < SO_HOSTENT_MAX_ADDRS; ai = ai->ai_next)
+    {
+        if (ai->ai_family != AF_INET)
+            continue;
+        // Both keep the address in network byte order.
+        const struct sockaddr_in* sin = (const struct sockaddr_in*)ai->ai_addr;
+        storage->addrs[count].addr = sin->sin_addr.s_addr;
+        storage->addr_list[count] = (u8*)&storage->addrs[count];
+        count++;
+    }
+    storage->addr_list[count] = NULL;
+
+    const char* canonical = res->ai_canonname != NULL ? res->ai_canonname : name;
+    snprintf(storage->name, sizeof(storage->name), "%s", canonical);
+    freeaddrinfo(res);
+    if (count == 0)
+        return NULL;
+
+    storage->aliases[0] = NULL;
+    storage->host = (SOHostEnt){
+        .name = storage->name,
+        .aliases = storage->aliases,
+        .addrType = SO_PF_INET,
+        .length = (s16)sizeof(SOInAddr),
+        .addrList = storage->addr_list,
+    };
+    return &storage->host;
+}
+
+
