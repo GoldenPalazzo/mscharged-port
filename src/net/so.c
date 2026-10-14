@@ -6,6 +6,7 @@
 #include <netinet/in.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <string.h>
 #include <unistd.h>
 
 #include "so_convert.h"
@@ -141,7 +142,7 @@ int SOBind(int s, const void *sockAddr)
         return SO_EINVAL;
 
     int real_fd;
-    result = so_backend_acquire(s, &real_fd);
+    result = so_backend_acquire(s, &real_fd, NULL);
     if (result != SO_SUCCESS)
         return result;
 
@@ -193,7 +194,7 @@ int SOFcntl(int s, int cmd, ...)
         return result;
 
     int real_fd;
-    result = so_backend_acquire(s, &real_fd);
+    result = so_backend_acquire(s, &real_fd, NULL);
     if (result != SO_SUCCESS)
         return result;
     result = so_fcntl_native(real_fd, cmd, arg);
@@ -240,7 +241,8 @@ static int so_send_to(int s, const void* buf, int len, int flags, const void* so
     if (len < 0 || (len > 0 && buf == NULL))
         return SO_EINVAL;
     int real_fd;
-    result = so_backend_acquire(s, &real_fd);
+    struct so_backend_io io;
+    result = so_backend_acquire_io(s, SO_BACKEND_WRITE, SO_ENOTCONN, &real_fd, &io);
     if (result != SO_SUCCESS)
         return result;
     ssize_t sent;
@@ -253,7 +255,7 @@ static int so_send_to(int s, const void* buf, int len, int flags, const void* so
     {
         sent = send(real_fd, buf, (size_t)len, flags);
     }
-    return so_backend_release_io(s, sent == -1 ? so_error_from_errno(errno) : (int)sent);
+    return so_backend_release_io(&io, sent == -1 ? so_error_from_errno(errno) : (int)sent);
 }
 
 static int so_recv_from(int s, void* buf, int len, int flags, void* sockFrom)
@@ -269,14 +271,15 @@ static int so_recv_from(int s, void* buf, int len, int flags, void* sockFrom)
     if (len < 0 || (len > 0 && buf == NULL))
         return SO_EINVAL;
     int real_fd;
-    result = so_backend_acquire(s, &real_fd);
+    struct so_backend_io io;
+    result = so_backend_acquire_io(s, SO_BACKEND_READ, SO_ENOTCONN, &real_fd, &io);
     if (result != SO_SUCCESS)
         return result;
     ssize_t received;
     struct sockaddr_in addr;
     socklen_t addrlen = sizeof(addr);
     received = recvfrom(real_fd, buf, (size_t)len, 0, (struct sockaddr *)&addr, &addrlen);
-    result = so_backend_release_io(s, received == -1 ? so_error_from_errno(errno) : (int)received);
+    result = so_backend_release_io(&io, received == -1 ? so_error_from_errno(errno) : (int)received);
     if (result >= 0 && sockFrom != NULL)
         from_native_sockaddr(sockFrom, &addr);
     
@@ -313,7 +316,7 @@ int SOGetSockName(int s, void* sockAddr)
     if (addr == NULL || sizeof(SOSockAddr) < addr->len || addr->len < sizeof(SOSockAddr))
         return SO_EINVAL;
     int real_fd;
-    result = so_backend_acquire(s, &real_fd);
+    result = so_backend_acquire(s, &real_fd, NULL);
     if (result != SO_SUCCESS)
         return result;
     struct sockaddr_in addrnative;
@@ -382,13 +385,14 @@ int SOConnect(int s, const void* sockAddr)
     if (addr == NULL || sizeof(SOSockAddr) < addr->len || addr->len < sizeof(SOSockAddr))
         return SO_EINVAL;
     int real_fd;
-    result = so_backend_acquire(s, &real_fd);
+    struct so_backend_io io;
+    result = so_backend_acquire_io(s, SO_BACKEND_WRITE, SO_ENETUNREACH, &real_fd, &io);
     if (result != SO_SUCCESS)
         return result;
     struct sockaddr_in addrnative = to_native_sockaddr((const SOSockAddrIn*)addr);
     if (connect(real_fd, (struct sockaddr*)&addrnative, sizeof(addrnative)) == -1)
         result = so_error_from_errno(errno);
-    return so_backend_release_io(s, result);
+    return so_backend_release_io(&io, result);
 }
 
 
@@ -398,7 +402,7 @@ int SOListen(int s, int backlog)
     if (result != SO_SUCCESS)
         return result;
     int real_fd;
-    result = so_backend_acquire(s, &real_fd);
+    result = so_backend_acquire(s, &real_fd, NULL);
     if (result != SO_SUCCESS)
         return result;
     if (listen(real_fd, backlog) == -1)
@@ -419,13 +423,14 @@ int SOAccept(int s, void* sockAddr)
         return SO_EINVAL;
 
     int real_fd;
-    result = so_backend_acquire(s, &real_fd);
+    struct so_backend_io io;
+    result = so_backend_acquire_io(s, SO_BACKEND_WRITE, SO_EINVAL, &real_fd, &io);
     if (result != SO_SUCCESS)
         return result;
     struct sockaddr_in addr;
     socklen_t size = sizeof(addr);
     int new_conn = accept(real_fd, (struct sockaddr*)&addr, &size);
-    result = so_backend_release_io(s, new_conn == -1 ? so_error_from_errno(errno) : SO_SUCCESS);
+    result = so_backend_release_io(&io, new_conn == -1 ? so_error_from_errno(errno) : SO_SUCCESS);
     if (result >= 0)
     {
         result = so_backend_insert_accepted(new_conn);
@@ -438,5 +443,89 @@ int SOAccept(int s, void* sockAddr)
     {
         close(new_conn);
     }
+    return result;
+}
+
+
+int SOShutdown(int s, int how)
+{
+    int result = so_backend_check_active();
+    if (result != SO_SUCCESS)
+        return result;
+    const int native_how = to_native_how(how);
+    if (native_how == -1)
+        return SO_EINVAL;
+
+    int real_fd, real_type;
+    result = so_backend_acquire(s, &real_fd, &real_type);
+    if (result != SO_SUCCESS)
+        return result;
+    // The Wii does nothing and returns 0 for UDP (Dolphin PR 8758's hwtest).
+    if (real_type == SOCK_STREAM)
+    {
+        const bool shut_read = native_how == SHUT_RD || native_how == SHUT_RDWR;
+        const bool shut_write = native_how == SHUT_WR || native_how == SHUT_RDWR;
+        so_backend_record_shutdown(s, shut_read, shut_write);
+        if (shutdown(real_fd, native_how) == -1)
+            result = so_error_from_errno(errno);
+    }
+    so_backend_release(s);
+    return result;
+}
+
+// The SDK copies option values through a 20-byte IOS buffer.
+#define SO_SOCKOPT_MAX_LEN 20
+
+int SOSetSockOpt(int s, int level, int optname, const void* optval, int optlen)
+{
+    int result = so_backend_check_active();
+    if (result != SO_SUCCESS)
+        return result;
+    if (optlen < 0 || optlen > SO_SOCKOPT_MAX_LEN)
+        return SO_EINVAL;
+    int native_level, native_optname;
+    if (!to_native_sockopt(level, optname, &native_level, &native_optname))
+        return SO_ENOPROTOOPT;
+    // A NULL value is zero-filled, as the SDK does before calling IOS.
+    static const u8 zeros[SO_SOCKOPT_MAX_LEN];
+    const void* native_value = optval != NULL ? optval : zeros;
+
+    int real_fd;
+    result = so_backend_acquire(s, &real_fd, NULL);
+    if (result != SO_SUCCESS)
+        return result;
+    if (setsockopt(real_fd, native_level, native_optname, native_value, (socklen_t)optlen) == -1)
+        result = so_error_from_errno(errno);
+    so_backend_release(s);
+    return result;
+}
+
+int SOGetSockOpt(int s, int level, int optname, void* optval, int* optlen)
+{
+    int result = so_backend_check_active();
+    if (result != SO_SUCCESS)
+        return result;
+    int native_level, native_optname;
+    if (!to_native_sockopt(level, optname, &native_level, &native_optname))
+        return SO_ENOPROTOOPT;
+
+    int real_fd;
+    result = so_backend_acquire(s, &real_fd, NULL);
+    if (result != SO_SUCCESS)
+        return result;
+    u8 value[SO_SOCKOPT_MAX_LEN];
+    socklen_t length = sizeof(value);
+    if (getsockopt(real_fd, native_level, native_optname, value, &length) == -1)
+        result = so_error_from_errno(errno);
+    so_backend_release(s);
+    if (result != SO_SUCCESS || optlen == NULL)
+        return result;
+
+    // As in the SDK, a short buffer gets the needed length and SO_EINVAL.
+    if (*optlen < (int)length)
+        result = SO_EINVAL;
+    else if (optval != NULL)
+        memcpy(optval, value, length);
+    *optlen = (int)length;
     return result;
 }

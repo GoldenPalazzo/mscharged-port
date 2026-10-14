@@ -2,6 +2,7 @@
 
 #include <pthread.h>
 #include <stdbool.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include "so_convert.h"
@@ -9,7 +10,14 @@
 #define SO_BACKEND_MAX_SOCKET 32
 
 enum slot_state { SLOT_FREE, SLOT_OPEN, SLOT_CLOSING };
-struct slot { int fd, refs; enum slot_state state; };
+struct slot
+{
+    int fd, refs, type;
+    // SOShutdown calls per direction, so an operation can tell whether one
+    // arrived while it was waiting.
+    unsigned int shutdowns[2];
+    enum slot_state state;
+};
 static struct slot slots[SO_BACKEND_MAX_SOCKET];
 static pthread_mutex_t so_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -129,7 +137,12 @@ int so_backend_open(int pf, int type, int protocol)
         if (sock < 0)
             result = sock;
         else
-            slots[result] = (struct slot){ .fd = sock, .refs = 0, .state = SLOT_OPEN };
+            slots[result] = (struct slot){ 
+                .fd = sock,
+                .refs = 0,
+                .type = to_native_type(type),
+                .state = SLOT_OPEN
+            };
     }
     pthread_mutex_unlock(&so_lock);
     return result;
@@ -146,7 +159,12 @@ int so_backend_insert_accepted(int fd)
         result = slot_find_free_locked();
     if (result >= 0)
     {
-        slots[result] = (struct slot){ .fd = fd, .refs = 0, .state = SLOT_OPEN };
+        slots[result] = (struct slot){
+            .fd = fd,
+            .refs = 0,
+            .type = SOCK_STREAM,
+            .state = SLOT_OPEN
+        };
     }
     else
     {
@@ -180,19 +198,57 @@ void so_backend_close_all_locked(void)
         so_backend_close_locked(i);
 }
 
-int so_backend_acquire(int s, int* fd)
+static int slot_acquire_locked(int s)
 {
-    pthread_mutex_lock(&so_lock);
     int result = so_backend_check_active_locked();
     if (result == SO_SUCCESS && !slot_is_open_locked(s))
         result = SO_EBADF;
     if (result == SO_SUCCESS)
-    {
         slots[s].refs++;
+    return result;
+}
+
+int so_backend_acquire(int s, int* fd, int* type)
+{
+    pthread_mutex_lock(&so_lock);
+    int result = slot_acquire_locked(s);
+    if (result == SO_SUCCESS)
+    {
         *fd = slots[s].fd;
+        if (type != NULL)
+            *type = slots[s].type;
     }
     pthread_mutex_unlock(&so_lock);
     return result;
+}
+
+int so_backend_acquire_io(int s, enum so_backend_direction direction, int shutdown_error,
+    int* fd, struct so_backend_io* io)
+{
+    pthread_mutex_lock(&so_lock);
+    int result = slot_acquire_locked(s);
+    if (result == SO_SUCCESS)
+    {
+        *fd = slots[s].fd;
+        *io = (struct so_backend_io){
+            .s = s,
+            .direction = direction,
+            .shutdown_error = shutdown_error,
+            .shutdowns = slots[s].shutdowns[direction],
+        };
+    }
+    pthread_mutex_unlock(&so_lock);
+    return result;
+}
+
+void so_backend_record_shutdown(int s, bool shut_read, bool shut_write)
+{
+    pthread_mutex_lock(&so_lock);
+    if (shut_read)
+        slots[s].shutdowns[SO_BACKEND_READ]++;
+    if (shut_write)
+        slots[s].shutdowns[SO_BACKEND_WRITE]++;
+    pthread_mutex_unlock(&so_lock);
 }
 
 static void slot_release_locked(int s)
@@ -212,21 +268,31 @@ void so_backend_release(int s)
 }
 
 // IOS fails the operations still pending on a socket it closes with
-// SO_ENOTCONN; the host instead returns 0 from a recv woken by shutdown().
-int so_backend_release_io(int s, int result)
+// SO_ENOTCONN, and those a shutdown ends with the operation's own error
+// (Dolphin's CloseFd and Shutdown; hwtest in dolphin-emu PR 8758). The host
+// instead returns 0 from a recv woken by shutdown(). Data that arrived before
+// the interruption is still reported.
+int so_backend_release_io(const struct so_backend_io* io, int result)
 {
     pthread_mutex_lock(&so_lock);
-    bool interrupted = slots[s].state == SLOT_CLOSING;
-    slot_release_locked(s);
+    const bool closed = slots[io->s].state == SLOT_CLOSING;
+    const bool shut_down = slots[io->s].shutdowns[io->direction] != io->shutdowns;
+    slot_release_locked(io->s);
     pthread_mutex_unlock(&so_lock);
-    return interrupted && result <= 0 ? SO_ENOTCONN : result;
+    if (result > 0)
+        return result;
+    if (closed)
+        return SO_ENOTCONN;
+    if (shut_down)
+        return io->shutdown_error;
+    return result;
 }
 
 void so_backend_acquire_pollfds(struct pollfd* dst, const SOPollFD* src, unsigned int n)
 {
     for (unsigned int i = 0; i < n; i++)
     {
-        if (so_backend_acquire(src[i].fd, &dst[i].fd) != SO_SUCCESS)
+        if (so_backend_acquire(src[i].fd, &dst[i].fd, NULL) != SO_SUCCESS)
             dst[i].fd = -1;
         dst[i].events = so_pollevent_to_native(src[i].events);
         dst[i].revents = 0;

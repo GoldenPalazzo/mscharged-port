@@ -1,7 +1,8 @@
 // SO backend on host sockets, one call at a time: byte order, the library
-// lifecycle, the socket table, bind and fcntl, UDP and TCP traffic, SOPoll,
-// SOGetHostID and broadcast, each with the argument and descriptor errors the
-// SDK's soBasic.c returns. The concurrent cases are in so_backend_threads.cpp.
+// lifecycle, the socket table, bind and fcntl, UDP and TCP traffic, socket
+// options, SOPoll, SOShutdown, SOGetHostID and broadcast, each with the
+// argument and descriptor errors the SDK's soBasic.c and SOOption.c return.
+// The concurrent cases are in so_backend_threads.cpp.
 #include <revolution/so.h>
 
 #include <chrono>
@@ -261,6 +262,59 @@ void SockName(const UdpPair& udp, int closed)
     CheckResult(SOClose(eph), SO_SUCCESS, "getsockname: SOClose on the ephemeral-port socket");
 }
 
+// The options NHTTP and GameSpy set: SO_SO_RCVBUF and SO_SO_SNDBUF. Linux
+// doubles a buffer size it is given and reports the doubled value, so the
+// value read back is only checked to be at least the one set.
+void SockOpt(const UdpPair& udp, int closed)
+{
+    for (int optname : { SO_SO_RCVBUF, SO_SO_SNDBUF })
+    {
+        const int size = 0x8000;
+        CheckResult(SOSetSockOpt(udp.rx, SO_SOL_SOCKET, optname, &size, sizeof(size)), SO_SUCCESS,
+                    "sockopt: SOSetSockOpt of a buffer size");
+        int value = 0;
+        int len = sizeof(value);
+        CheckResult(SOGetSockOpt(udp.rx, SO_SOL_SOCKET, optname, &value, &len), SO_SUCCESS,
+                    "sockopt: SOGetSockOpt of a buffer size");
+        CheckResult(len, (int)sizeof(int), "sockopt: SOGetSockOpt length of a buffer size");
+        Check(value >= size, "sockopt: the buffer size read back is smaller than the one set");
+    }
+
+    // Argument handling copied from SOOption.c: the SDK zero-fills a NULL
+    // value, rejects lengths above its 20-byte buffer, skips the copy without
+    // optlen, and reports the needed length with SO_EINVAL when it is short.
+    const int size = 0x8000;
+    CheckResult(SOSetSockOpt(udp.rx, SO_SOL_SOCKET, SO_SO_RCVBUF, NULL, sizeof(int)), SO_SUCCESS,
+                "sockopt: SOSetSockOpt with a NULL value (zero-filled)");
+    CheckResult(SOSetSockOpt(udp.rx, SO_SOL_SOCKET, SO_SO_RCVBUF, &size, -1), SO_EINVAL,
+                "sockopt: SOSetSockOpt with a negative length");
+    CheckResult(SOSetSockOpt(udp.rx, SO_SOL_SOCKET, SO_SO_RCVBUF, &size, 21), SO_EINVAL,
+                "sockopt: SOSetSockOpt longer than the SDK's 20-byte buffer");
+    int value = 0;
+    CheckResult(SOGetSockOpt(udp.rx, SO_SOL_SOCKET, SO_SO_RCVBUF, &value, NULL), SO_SUCCESS,
+                "sockopt: SOGetSockOpt without optlen");
+    int short_len = 2;
+    CheckResult(SOGetSockOpt(udp.rx, SO_SOL_SOCKET, SO_SO_RCVBUF, &value, &short_len), SO_EINVAL,
+                "sockopt: SOGetSockOpt into a 2-byte buffer");
+    CheckResult(short_len, (int)sizeof(int), "sockopt: a short SOGetSockOpt must report the needed length");
+
+    // so.h's SO_BROADCAST is 9, which is SO_KEEPALIVE on Linux: an option the
+    // backend does not know must fail rather than reach the host.
+    const int sdk_broadcast = 9;
+    const int enable = 1;
+    int len = sizeof(value);
+    CheckResult(SOSetSockOpt(udp.rx, SO_SOL_SOCKET, sdk_broadcast, &enable, sizeof(enable)), SO_ENOPROTOOPT,
+                "sockopt: SOSetSockOpt of an option the backend does not translate");
+    CheckResult(SOGetSockOpt(udp.rx, SO_SOL_SOCKET, sdk_broadcast, &value, &len), SO_ENOPROTOOPT,
+                "sockopt: SOGetSockOpt of an option the backend does not translate");
+    CheckResult(SOSetSockOpt(udp.rx, SO_SOL_TCP, 0x2001, &enable, sizeof(enable)), SO_ENOPROTOOPT,
+                "sockopt: SOSetSockOpt at a level the backend does not translate");
+    CheckResult(SOSetSockOpt(closed, SO_SOL_SOCKET, SO_SO_RCVBUF, &size, sizeof(size)), SO_EBADF,
+                "sockopt: SOSetSockOpt on a closed descriptor");
+    CheckResult(SOGetSockOpt(closed, SO_SOL_SOCKET, SO_SO_RCVBUF, &value, &len), SO_EBADF,
+                "sockopt: SOGetSockOpt on a closed descriptor");
+}
+
 // The receiver must be non-blocking with an empty queue.
 void Poll(const UdpPair& udp, int closed)
 {
@@ -310,6 +364,21 @@ void Poll(const UdpPair& udp, int closed)
     CheckResult(pfd[0].revents, 0, "poll: empty socket next to invalid ones");
     CheckResult(pfd[1].revents, SO_POLLNVAL, "poll: fd -1 revents");
     CheckResult(pfd[2].revents, SO_POLLNVAL, "poll: fd 99 revents");
+}
+
+// The Wii ignores SOShutdown on UDP (Dolphin PR 8758's hwtest): the receiver
+// must keep receiving. so.h names no modes, so only 0, 1 and 2 are valid.
+void Shutdown(const UdpPair& udp, int closed)
+{
+    u8 buf[64];
+    CheckResult(SOShutdown(udp.rx, 2), SO_SUCCESS, "shutdown: SOShutdown on a UDP socket");
+    CheckResult(SOSendTo(udp.tx, kPayload, sizeof(kPayload), 0, &udp.rx_addr), (int)sizeof(kPayload),
+                "shutdown: SOSendTo to the shut down UDP receiver");
+    CheckResult(SORecvFrom(udp.rx, buf, sizeof(buf), 0, NULL), (int)sizeof(kPayload),
+                "shutdown: a UDP socket must keep receiving after SOShutdown");
+    CheckResult(SOShutdown(udp.rx, 3), SO_EINVAL, "shutdown: SOShutdown with how=3");
+    CheckResult(SOShutdown(udp.rx, -1), SO_EINVAL, "shutdown: SOShutdown with how=-1");
+    CheckResult(SOShutdown(closed, 2), SO_EBADF, "shutdown: SOShutdown on a closed descriptor");
 }
 
 // The detected address depends on the machine running the suite (it is
@@ -514,6 +583,13 @@ void AfterCleanup(const UdpPair& udp)
     CheckResult(SOGetSockName(udp.rx, &name), SO_EINVAL, "post tests: SOGetSockName after SOCleanup (READY)");
     CheckResult(SOConnect(0, &server), SO_EINVAL, "post tests: SOConnect after SOCleanup (READY)");
     CheckResult(SOSend(0, kPayload, sizeof(kPayload), 0), SO_EINVAL, "post tests: SOSend after SOCleanup (READY)");
+    int value = 0;
+    int len = sizeof(value);
+    CheckResult(SOSetSockOpt(0, SO_SOL_SOCKET, SO_SO_RCVBUF, &value, sizeof(value)), SO_EINVAL,
+                "post tests: SOSetSockOpt after SOCleanup (READY)");
+    CheckResult(SOGetSockOpt(0, SO_SOL_SOCKET, SO_SO_RCVBUF, &value, &len), SO_EINVAL,
+                "post tests: SOGetSockOpt after SOCleanup (READY)");
+    CheckResult(SOShutdown(0, 2), SO_EINVAL, "post tests: SOShutdown after SOCleanup (READY)");
     CheckResult(SOFinish(), SO_SUCCESS, "post tests: SOFinish after SOCleanup (READY -> TERMINATED)");
     Check(SOGetHostID() == 0, "post tests: SOGetHostID after SOFinish (TERMINATED)");
 }
@@ -530,7 +606,9 @@ int main()
         CleanupAndRestart(closed);
         const UdpPair udp = Udp(closed);
         SockName(udp, closed);
+        SockOpt(udp, closed);
         Poll(udp, closed);
+        Shutdown(udp, closed);
         const u32 host = HostId();
         Tcp(closed);
         const bool broadcast = Broadcast();

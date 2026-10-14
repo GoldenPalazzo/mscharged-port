@@ -103,6 +103,27 @@ static inline int native_pollevent_to_so(short event)
     return res;
 }
 
+// Only the options the game's libraries use. The SDK numbers name other
+// options on Linux (SO_SO_RCVBUF is 0x1002, SO_RCVBUF is 8), so an unknown
+// option must fail instead of reaching the host.
+static inline bool to_native_sockopt(int level, int optname, int* native_level, int* native_optname)
+{
+    if (level != SO_SOL_SOCKET)
+        return false;
+    *native_level = SOL_SOCKET;
+    switch (optname)
+    {
+    case SO_SO_SNDBUF:
+        *native_optname = SO_SNDBUF;
+        return true;
+    case SO_SO_RCVBUF:
+        *native_optname = SO_RCVBUF;
+        return true;
+    default:
+        return false;
+    }
+}
+
 static inline int so_error_from_errno(int error)
 {
     switch (error)
@@ -133,6 +154,7 @@ static inline int so_error_from_errno(int error)
     case ENFILE: return SO_ENFILE;
     case ENOBUFS: return SO_ENOBUFS;
     case ENOMEM: return SO_ENOMEM;
+    case ENOPROTOOPT: return SO_ENOPROTOOPT;
     case ENOTCONN: return SO_ENOTCONN;
     case ENOTSOCK: return SO_ENOTSOCK;
     case EOPNOTSUPP: return SO_EOPNOTSUPP;
@@ -140,6 +162,22 @@ static inline int so_error_from_errno(int error)
     case EPROTONOSUPPORT: return SO_EPROTONOSUPPORT;
     case EPROTOTYPE: return SO_EPROTOTYPE;
     default: return SO_EFATAL;
+    }
+}
+
+// so.h names no shutdown modes: callers pass the BSD numbers 0, 1 and 2.
+static inline int to_native_how(int how)
+{
+    switch (how)
+    {
+    case 0:
+        return SHUT_RD;
+    case 1:
+        return SHUT_WR;
+    case 2:
+        return SHUT_RDWR;
+    default:
+        return -1;
     }
 }
 
