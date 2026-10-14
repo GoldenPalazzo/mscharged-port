@@ -25,6 +25,9 @@ static u8 soState = SO_INTERNAL_STATE_TERMINATED;
 
 static u32 soHostId = 0;
 
+static SOAlloc soAlloc = NULL;
+static SOFree soFree = NULL;
+
 void so_backend_lock(void)
 {
     pthread_mutex_lock(&so_lock);
@@ -75,6 +78,29 @@ int so_backend_check_active(void)
     int result = so_backend_check_active_locked();
     pthread_mutex_unlock(&so_lock);
     return result;
+}
+
+void so_backend_set_allocator_locked(SOAlloc alloc_fn, SOFree free_fn)
+{
+    soAlloc = alloc_fn;
+    soFree = free_fn;
+}
+
+void* so_backend_alloc(u32 name, s32 size)
+{
+    pthread_mutex_lock(&so_lock);
+    SOAlloc alloc_fn = soAlloc;
+    pthread_mutex_unlock(&so_lock);
+    return alloc_fn != NULL && size > 0 ? alloc_fn(name, size) : NULL;
+}
+
+void so_backend_free(u32 name, void* ptr, s32 size)
+{
+    pthread_mutex_lock(&so_lock);
+    SOFree free_fn = soState != SO_INTERNAL_STATE_TERMINATED ? soFree : NULL;
+    pthread_mutex_unlock(&so_lock);
+    if (free_fn != NULL && ptr != NULL)
+        free_fn(name, ptr, size);
 }
 
 static bool slot_is_open_locked(int s)

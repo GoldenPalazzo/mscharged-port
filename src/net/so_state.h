@@ -17,6 +17,10 @@ void so_backend_set_host_id_locked(u32 host_id);
 int so_backend_check_active_locked(void);
 int so_backend_check_active(void);
 
+void so_backend_set_allocator_locked(SOAlloc alloc_fn, SOFree free_fn);
+void* so_backend_alloc(u32 name, s32 size);
+void so_backend_free(u32 name, void* ptr, s32 size);
+
 int so_backend_open(int pf, int type, int protocol);
 int so_backend_insert_accepted(int fd);
 int so_backend_close_locked(int s);

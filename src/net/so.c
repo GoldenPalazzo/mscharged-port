@@ -1,11 +1,11 @@
-#include <arpa/inet.h>
 #include <stdio.h>
-#include <netdb.h>
 #include <revolution/so.h>
 #include <errno.h>
 #include <stdarg.h>
 #include <sys/socket.h> // needs to be imported after so.h to avoid
                         // redefinitions of symbols SO_BROADCAST
+#include <netdb.h>
+#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -33,6 +33,7 @@ int SOInit(SOLibraryConfig* config)
             result = SO_EINVAL;
                 break;
         }
+        so_backend_set_allocator_locked(config->alloc, config->free);
         so_backend_set_state_locked(SO_INTERNAL_STATE_READY);
         break;
     }
@@ -558,6 +559,14 @@ char* SOInetNtoA(SOInAddr in)
     return addressBuffer;
 }
 
+// The one place the SO name lookups reach the host resolver.
+static int so_resolve(const char* node, const char* service, const struct addrinfo* hints,
+    struct addrinfo** list)
+{
+    const int error = getaddrinfo(node, service, hints, list);
+    return error == 0 ? SO_SUCCESS : so_error_from_gai(error);
+}
+
 // The SDK fills one 0x460-byte buffer allocated by SOInit (soWork._unk10) and
 // returns it, so a result is valid until the next call. Callers only read the
 // SOHostEnt fields, so this keeps a native layout instead of the IOS one. It
@@ -586,7 +595,7 @@ SOHostEnt* SOGetHostByName(const char* name)
         .ai_flags = AI_CANONNAME,
     };
     struct addrinfo* res;
-    if (getaddrinfo(name, NULL, &hints, &res) != 0)
+    if (so_resolve(name, NULL, &hints, &res) != SO_SUCCESS)
         return NULL;
 
     struct so_hostent_storage* storage = &so_hostent;
@@ -620,4 +629,138 @@ SOHostEnt* SOGetHostByName(const char* name)
     return &storage->host;
 }
 
+// The SDK returns one 0x840-byte block from SOInit's allocator (name 10): the
+// SOAddrInfo entries are consecutive and each addr points to a SOSockAddrIn
+// further in the same block, so SOFreeAddrInfo frees the whole list at once.
+// The IOS layout holds 35 entries.
+#define SO_ADDRINFO_ALLOC_NAME 10
+#define SO_ADDRINFO_MAX 35
 
+struct so_addrinfo_block
+{
+    SOAddrInfo entries[SO_ADDRINFO_MAX];
+    SOSockAddrIn addrs[SO_ADDRINFO_MAX];
+};
+
+int SOGetAddrInfo(const char* nodeName, const char* servName,
+    const SOAddrInfo* hints, SOAddrInfo** res)
+{
+    int result = so_backend_check_active();
+    if (result != SO_SUCCESS)
+        return result;
+    if (res == NULL)
+        return SO_EINVAL;
+    *res = NULL;
+
+    struct addrinfo native_hints;
+    result = to_native_addrinfo_hints(hints, &native_hints);
+    if (result != SO_SUCCESS)
+        return result;
+
+    struct addrinfo* native;
+    result = so_resolve(nodeName, servName, &native_hints, &native);
+    if (result != SO_SUCCESS)
+        return result;
+
+    struct so_addrinfo_block* block = so_backend_alloc(SO_ADDRINFO_ALLOC_NAME, (s32)sizeof(*block));
+    if (block == NULL)
+    {
+        freeaddrinfo(native);
+        return SO_ENOMEM;
+    }
+
+    size_t count = 0;
+    for (const struct addrinfo* ai = native; ai != NULL && count < SO_ADDRINFO_MAX; ai = ai->ai_next)
+    {
+        // With no socket type in the hints, getaddrinfo returns every address
+        // three times: for stream, datagram and raw sockets. SO has no raw
+        // sockets, so those entries are skipped.
+        const int type = from_native_type(ai->ai_socktype);
+        if (ai->ai_family != AF_INET || type == -1)
+            continue;
+        SOSockAddrIn* addr = &block->addrs[count];
+        from_native_sockaddr(addr, (const struct sockaddr_in*)ai->ai_addr);
+        // The SDK never relocates canonName into the block; no caller reads it.
+        block->entries[count] = (SOAddrInfo){
+            .family = SO_PF_INET,
+            .sockType = type,
+            .protocol = ai->ai_protocol,
+            .addrLen = sizeof(SOSockAddrIn),
+            .canonName = NULL,
+            .addr = addr,
+            .next = NULL,
+        };
+        if (count > 0)
+            block->entries[count - 1].next = &block->entries[count];
+        count++;
+    }
+    freeaddrinfo(native);
+
+    if (count == 0)
+    {
+        so_backend_free(SO_ADDRINFO_ALLOC_NAME, block, (s32)sizeof(*block));
+        return SO_EHOSTUNREACH;
+    }
+    *res = block->entries;
+    return SO_SUCCESS;
+}
+
+void SOFreeAddrInfo(SOAddrInfo* head)
+{
+    so_backend_free(SO_ADDRINFO_ALLOC_NAME, head, (s32)sizeof(struct so_addrinfo_block));
+}
+
+int SOGetInterfaceOpt(IPInterface* interface, int level, int optname,
+                        void* optval, int* optlen)
+{
+    (void)interface;
+    so_backend_lock();
+    int state = so_backend_state_locked();
+    so_backend_unlock();
+    if (state == SO_INTERNAL_STATE_TERMINATED)
+        return SO_ENETRESET;
+    if (optname == SO_CONFIG_FILTER_INPUT || optname == SO_CONFIG_FILTER_OUTPUT)
+        return SO_EINVAL;
+    if (optlen == NULL)
+        return SO_EINVAL;
+    if (level != SO_SOL_CONFIG)
+        return SO_ENOPROTOOPT;
+    switch (optname)
+    {
+        case SO_CONFIG_IP_ADDR_NUMBER:
+            if (*optlen >= (long)sizeof(int))
+            {
+                if (optval != NULL)
+                    *(s32*)optval = 1;
+                *optlen = sizeof(int);
+            }
+            else
+            {
+                *optlen = sizeof(int);
+                return SO_EINVAL;
+            }
+            break;
+        case SO_CONFIG_IP_ADDR_TABLE:
+            if (*optlen >= (long)sizeof(IPAddrEntry))
+            {
+                if (optval != NULL)
+                {
+                    IPAddrEntry* ipaddr = optval;
+                    struct so_host_ipv4 ipaddr_native;
+                    so_host_find_ipv4_info(&ipaddr_native);
+                    memcpy(ipaddr->addr, &ipaddr_native.addr, sizeof(u32));
+                    memcpy(ipaddr->bcastAddr, &ipaddr_native.broadcast, sizeof(u32));
+                    memcpy(ipaddr->netMask, &ipaddr_native.netmask, sizeof(u32));
+                }
+                *optlen = sizeof(IPAddrEntry);
+            }
+            else
+            {
+                *optlen = sizeof(IPAddrEntry);
+                return SO_EINVAL;
+            }
+            break;
+        default: return SO_ENOPROTOOPT;
+    }
+    return SO_SUCCESS;
+}
