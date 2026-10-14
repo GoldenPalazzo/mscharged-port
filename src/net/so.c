@@ -536,14 +536,21 @@ int SOGetSockOpt(int s, int level, int optname, void* optval, int* optlen)
 
 int SOInetAtoN(const char* cp, SOInAddr* inp)
 {
+    so_backend_lock();
+    int state = so_backend_state_locked();
+    so_backend_unlock();
+    if (state == SO_INTERNAL_STATE_TERMINATED)
+        return SO_ENETRESET;
+    if (cp == NULL)
+        return SO_EINVAL;
     struct in_addr inaddr;
     int res = inet_aton(cp, &inaddr);
-    if (res >= 0 && inp != NULL)
+    if (res > 0 && inp != NULL)
         inp->addr = inaddr.s_addr;
     return res;
 }
 
-static char addressBuffer[40];
+static _Thread_local char addressBuffer[40];
 char* SOInetNtoA(SOInAddr in)
 {
     u8* addr = (u8*)&in;
