@@ -63,7 +63,8 @@ the command line and folder names, which can include your user name.
 
 **Every offline feature of the original game works**: all modes, up to four
 players, saves, movies, music and sound. What remains is polishing and testing.
-Online play is not available, since Nintendo Wi-Fi Connection has shut down.
+Online play is in the works, aiming initially at recovering the original
+netcode and subsequently improving it.
 
 Highlights:
 
