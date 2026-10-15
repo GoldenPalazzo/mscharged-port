@@ -1,0 +1,68 @@
+From: mscharged-port
+Subject: Native compiler contracts of the original online scenes
+Upstream-base: 7a6bf165d9f1c5914181c079c7d4bfa7204f3509
+Classification: native compiler contract; no game behavior change.
+
+Retail MWCC emits header inline functions out of line, so units that see only
+a declaration still link. GCC emits no out-of-line copy, which left the module
+importing symbols nothing defines, as in the Challenge preview (0621).
+
+- SHOnlineMiiSelectOverlay.cpp includes the unchanged inline bodies of
+  fn_801CA660 (GameInfo.inl) and BaseSceneHandler::GetPresentation
+  (BaseSceneHandler.inl).
+- SHOnlineInvitePreview.cpp includes GetFriendManager (GameInfo.inl),
+  BaseSceneHandler::GetPresentation and the InlineHasher constructors
+  (feInlineHasher.h).
+- SHOnlineInvitePlayers.cpp includes GetFriendManager.
+
+diff --git a/src/Game/SH/SHOnlineInvitePlayers.cpp b/src/Game/SH/SHOnlineInvitePlayers.cpp
+index d8177d0..2987cbc 100644
+--- a/src/Game/SH/SHOnlineInvitePlayers.cpp
++++ b/src/Game/SH/SHOnlineInvitePlayers.cpp
+@@ -39,6 +39,11 @@
+ #include "Game/FE/feDPD.h"
+ #include "Game/SH/SHNavigation.h"
+ #include "NL/nlstring_tmpl.h"
++#if defined(MSCHARGED_NATIVE)
++// Retail emits these inlines out of line in other units; natively this
++// unit includes their unchanged bodies.
++#include "Game/GameInfo.inl"
++#endif
+ 
+ SHOnlineInvitePlayers::SHOnlineInvitePlayers()
+     : mIsHost(true)
+diff --git a/src/Game/SH/SHOnlineInvitePreview.cpp b/src/Game/SH/SHOnlineInvitePreview.cpp
+index bb5f027..3b4bcc6 100644
+--- a/src/Game/SH/SHOnlineInvitePreview.cpp
++++ b/src/Game/SH/SHOnlineInvitePreview.cpp
+@@ -25,6 +25,13 @@
+ #include "NL/nlPrint.h"
+ 
+ #include <string.h>
++#if defined(MSCHARGED_NATIVE)
++// Retail emits these inlines out of line in other units; natively this
++// unit includes their unchanged bodies.
++#include "Game/BaseSceneHandler.inl"
++#include "Game/FE/feInlineHasher.h"
++#include "Game/GameInfo.inl"
++#endif
+ 
+ typedef BasicString<unsigned short, Detail::TempStringAllocator> WideBasicString;
+ 
+diff --git a/src/Game/SH/SHOnlineMiiSelectOverlay.cpp b/src/Game/SH/SHOnlineMiiSelectOverlay.cpp
+index 8166603..097ee52 100644
+--- a/src/Game/SH/SHOnlineMiiSelectOverlay.cpp
++++ b/src/Game/SH/SHOnlineMiiSelectOverlay.cpp
+@@ -39,6 +39,12 @@
+ #include <string.h>
+ #include "Game/FE/fePageControls.h"
+ #include "NL/nlstring_tmpl.h"
++#if defined(MSCHARGED_NATIVE)
++// Retail emits these inlines out of line in other units; natively this
++// unit includes their unchanged bodies.
++#include "Game/BaseSceneHandler.inl"
++#include "Game/GameInfo.inl"
++#endif
+ 
+ SHOnlineMiiSelectOverlay::SHOnlineMiiSelectOverlay()
+     : mInitialized(false)

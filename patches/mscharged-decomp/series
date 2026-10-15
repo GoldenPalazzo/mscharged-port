@@ -510,3 +510,10 @@
 0706-dwc-gamespy-memory-callbacks.patch
 0707-nhttp-pointer-width.patch
 0708-dwc-pointer-arithmetic.patch
+0709-dwc-encsession-itoa-snprintf.patch
+0710-disable-tls-mp.patch
+0711-admit-original-online-scenes.patch
+0712-native-online-scene-context-words.patch
+0713-native-online-scene-inline-contracts.patch
+0714-native-mii-loading-from-nand.patch
+0715-native-nhttp-system-storage.patch
