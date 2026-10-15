@@ -517,3 +517,14 @@
 0713-native-online-scene-inline-contracts.patch
 0714-native-mii-loading-from-nand.patch
 0715-native-nhttp-system-storage.patch
+0716-native-rfl-create-id-flags.patch
+0717-native-dwc-control-records.patch
+0718-native-online-lobby-connection-aid.patch
+0719-native-dwc-ingamesn-u16.patch
+0720-native-gamespy-thread-ids.patch
+0721-native-dwc-sha1-word-order.patch
+0722-native-net-md5-length-words.patch
+0723-native-qr2-public-ip-decimal.patch
+0724-native-dwc-ranking-word-order.patch
+0725-native-dwc-match-filter-append.patch
+0726-native-dwc-little-endian-words.patch
