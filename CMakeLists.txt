@@ -271,6 +271,7 @@ endif()
 
 if(BUILD_TESTING)
     include(cmake/Network.cmake)
+    include(cmake/OriginalOnline.cmake)
 endif()
 
 if(BUILD_TESTING)
