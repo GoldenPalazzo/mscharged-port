@@ -529,3 +529,4 @@
 0725-native-dwc-match-filter-append.patch
 0726-native-dwc-little-endian-words.patch
 0727-native-online-lobby-connection-pointers.patch
+0728-native-online-lobby-outgoing-connection-word.patch
