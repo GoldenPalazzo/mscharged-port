@@ -109,6 +109,7 @@ struct Settings
     std::string ui_scale = "auto";    // launcher.ui_scale: auto or a percentage (75 to 200)
     // [gameplay]: opt-in game tweaks (kGameTweaks order), all off by default.
     std::array<bool, kGameTweaks.size()> tweaks{};
+    std::string online_server;
     unsigned GameTweakMask() const
     {
         unsigned mask = 0;

@@ -10,11 +10,13 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 
 #include "so_convert.h"
 #include "so_host.h"
 #include "so_state.h"
+#include "so_resolve.h"
 
 int SOInit(SOLibraryConfig* config)
 {
@@ -559,13 +561,40 @@ char* SOInetNtoA(SOInAddr in)
     return addressBuffer;
 }
 
+static char online_server_override[256] = {0};
+
+static int endswith(const char *str, const char *suffix)
+{
+    if (!str || !suffix)
+        return 0;
+    size_t lenstr = strlen(str);
+    size_t lensuffix = strlen(suffix);
+    if (lensuffix >  lenstr)
+        return 0;
+    return strncasecmp(str + lenstr - lensuffix, suffix, lensuffix) == 0;
+}
+
+
 // The one place the SO name lookups reach the host resolver.
 static int so_resolve(const char* node, const char* service, const struct addrinfo* hints,
     struct addrinfo** list)
 {
+    if (endswith(node, ".nintendowifi.net") && online_server_override[0] != '\0')
+        node = online_server_override;
     const int error = getaddrinfo(node, service, hints, list);
     return error == 0 ? SO_SUCCESS : so_error_from_gai(error);
 }
+
+void so_set_server_override(const char *hijacked)
+{
+    if (hijacked != NULL
+        && strlen(hijacked) < 256
+        && hijacked[0] != 0)
+        strcpy(online_server_override, hijacked);
+    else
+        online_server_override[0] = 0;
+}
+
 
 // The SDK fills one 0x460-byte buffer allocated by SOInit (soWork._unk10) and
 // returns it, so a result is valid until the next call. Callers only read the
