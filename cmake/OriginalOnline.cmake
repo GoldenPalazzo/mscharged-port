@@ -177,7 +177,8 @@ function(mscharged_select_original_frontend_online target)
             src/Game/SH/SHOnlineMiiSelectOverlay.cpp
             src/Game/SH/SHOnlinePlayerCount.cpp
             src/Game/SH/SHOnlineRanking.cpp
-            src/Game/FE/feOnlinePlayerRow.cpp)
+            src/Game/FE/feOnlinePlayerRow.cpp
+            src/Game/FE/OnlineRanking.cpp)
         set(_source "${MSCHARGED_PREPARED}/${_relative}")
         if(NOT _source IN_LIST _online_known)
             target_sources("${target}" PRIVATE "${_source}")
