@@ -15,10 +15,16 @@ so the game showed 4219-0679-5010 for profile 1000000002 where the Wii's
 DWC gives 2157-4836-4802; and the user data CRC covered swapped words.
 
 Natively those conversions keep the words as they are, guarded to
-little-endian hosts. GP buddy messages print each command word as the
-decimal of the u32 the Wii holds, a big-endian load of the word's bytes;
-natively that is the byte-swapped load, so DWCi_GPCommandWord swaps on
-both sending and parsing to keep the Wii's numbers on the wire.
+little-endian hosts.
+
+GP buddy messages, which carry friend match commands, print each command
+word in decimal. The Wii prints the big-endian load of the word's
+little-endian bytes, a byte-swapped number; the DS, and natively this
+port, print the word's value. The port keeps that DS form: online play
+is between native builds only, and wfc-server decodes version 3
+"GPCM3vMAT" messages only in the DS form; it rejected the Wii form's
+reservation as "Invalid match command data" (error 81010 on the invited
+side). This does not interoperate with Wii clients' GP match commands.
 
 diff --git a/libs/RVL_SDK/include/dwc/dwc_nonport.h b/libs/RVL_SDK/include/dwc/dwc_nonport.h
 index 9b29003..266d6c9 100644
@@ -56,48 +62,3 @@ index 9b29003..266d6c9 100644
  
  static inline u16 DWCi_LEtoHs(u16 data)
  {
-diff --git a/src/RVL_SDK/dwc/dwc_match.c b/src/RVL_SDK/dwc/dwc_match.c
-index 86678c6..cc244ef 100644
---- a/src/RVL_SDK/dwc/dwc_match.c
-+++ b/src/RVL_SDK/dwc/dwc_match.c
-@@ -19,6 +19,17 @@
- 
- #define DWC_MATCH_COMMAND_ADD_MESSAGE_MAX 512
- 
-+#if defined(MSCHARGED_NATIVE)
-+// GP buddy messages carry each command word as the decimal of the u32 the
-+// Wii holds, a big-endian load of the word's (little-endian) bytes. Natively
-+// the same number is the byte-swapped native load.
-+#define DWCi_GPCommandWord(word)                                       \
-+    ((((u32)(word) >> 24) & 0x000000FF) | (((u32)(word) >> 8) & 0x0000FF00) \
-+        | (((u32)(word) << 8) & 0x00FF0000) | (((u32)(word) << 24) & 0xFF000000))
-+#else
-+#define DWCi_GPCommandWord(word) (word)
-+#endif
-+
- enum
- {
-     DWC_MATCH_CANCEL_STATE_INIT = 0,
-@@ -1674,7 +1685,7 @@ void DWCi_MatchGPRecvBuddyMsgCallback(
-         {
-             break;
-         }
--        list[i] = strtoul(buf, NULL, 10);
-+        list[i] = DWCi_GPCommandWord(strtoul(buf, NULL, 10));
-     }
-     DWCi_ProcessRecvMatchCommand(message[0], profileId, 0, 0, list, i);
- }
-@@ -2511,11 +2522,11 @@ static int DWCi_SendMatchCommand(u8 command, int profileID, u32 ip, u16 port,
-     {
-         if (data && len)
-         {
--            msgLen = snprintf(message, sizeof(message), "%u", data[0]);
-+            msgLen = snprintf(message, sizeof(message), "%u", DWCi_GPCommandWord(data[0]));
- 
-             for (i = 1; i < len; i++)
-             {
--                tmpLen = snprintf(tmpStr, sizeof(tmpStr), "/%u", data[i]);
-+                tmpLen = snprintf(tmpStr, sizeof(tmpStr), "/%u", DWCi_GPCommandWord(data[i]));
-                 DWCi_Np_CpuCopy8(
-                     tmpStr, &message[msgLen], (u32)tmpLen);
-                 msgLen += tmpLen;
