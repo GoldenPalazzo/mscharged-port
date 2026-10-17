@@ -533,3 +533,6 @@
 0729-admit-original-online-ranking-overlay.patch
 0730-native-online-ranking-navigation-inline.patch
 0731-native-friend-code-digit-buffer.patch
+0732-native-gamespy-revolution-platform-on-windows.patch
+0733-native-pointer-rounding-uintptr.patch
+0734-native-gp-buddy-index-intptr.patch
