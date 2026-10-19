@@ -1,0 +1,51 @@
+Subject: Diagnostic: the sync test keeps audio effects out of the simulation
+Upstream-base: 9046e67aa2077a7eb4ed6e28c9df3c1d3b368f84
+
+Rollback study, after tweak patch 0029. Besides sounds, the simulation starts
+audio effects (ApplyAudioTransition from cGame::ReceiveCustomDetermData,
+StartAudioEffect): both reach AudioEffectBinding::StartEffect, which creates
+effect parameters from slot pools of the audio code. Under RECHARGED_SYNCTEST
+both forms of StartEffect report no effect started during the fixed steps of
+a match, as an effect missing from the configuration does. Without
+RECHARGED_SYNCTEST nothing changes.
+
+diff --git a/src/Game/Audio/AudioResourceRuntime.cpp b/src/Game/Audio/AudioResourceRuntime.cpp
+index 1614ef5..c7c9bae 100644
+--- a/src/Game/Audio/AudioResourceRuntime.cpp
++++ b/src/Game/Audio/AudioResourceRuntime.cpp
+@@ -1,4 +1,5 @@
+ #include "NL/nlDLListContainer.inl"
++#include "mscharged_synctest.h"
+ #include "NL/nlFunction.inl"
+ #include "Game/Audio/AudioResourceRuntime.h"
+ #if defined(MSCHARGED_NATIVE)
+@@ -77,6 +78,14 @@ static inline bool FindBindingEffect(AudioEffectBinding* binding,
+ inline bool AudioEffectBinding::StartEffect(u32 definition,
+     void* parameterData, bool invert, float blendTime)
+ {
++#if defined(MSCHARGED_TWEAKS)
++    // The sync test keeps the simulation from starting audio effects, as it
++    // keeps it from making sounds (CreateSoundHandle).
++    if (mscharged_synctest_silences_sounds())
++    {
++        return false;
++    }
++#endif
+     u32 effectId = GetDefinitionValue(definition, AUDIO_EFFECT_KEY);
+ 
+     AudioEffectBase* effect;
+@@ -99,6 +108,14 @@ inline bool AudioEffectBinding::StartEffect(u32 definition,
+ inline bool AudioEffectBinding::StartEffect(u32 definition,
+     void* parameterData, bool invert, void* owner)
+ {
++#if defined(MSCHARGED_TWEAKS)
++    // The sync test keeps the simulation from starting audio effects, as it
++    // keeps it from making sounds (CreateSoundHandle).
++    if (mscharged_synctest_silences_sounds())
++    {
++        return false;
++    }
++#endif
+     u32 effectId = GetDefinitionValue(definition, AUDIO_EFFECT_KEY);
+ 
+     AudioEffectBase* effect;
