@@ -7,6 +7,7 @@
 #include <netinet/in.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <string.h>
 
 #include "so_host.h"
 
@@ -490,6 +491,13 @@ int SOSend(int s, const void *buf, int len, int flags)
     return so_send_to(s, buf, len, flags, NULL);
 }
 
+// Received bytes land in this host buffer and are then copied into the game's.
+// A recvfrom straight into game memory is written by the kernel, which fails
+// with EFAULT instead of faulting where a rollback write-protects that memory
+// to find the pages that changed. 64 KiB holds any UDP datagram; a stream
+// receive larger than that returns part of the data, as recv may.
+static __thread unsigned char so_receive_bounce[65536];
+
 int SORecvFrom(int s, void* buf, int len, int flags, void* sockFrom)
 {
     int result = so_check_active();
@@ -507,9 +515,12 @@ int SORecvFrom(int s, void* buf, int len, int flags, void* sockFrom)
         return SO_EBADF;
     struct sockaddr_in addr;
     socklen_t addrlen = sizeof(addr);
-    ssize_t received = recvfrom(real_fd, buf, (size_t)len, 0, (struct sockaddr *)&addr, &addrlen);
+    size_t capacity = (size_t)len < sizeof(so_receive_bounce) ? (size_t)len : sizeof(so_receive_bounce);
+    ssize_t received = recvfrom(real_fd, so_receive_bounce, capacity, 0, (struct sockaddr *)&addr, &addrlen);
     if (received == -1)
         return so_error_from_errno(errno);
+    if (received > 0)
+        memcpy(buf, so_receive_bounce, (size_t)received);
     if (sockFrom != NULL)
         from_native_sockaddr(sockFrom, &addr);
     return (int)received;
