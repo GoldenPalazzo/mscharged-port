@@ -281,4 +281,29 @@ void ValidateGameAllocationFree(MemoryAllocator& owner, const void* pointer);
 void FinishGameAllocationFree(const void* pointer);
 void DiscardGameAllocatorRecords(MemoryAllocator& owner);
 void FreeGameAllocation(void* pointer);
+
+// Diagnostic observer of every original allocation and free (null: none). It
+// runs after the registry changed, outside its lock, on the calling thread, and
+// must not allocate through the original game allocator.
+using GameAllocationObserver = void (*)(bool allocate, const void* pointer, unsigned long bytes,
+                                        const MemoryAllocator* owner);
+void SetGameAllocationObserver(GameAllocationObserver observer) noexcept;
+
+// Rollback sync test only. From Begin, original allocations and frees are
+// journaled; after the arenas were restored to that point, Rollback returns the
+// records to it too and closes the checkpoint. Records at addresses `keep`
+// accepts (memory that was not restored) stay as they are. It returns how many
+// frees could not be undone exactly (records that owned native data). End
+// closes the checkpoint and keeps the records as they are.
+// Asynchronous producers of original bytes (disc reads and the like): how many
+// are still writing, and how many ever started. A rollback cannot cross one.
+struct GameByteProducers
+{
+    std::size_t pending;
+    std::uint64_t started;
+};
+GameByteProducers CurrentGameByteProducers();
+void BeginGameAllocationCheckpoint();
+std::size_t RollbackGameAllocationCheckpoint(bool (*keep)(std::uintptr_t address));
+void EndGameAllocationCheckpoint();
 }

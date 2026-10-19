@@ -2,6 +2,7 @@
 #include "platform/host_metadata.h"
 #include "NL/MemAlloc.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -172,6 +173,14 @@ struct Allocation
 using Records = std::map<std::uintptr_t, Allocation, std::less<std::uintptr_t>,
     HostMetadataAllocator<std::pair<const std::uintptr_t, Allocation>>>;
 using HeapOwners = std::set<std::uintptr_t, std::less<std::uintptr_t>, HostMetadataAllocator<std::uintptr_t>>;
+// Sync test checkpoint: an allocation (empty node) or a free (the record it
+// removed), undone in reverse order after the arenas were restored.
+struct CheckpointEntry
+{
+    std::uintptr_t key;
+    Records::node_type removed;
+};
+using CheckpointJournal = std::vector<CheckpointEntry, HostMetadataAllocator<CheckpointEntry>>;
 struct Registry
 {
     std::mutex mutex;
@@ -185,6 +194,11 @@ struct Registry
     std::uint64_t next_incarnation = 1;
     std::uint64_t next_graphics_incarnation = 1;
     std::uint64_t next_memory_incarnation = 1;
+    bool checkpoint = false;
+    CheckpointJournal journal;
+    std::uint64_t checkpoint_incarnation = 0;
+    std::size_t checkpoint_lossy = 0;
+    std::uint64_t byte_writes_started = 0;
 };
 Registry& State()
 {
@@ -193,6 +207,13 @@ Registry& State()
     // this registry is compiled inside the original-game module.
     static Registry registry;
     return registry;
+}
+std::atomic<GameAllocationObserver> sAllocationObserver{nullptr};
+void NotifyAllocationObserver(bool allocate, const void* pointer, unsigned long bytes,
+                              const MemoryAllocator* owner)
+{
+    if (auto observer = sAllocationObserver.load(std::memory_order_acquire))
+        observer(allocate, pointer, bytes, owner);
 }
 struct Pending
 {
@@ -599,14 +620,20 @@ void GameAllocationReservation::Commit(void* pointer)
 {
     auto& pending = *static_cast<Pending*>(pending_);
     pending.record.key() = reinterpret_cast<std::uintptr_t>(pointer);
+    const MemoryAllocator* owner = pending.record.mapped().owner;
+    const unsigned long bytes = pending.record.mapped().bytes;
     auto& state = State();
-    std::lock_guard lock(state.mutex);
-    auto insertion = state.records.insert(std::move(pending.record));
-    if (!insertion.inserted)
     {
-        pending.record = std::move(insertion.node);
-        throw std::logic_error("Original allocator returned an already live allocation");
+        std::lock_guard lock(state.mutex);
+        auto insertion = state.records.insert(std::move(pending.record));
+        if (!insertion.inserted)
+        {
+            pending.record = std::move(insertion.node);
+            throw std::logic_error("Original allocator returned an already live allocation");
+        }
+        if (state.checkpoint) state.journal.push_back({reinterpret_cast<std::uintptr_t>(pointer), {}});
     }
+    NotifyAllocationObserver(true, pointer, bytes, owner);
 }
 GameAllocationDeviceReservation::GameAllocationDeviceReservation(
     std::size_t metadataBytes, void (*release)(void*)) : pending_(nullptr)
@@ -821,6 +848,7 @@ GameByteWriteReservation::GameByteWriteReservation(void* destination, std::size_
         auto split = ReservedByteNode();
         auto inserted = owner->second.pending_writes.insert(std::move(token->active));
         if (!inserted.inserted) throw std::logic_error("Byte reservation address conflict");
+        ++state.byte_writes_started;
         RetireCompletedByteRange(owner->second, address, physicalBytes, split);
         RetireNativeBackings(owner->second,address,physicalBytes);
         ++owner->second.next_write;
@@ -1595,12 +1623,93 @@ void ValidateGameAllocationFree(MemoryAllocator& owner, const void* pointer)
 void FinishGameAllocationFree(const void* pointer)
 {
     auto& state = State();
+    const MemoryAllocator* owner;
+    unsigned long bytes;
+    {
+        std::lock_guard lock(state.mutex);
+        auto address = reinterpret_cast<std::uintptr_t>(pointer);
+        auto found = state.records.find(address);
+        if (found == state.records.end())
+            throw std::logic_error("Game free lost its native ownership record");
+        owner = found->second.owner;
+        bytes = found->second.bytes;
+        if (state.checkpoint)
+        {
+            // Keep the record whole for a rollback when it owns nothing but its
+            // bytes; a record with native children or data cannot be undone.
+            const Allocation& allocation = found->second;
+            const auto next = std::next(found);
+            const bool alone = next == state.records.end() || next->first >= address + bytes;
+            if (alone && allocation.byte_spans.empty() && allocation.pending_writes.empty()
+                && allocation.graphics_storage.empty() && allocation.native_backings.empty()
+                && allocation.memory_storage.empty() && allocation.heap_metadata.empty()
+                && !allocation.device.data && !state.heap_owners.count(address))
+            {
+                state.journal.push_back({address, state.records.extract(found)});
+            }
+            else
+            {
+                ++state.checkpoint_lossy;
+                EraseBackingRange(state, address, bytes);
+            }
+        }
+        else
+            EraseBackingRange(state, address, bytes);
+    }
+    NotifyAllocationObserver(false, pointer, bytes, owner);
+}
+void SetGameAllocationObserver(GameAllocationObserver observer) noexcept
+{
+    sAllocationObserver.store(observer, std::memory_order_release);
+}
+void BeginGameAllocationCheckpoint()
+{
+    auto& state = State();
     std::lock_guard lock(state.mutex);
-    auto address = reinterpret_cast<std::uintptr_t>(pointer);
-    auto found = state.records.find(address);
-    if (found == state.records.end())
-        throw std::logic_error("Game free lost its native ownership record");
-    EraseBackingRange(state, address, found->second.bytes);
+    if (state.checkpoint) throw std::logic_error("Game allocation checkpoint already open");
+    state.checkpoint = true;
+    state.journal.clear();
+    state.checkpoint_incarnation = state.next_incarnation;
+    state.checkpoint_lossy = 0;
+}
+std::size_t RollbackGameAllocationCheckpoint(bool (*keep)(std::uintptr_t address))
+{
+    auto& state = State();
+    std::lock_guard lock(state.mutex);
+    if (!state.checkpoint) throw std::logic_error("No game allocation checkpoint to roll back");
+    for (auto entry = state.journal.rbegin(); entry != state.journal.rend(); ++entry)
+    {
+        if (keep && keep(entry->key)) continue; // memory not restored: keep its records
+        if (entry->removed)
+        {
+            if (!state.records.insert(std::move(entry->removed)).inserted)
+                throw std::logic_error("Rolled back free overlaps a live allocation");
+        }
+        else
+        {
+            auto found = state.records.find(entry->key);
+            if (found != state.records.end()) EraseBackingRange(state, entry->key, found->second.bytes);
+        }
+    }
+    state.journal.clear();
+    state.next_incarnation = state.checkpoint_incarnation;
+    state.checkpoint = false;
+    return state.checkpoint_lossy;
+}
+GameByteProducers CurrentGameByteProducers()
+{
+    auto& state = State();
+    std::lock_guard lock(state.mutex);
+    GameByteProducers result{0, state.byte_writes_started};
+    for (const auto& [address, allocation] : state.records) result.pending += allocation.pending_writes.size();
+    return result;
+}
+void EndGameAllocationCheckpoint()
+{
+    auto& state = State();
+    std::lock_guard lock(state.mutex);
+    state.journal.clear();
+    state.checkpoint = false;
 }
 void DiscardGameAllocatorRecords(MemoryAllocator& owner)
 {
