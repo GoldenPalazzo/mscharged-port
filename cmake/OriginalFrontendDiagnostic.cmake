@@ -141,6 +141,13 @@ function(mscharged_add_original_frontend_diagnostic target version suffix)
     # same original sources keeps their original code unchanged.
     target_compile_definitions(${target} PRIVATE MSCHARGED_TWEAKS=1)
     target_sources(${target} PRIVATE src/platform/game_tweaks.cpp src/platform/gx_texture.cpp src/platform/away_kits.cpp)
+    # The original game's globals in sections of their own (rbk_data/rbk_bss),
+    # which a rollback saves with the arenas. ELF linkers only (GNU ld, lld).
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        set(_rollback_sections "${CMAKE_CURRENT_SOURCE_DIR}/cmake/rollback_sections.ld")
+        target_link_options(${target} PRIVATE "LINKER:-T,${_rollback_sections}")
+        set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS "${_rollback_sections}")
+    endif()
     # Robot goalies: the disc's unused robot goalie texture on Charged's goalie (tweak patch 0025).
     target_sources(${target} PRIVATE src/platform/robot_goalie.cpp src/platform/robot_goalie_hook.cpp)
     # Super Team: robot captains and sidekicks from the GameCube robot (tweak patch 0026).
