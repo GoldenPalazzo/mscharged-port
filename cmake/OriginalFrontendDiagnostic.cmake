@@ -148,6 +148,9 @@ function(mscharged_add_original_frontend_diagnostic target version suffix)
         target_link_options(${target} PRIVATE "LINKER:-T,${_rollback_sections}")
         set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS "${_rollback_sections}")
     endif()
+    # RECHARGED_SYNCTEST: save, run, restore and rerun a few steps of a match and
+    # compare (rollback study, tweak patches 0028-0031).
+    target_sources(${target} PRIVATE src/platform/sync_test.cpp)
     # Robot goalies: the disc's unused robot goalie texture on Charged's goalie (tweak patch 0025).
     target_sources(${target} PRIVATE src/platform/robot_goalie.cpp src/platform/robot_goalie_hook.cpp)
     # Super Team: robot captains and sidekicks from the GameCube robot (tweak patch 0026).

@@ -1,0 +1,77 @@
+Subject: Diagnostic: the sync test keeps the simulation silent
+Upstream-base: 9046e67aa2077a7eb4ed6e28c9df3c1d3b368f84
+
+Rollback study. A sound the simulation starts spreads over memory a rollback
+restores (handles and slot pool blocks in MEM1), the audio code's globals and
+the host's audio device, which the sync test cannot keep consistent yet.
+Under RECHARGED_SYNCTEST, CreateSoundHandle (the only way sounds are made)
+returns the null handle of an exhausted or disabled audio system during the
+fixed steps of a match, so the simulation never owns audio state. Sounds
+made outside the steps (music, crowd, menus) still play. The fixed steps are
+reported to the port for that. Without RECHARGED_SYNCTEST nothing changes.
+
+diff --git a/include/mscharged_synctest.h b/include/mscharged_synctest.h
+index d3fe436..5316ea5 100644
+--- a/include/mscharged_synctest.h
++++ b/include/mscharged_synctest.h
+@@ -16,6 +16,11 @@ extern "C" {
+ // `task` and `taskBytes` are the fixed update task, restored with the arenas.
+ void mscharged_synctest_between_steps(int (*step)(void), unsigned (*checksum)(void), void* task,
+                                       unsigned long taskBytes);
++// Around each fixed simulation step (1 at its start, 0 at its end).
++void mscharged_synctest_fixed_step(int running);
++// Whether a sound the game asks for now must not be made: during the steps of
++// a match under the sync test, so the simulation never owns audio state.
++bool mscharged_synctest_silences_sounds(void);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/src/Game/Audio/audio.cpp b/src/Game/Audio/audio.cpp
+index d379bb7..4d2fdb6 100644
+--- a/src/Game/Audio/audio.cpp
++++ b/src/Game/Audio/audio.cpp
+@@ -27,6 +27,7 @@
+ #include "NL/nlTask.h"
+ #include "Game/Audio/RegistryPools.h"
+ #include "Game/SharedStaticStorage.h"
++#include "mscharged_synctest.h"
+ 
+ #include "Game/Audio/AudioListener.inl"
+ 
+@@ -231,6 +232,14 @@ XSoundHandle* CreateSoundHandle(int slotId,
+     unsigned long cueId, XSoundOwner* owner,
+     const void* debugName, void* context, bool findExisting)
+ {
++#if defined(MSCHARGED_TWEAKS)
++    // The sync test keeps the simulation from owning sounds (the null handle
++    // of an exhausted or disabled audio system).
++    if (mscharged_synctest_silences_sounds())
++    {
++        return 0;
++    }
++#endif
+     if (gExclusiveAudioContext != 0)
+     {
+         return 0;
+diff --git a/src/Game/Task/FixedUpdateTask.cpp b/src/Game/Task/FixedUpdateTask.cpp
+index b8abb03..b50ce23 100644
+--- a/src/Game/Task/FixedUpdateTask.cpp
++++ b/src/Game/Task/FixedUpdateTask.cpp
+@@ -475,6 +475,9 @@ static void PostPhysicsAITask(float fDeltaT)
+ 
+ void FixedUpdateTask::CallFixedUpdateTasks()
+ {
++#if defined(MSCHARGED_TWEAKS)
++    mscharged_synctest_fixed_step(1);
++#endif
+     ++lbl_806E2130;
+     mFrame++;
+     mSimulationTime += g_fSimulationTick;
+@@ -519,4 +522,7 @@ void FixedUpdateTask::CallFixedUpdateTasks()
+     mEventDispatcher.Dispatch(true);
+     UpdatePeachPhoto(&gPeachPhotoState, g_fSimulationTick, lbl_806E2130--);
+     ReplayManager::Instance()->GrabSnapshot();
++#if defined(MSCHARGED_TWEAKS)
++    mscharged_synctest_fixed_step(0);
++#endif
+ }
