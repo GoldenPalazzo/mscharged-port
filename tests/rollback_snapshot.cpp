@@ -3,8 +3,14 @@
 // share pages with memory they do not own.
 #include "platform/rollback_snapshot.h"
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#else
 #include <sys/mman.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -22,6 +28,36 @@ namespace
 {
 int failures = 0;
 
+std::size_t PageSize()
+{
+#if defined(_WIN32)
+    SYSTEM_INFO info;
+    GetSystemInfo(&info);
+    return info.dwPageSize;
+#else
+    return static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+#endif
+}
+
+std::uint8_t* MapPages(std::size_t bytes)
+{
+#if defined(_WIN32)
+    return static_cast<std::uint8_t*>(VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+#else
+    return static_cast<std::uint8_t*>(mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+#endif
+}
+
+void UnmapPages(std::uint8_t* block, std::size_t bytes)
+{
+#if defined(_WIN32)
+    (void)bytes;
+    VirtualFree(block, 0, MEM_RELEASE);
+#else
+    munmap(block, bytes);
+#endif
+}
+
 void Check(bool passed, const char* message)
 {
     if (passed) return;
@@ -31,7 +67,7 @@ void Check(bool passed, const char* message)
 
 struct Fixture
 {
-    std::size_t page = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+    std::size_t page = PageSize();
     std::size_t bytes = 64 * page;
     std::uint8_t* block = nullptr;
     std::vector<RollbackRegion> regions;
@@ -39,8 +75,7 @@ struct Fixture
 
     Fixture()
     {
-        block = static_cast<std::uint8_t*>(
-            mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+        block = MapPages(bytes);
         // Starts and ends inside pages; a gap of whole pages; a hole inside a page.
         regions.push_back({block + page + 100, 19 * page + 200});
         regions.push_back({block + 30 * page, 10 * page + 1000});
@@ -53,7 +88,7 @@ struct Fixture
                       owned.begin() + static_cast<long>(offset + region.bytes), 1);
         }
     }
-    ~Fixture() { munmap(block, bytes); }
+    ~Fixture() { UnmapPages(block, bytes); }
 
     // Addresses of the owned bytes that differ from saved (an Owned() state).
     std::vector<std::uintptr_t> Changed(const std::vector<std::uint8_t>& saved) const

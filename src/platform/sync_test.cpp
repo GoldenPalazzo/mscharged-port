@@ -57,8 +57,9 @@
 #if defined(_WIN32)
 extern "C" void mscharged_synctest_between_steps(int (*)(void), unsigned (*)(void), void*, unsigned long) {}
 extern "C" void mscharged_synctest_fixed_step(int) {}
-extern "C" bool mscharged_synctest_silences_sounds(void) { return false; }
-extern "C" bool mscharged_synctest_active(void) { return false; }
+extern "C" bool mscharged_synctest_silences_sounds(void) { return mscharged_rollback_resimulating(); }
+// The rollback's matches play with the deterministic AI clocks too.
+extern "C" bool mscharged_synctest_active(void) { return mscharged_rollback_active(); }
 #else
 #include "Game/Audio/AudioBackend.h"
 #include "Game/Audio/AudioGlobals.h"

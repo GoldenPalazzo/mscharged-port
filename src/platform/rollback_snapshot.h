@@ -21,7 +21,8 @@ namespace mscharged::platform
 // Other threads may write those bytes (their faults are handled the same way);
 // they must not write the regions' own bytes between a save and a restore.
 // Saves and restores run on one thread. Linux and macOS (write protection with
-// signals); elsewhere ConfigureRollbackSnapshots returns false.
+// signals) and Windows (with a vectored exception handler); elsewhere
+// ConfigureRollbackSnapshots returns false.
 struct RollbackRegion
 {
     void* base;

@@ -18,7 +18,10 @@
    section of its own; vtables and other relocated constants (.data.rel.ro*)
    stay where the default script puts them, in RELRO. Statements of a -T
    script are matched before the default script's, and INSERT keeps the
-   default layout around them (GNU ld and lld). */
+   default layout around them (GNU ld and lld).
+
+   PE linkers take no script: tools/rollback_sections.py does the same for the
+   Windows modules, with the same lists of files (keep them the same). */
 
 SECTIONS
 {

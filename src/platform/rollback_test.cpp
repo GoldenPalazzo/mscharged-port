@@ -60,28 +60,6 @@
 #endif
 #include "mscharged_rollback.h"
 
-#if defined(_WIN32)
-extern "C" bool mscharged_rollback_active(void) { return false; }
-extern "C" bool mscharged_rollback_resimulating(void) { return false; }
-extern "C" void mscharged_rollback_inputs_applied(const MschargedRollbackInputs*) {}
-extern "C" void mscharged_rollback_meter_received(const bool*, int) {}
-extern "C" void mscharged_rollback_task_time(const void*, float) {}
-extern "C" void mscharged_rollback_between_steps(int (*)(const MschargedRollbackInputs*), unsigned (*)(void), void*,
-                                                 unsigned long)
-{
-}
-extern "C" void mscharged_rollback_frame_start(void) {}
-extern "C" bool mscharged_rollback_predicting(void) { return false; }
-extern "C" int mscharged_rollback_network_reset(void) { return 4; }
-extern "C" bool mscharged_rollback_has_input(void) { return true; }
-extern "C" void mscharged_rollback_input_ready(void) {}
-extern "C" bool mscharged_rollback_can_capture(void) { return true; }
-extern "C" int mscharged_rollback_extra_captures(void) { return 0; }
-extern "C" void mscharged_rollback_audio_enter(void) {}
-extern "C" void mscharged_rollback_audio_leave(void) {}
-extern "C" void* mscharged_rollback_audio_allocator(void) { return nullptr; }
-extern "C" int mscharged_rollback_sync_data(unsigned*, unsigned*, unsigned*) { return 0; }
-#else
 #include "Game/Audio/AudioBackend.h"
 #include "Game/Game.h"
 #include "Game/InputManager.h"
@@ -108,11 +86,13 @@ extern "C" int mscharged_rollback_sync_data(unsigned*, unsigned*, unsigned*) { r
 #include "platform/rollback_snapshot.h"
 #include "platform/tweak_frame_state.h"
 
+#include "platform/rollback_platform.h"
+
 #include <algorithm>
 #include <chrono>
+#if !defined(_WIN32)
 #include <dlfcn.h>
-#include <link.h>
-#include <execinfo.h>
+#endif
 #include <iterator>
 #include <typeinfo>
 #include <cstdint>
@@ -120,15 +100,17 @@ extern "C" int mscharged_rollback_sync_data(unsigned*, unsigned*, unsigned*) { r
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
-#include <pthread.h>
-#include <sys/mman.h>
-#include <time.h>
 
-// Bounds of the simulation's globals (cmake/rollback_sections.ld).
+// Bounds of the simulation's globals (cmake/rollback_sections.ld; on Windows,
+// tools/rollback_sections.py and rollback_platform.cpp).
+#if defined(_WIN32)
+extern "C" char __rbk_data_start[], __rbk_data_end[], __rbk_bss_start[], __rbk_bss_end[];
+#else
 extern "C" char __rbk_data_start[] __attribute__((weak, visibility("hidden")));
 extern "C" char __rbk_data_end[] __attribute__((weak, visibility("hidden")));
 extern "C" char __rbk_bss_start[] __attribute__((weak, visibility("hidden")));
 extern "C" char __rbk_bss_end[] __attribute__((weak, visibility("hidden")));
+#endif
 // The routers (InputRouter.cpp).
 extern InputRouter* gSimpleInputRouter;
 extern NetworkInputRouter* gNetworkInputRouter;
@@ -426,13 +408,11 @@ void AuditAllocation()
     if (tInAudit) return;
     tInAudit = true;
     void* frames[kAuditFrames + 2];
-    const int depth = backtrace(frames, kAuditFrames + 2);
+    const int depth = mscharged::platform::RollbackCallStack(frames, kAuditFrames + 2);
     AuditStack stack{};
-    Dl_info self{};
-    dladdr(reinterpret_cast<void*>(&AuditAllocation), &self);
+    const std::uintptr_t self = mscharged::platform::RollbackModuleBase(reinterpret_cast<void*>(&AuditAllocation));
     for (int i = 2; i < depth && stack.count < kAuditFrames; ++i)
-        stack.frames[stack.count++] = reinterpret_cast<std::uintptr_t>(frames[i])
-                                      - reinterpret_cast<std::uintptr_t>(self.dli_fbase) - 1;
+        stack.frames[stack.count++] = reinterpret_cast<std::uintptr_t>(frames[i]) - self - 1;
     for (int i = 0; i < sAuditCount; ++i)
         if (sAuditStacks[i].count == stack.count
             && !std::memcmp(sAuditStacks[i].frames, stack.frames, sizeof(std::uintptr_t) * stack.count))
@@ -972,28 +952,14 @@ void Stop(const char* why)
 // A replay should not change them; what it does change goes forward twice.
 constexpr const char* kModuleGlobals = "module global";
 
-int AddLoadSegments(dl_phdr_info* info, std::size_t, void* data)
-{
-    State& s = *sState;
-    if (info->dlpi_addr != s.moduleBase) return 0;
-    auto* segments = static_cast<Range*>(data);
-    int count = 0;
-    for (int i = 0; i < info->dlpi_phnum && count < 8; ++i)
-    {
-        const ElfW(Phdr)& header = info->dlpi_phdr[i];
-        if (header.p_type != PT_LOAD || !(header.p_flags & PF_W)) continue;
-        const std::uintptr_t start = info->dlpi_addr + header.p_vaddr;
-        segments[count++] = {start, start + header.p_memsz, kModuleGlobals};
-    }
-    return count;
-}
-
 void BuildWatched()
 {
     State& s = *sState;
     s.watchedCount = 0;
     Range segments[8] = {};
-    dl_iterate_phdr(AddLoadSegments, segments);
+    std::uintptr_t bounds[8][2];
+    const int segmentCount = mscharged::platform::RollbackWritableSegments(s.moduleBase, bounds, 8);
+    for (int i = 0; i < segmentCount; ++i) segments[i] = {bounds[i][0], bounds[i][1], kModuleGlobals};
     Range cuts[kMaxRanges];
     std::copy(s.ranges, s.ranges + s.rangeCount, cuts);
     std::sort(cuts, cuts + s.rangeCount, [](const Range& a, const Range& b) { return a.start < b.start; });
@@ -1033,9 +999,8 @@ bool CopyForCompare()
     for (int i = 0; i < s.watchedCount; ++i) bytes += s.watched[i].end - s.watched[i].start;
     if (bytes != s.compareBytes)
     {
-        if (s.compareCopy) munmap(s.compareCopy, s.compareBytes);
-        void* copy = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        s.compareCopy = copy == MAP_FAILED ? nullptr : static_cast<std::uint8_t*>(copy);
+        mscharged::platform::RollbackUnmapPages(s.compareCopy, s.compareBytes);
+        s.compareCopy = static_cast<std::uint8_t*>(mscharged::platform::RollbackMapPages(bytes));
         s.compareBytes = s.compareCopy ? bytes : 0;
         if (!s.compareCopy) return false;
     }
@@ -1056,9 +1021,8 @@ bool CopyForCompare()
 
 bool ModuleOffset(std::uintptr_t value, std::uintptr_t& offset)
 {
-    Dl_info info{};
-    if (!value || !dladdr(reinterpret_cast<void*>(value), &info)) return false;
-    if (reinterpret_cast<std::uintptr_t>(info.dli_fbase) != sState->moduleBase) return false;
+    if (!value || mscharged::platform::RollbackModuleBase(reinterpret_cast<void*>(value)) != sState->moduleBase)
+        return false;
     offset = value - sState->moduleBase;
     return true;
 }
@@ -1946,21 +1910,22 @@ void NetplayFrameStart()
     }
 }
 
-void* Watchdog(void*)
+void Watchdog()
 {
     for (;;)
     {
-        timespec pause{0, 50'000'000};
-        nanosleep(&pause, nullptr);
+        mscharged::platform::RollbackSleepMs(50);
         std::lock_guard lock(sMutex);
-        if (!sState->out) return nullptr;
+        if (!sState->out) return;
         if (sState->active && NowNs() - sState->lastHookNs > kIdleNs && !OldestPredicted())
             Stop("no step for 250 ms");
     }
 }
 
+#if !defined(_WIN32)
 // The game module's own code that throws, logged while the test runs: the
-// runtime only reports what() when the game stops.
+// runtime only reports what() when the game stops. (Not on Windows, where the
+// module links the C++ runtime's __cxa_throw itself.)
 constexpr int kListedThrows = 8;
 int sThrows;
 
@@ -1968,22 +1933,18 @@ void LogThrow(const std::type_info* type)
 {
     State& s = *sState;
     void* frames[24];
-    const int depth = backtrace(frames, 24);
-    Dl_info self{};
-    dladdr(reinterpret_cast<void*>(&LogThrow), &self);
+    const int depth = mscharged::platform::RollbackCallStack(frames, 24);
+    const std::uintptr_t self = mscharged::platform::RollbackModuleBase(reinterpret_cast<void*>(&LogThrow));
     std::fprintf(s.out, "THROW %s at frame %u, call stack in the game module:", type ? type->name() : "?",
                  s.latest);
     for (int i = 2; i < depth; ++i)
-    {
-        Dl_info info{};
-        if (dladdr(frames[i], &info) && info.dli_fbase == self.dli_fbase)
+        if (mscharged::platform::RollbackModuleBase(frames[i]) == self)
             std::fprintf(s.out, " +0x%lx",
-                         static_cast<unsigned long>(reinterpret_cast<std::uintptr_t>(frames[i])
-                                                    - reinterpret_cast<std::uintptr_t>(self.dli_fbase) - 1));
-    }
+                         static_cast<unsigned long>(reinterpret_cast<std::uintptr_t>(frames[i]) - self - 1));
     std::fprintf(s.out, "\n");
     std::fflush(s.out);
 }
+#endif
 
 struct Install
 {
@@ -2031,9 +1992,8 @@ struct Install
         if (netplay) state->compareEvery = 0;
         if (state->compareEvery)
         {
-            Dl_info info{};
-            if (dladdr(reinterpret_cast<void*>(&mscharged_rollback_active), &info))
-                state->moduleBase = reinterpret_cast<std::uintptr_t>(info.dli_fbase);
+            state->moduleBase =
+                mscharged::platform::RollbackModuleBase(reinterpret_cast<void*>(&mscharged_rollback_active));
             state->places = static_cast<Place*>(std::calloc(kMaxPlaces, sizeof(Place)));
         }
         if (netplay)
@@ -2044,9 +2004,7 @@ struct Install
                          state->maxDepth, state->interval, state->summaryPath);
         std::fflush(state->out);
         sState = state;
-        pthread_t watchdog;
-        if (pthread_create(&watchdog, nullptr, Watchdog, nullptr) == 0)
-            pthread_detach(watchdog); // a pthread: std::thread would allocate its state with nlMalloc
+        mscharged::platform::RollbackStartThread(Watchdog);
     }
     ~Install()
     {
@@ -2434,6 +2392,7 @@ extern "C" void* mscharged_rollback_audio_allocator(void)
     return &sAudioAllocator;
 }
 
+#if !defined(_WIN32)
 // Calls to __cxa_throw from the game module bind to this one (hidden), which
 // logs the throw and goes on to the C++ runtime's.
 extern "C" __attribute__((visibility("hidden"), noreturn)) void __cxa_throw(void* thrown, std::type_info* type,

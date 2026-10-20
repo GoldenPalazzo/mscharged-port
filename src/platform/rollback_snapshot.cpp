@@ -4,6 +4,10 @@
 #include <signal.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#elif defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
 #endif
 
 #include <algorithm>
@@ -86,6 +90,28 @@ std::uint8_t* PageAddress(const Tracker& t, std::size_t page)
     return nullptr;
 }
 
+void Protect(void* address, std::size_t bytes, bool writable);
+
+// A write fault at address: when it is a tracked page's, the page is marked
+// and made writable, and the write can run again. Async-signal-safe: atomics
+// on the tracker's own arrays and the protection change.
+bool OnWriteFault(std::uintptr_t address)
+{
+    Tracker* t = sTracker;
+    if (!t || !__atomic_load_n(&t->active, __ATOMIC_ACQUIRE)) return false;
+    for (int i = 0; i < t->spanCount; ++i)
+    {
+        const Span& span = t->spans[i];
+        if (address < span.start || address - span.start >= span.pages * t->pageSize) continue;
+        const std::size_t page = (address - span.start) / t->pageSize;
+        if (!__atomic_exchange_n(&t->faulted[span.first + page], 1, __ATOMIC_ACQ_REL))
+            __atomic_add_fetch(&t->stats.faults, 1, __ATOMIC_RELAXED);
+        Protect(reinterpret_cast<void*>(span.start + page * t->pageSize), t->pageSize, true);
+        return true;
+    }
+    return false;
+}
+
 #if defined(__linux__) || defined(__APPLE__)
 struct sigaction sPreviousSegv;
 #if defined(__APPLE__)
@@ -119,24 +145,9 @@ void Forward(const struct sigaction& previous, int signal, siginfo_t* info, void
     previous.sa_handler(signal);
 }
 
-// Async-signal-safe: atomics on the tracker's own arrays and mprotect.
 void Fault(int signal, siginfo_t* info, void* context)
 {
-    Tracker* t = sTracker;
-    if (t && info && __atomic_load_n(&t->active, __ATOMIC_ACQUIRE))
-    {
-        const auto address = reinterpret_cast<std::uintptr_t>(info->si_addr);
-        for (int i = 0; i < t->spanCount; ++i)
-        {
-            const Span& span = t->spans[i];
-            if (address < span.start || address - span.start >= span.pages * t->pageSize) continue;
-            const std::size_t page = (address - span.start) / t->pageSize;
-            if (!__atomic_exchange_n(&t->faulted[span.first + page], 1, __ATOMIC_ACQ_REL))
-                __atomic_add_fetch(&t->stats.faults, 1, __ATOMIC_RELAXED);
-            Protect(reinterpret_cast<void*>(span.start + page * t->pageSize), t->pageSize, true);
-            return;
-        }
-    }
+    if (info && OnWriteFault(reinterpret_cast<std::uintptr_t>(info->si_addr))) return;
 #if defined(__APPLE__)
     if (signal == SIGBUS)
     {
@@ -161,8 +172,51 @@ bool InstallHandler()
     sHandlerInstalled = true;
     return true;
 }
+#elif defined(_WIN32)
+PVOID sHandler;
+
+std::size_t SystemPageSize()
+{
+    SYSTEM_INFO info;
+    GetSystemInfo(&info);
+    return info.dwPageSize;
+}
+
+// Spans merge regions that meet, which may be separate allocations: one call
+// cannot change pages of two, so a failed change goes allocation by allocation.
+void Protect(void* address, std::size_t bytes, bool writable)
+{
+    const DWORD protection = writable ? PAGE_READWRITE : PAGE_READONLY;
+    DWORD previous;
+    if (VirtualProtect(address, bytes, protection, &previous)) return;
+    auto* at = static_cast<std::uint8_t*>(address);
+    std::uint8_t* const end = at + bytes;
+    while (at < end)
+    {
+        MEMORY_BASIC_INFORMATION region;
+        if (!VirtualQuery(at, &region, sizeof region)) return;
+        std::uint8_t* const next = std::min(end, static_cast<std::uint8_t*>(region.BaseAddress) + region.RegionSize);
+        VirtualProtect(at, static_cast<SIZE_T>(next - at), protection, &previous);
+        at = next;
+    }
+}
+
+LONG CALLBACK Fault(EXCEPTION_POINTERS* exception)
+{
+    const EXCEPTION_RECORD* record = exception->ExceptionRecord;
+    if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2
+        && record->ExceptionInformation[0] == 1 // a write
+        && OnWriteFault(static_cast<std::uintptr_t>(record->ExceptionInformation[1])))
+        return EXCEPTION_CONTINUE_EXECUTION;
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+bool InstallHandler()
+{
+    if (!sHandler) sHandler = AddVectoredExceptionHandler(1, Fault);
+    return sHandler != nullptr;
+}
 #else
-// Windows (VirtualProtect and a vectored exception handler) is still to come.
 std::size_t SystemPageSize() { return 4096; }
 void Protect(void*, std::size_t, bool) {}
 bool InstallHandler() { return false; }
