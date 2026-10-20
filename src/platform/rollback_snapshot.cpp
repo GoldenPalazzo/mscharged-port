@@ -17,7 +17,7 @@ namespace mscharged::platform
 {
 namespace
 {
-constexpr int kMaxRegions = 32;
+constexpr int kMaxRegions = 256;
 constexpr int kHotIdleSaves = 16; // saves a hot page stays unchanged before it turns cold
 
 struct Span
