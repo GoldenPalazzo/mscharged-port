@@ -32,7 +32,10 @@
 // the other. <file>.summary then lists what the rest of the frame writes (the
 // network task, drawing, the front end, the next step's pads and inputs, other
 // threads): a rollback that restores it undoes work that is not simulation.
-// Each place says whether the simulation writes it too. The game plays as
+// Each place says whether the simulation writes it too; and the allocations
+// and frees made outside the steps and on other threads, by allocator and
+// call site, which a rollback would undo under code that still uses them.
+// The game plays as
 // usual, sounds and all, offline and in network matches; tracking stops when
 // no step comes for a quarter of a second (pause, end of the match).
 //
@@ -110,6 +113,7 @@ constexpr std::size_t kMaxOwners = 512;
 constexpr std::size_t kChunk = 4096;
 constexpr std::size_t kMergeGap = 16;
 constexpr std::size_t kMaxAggregates = 4096;
+constexpr std::size_t kAggregateSlots = 2 * kMaxAggregates; // the aggregates' hash index
 constexpr int kMaxMatches = 256;
 constexpr int kMaxListedTests = 64;
 constexpr int kCaptains = 12;
@@ -183,12 +187,25 @@ std::size_t CallsiteSlot(std::uintptr_t pointer)
     return static_cast<std::size_t>(((pointer >> 4) * 0x9E3779B97F4A7C15ull) >> (64 - kSiteBits));
 }
 
-void RecordAllocation(bool allocate, const void* pointer, unsigned long bytes, const MemoryAllocator*)
+bool AuditingAllocations();
+void AuditAllocation(bool allocate, unsigned long bytes, const MemoryAllocator* owner, void* const* frames, int depth);
+
+void RecordAllocation(bool allocate, const void* pointer, unsigned long bytes, const MemoryAllocator* owner)
 {
-    if (bytes < kTrackedBytes || tRecordingCallsite || !sCallsites) return;
+    if (tRecordingCallsite) return;
+    const bool audit = AuditingAllocations();
+    if (!audit && (bytes < kTrackedBytes || !sCallsites)) return;
     tRecordingCallsite = true;
     void* frames[kSiteDepth + 2];
-    const int depth = allocate ? backtrace(frames, kSiteDepth + 2) : 0;
+    const int depth = allocate || audit ? backtrace(frames, kSiteDepth + 2) : 0;
+    // Without this function and the registry's notifier.
+    const int siteDepth = depth > 2 ? std::min(depth - 2, kSiteDepth) : 0;
+    if (audit) AuditAllocation(allocate, bytes, owner, frames + 2, siteDepth);
+    if (bytes < kTrackedBytes || !sCallsites)
+    {
+        tRecordingCallsite = false;
+        return;
+    }
     const auto address = reinterpret_cast<std::uintptr_t>(pointer);
     {
         std::lock_guard lock(sCallsiteMutex);
@@ -213,9 +230,8 @@ void RecordAllocation(bool allocate, const void* pointer, unsigned long bytes, c
             Callsite& site = sCallsites[free];
             if (allocate)
             {
-                // Drop this function and the registry's notifier.
                 site.pointer = address;
-                site.depth = depth > 2 ? std::min(depth - 2, kSiteDepth) : 0;
+                site.depth = siteDepth;
                 std::memcpy(site.frames, frames + 2, site.depth * sizeof(void*));
             }
             else if (site.pointer == address)
@@ -273,6 +289,22 @@ enum AuditWindow
     kTestDiffs,    // not an audit: differences of a sync test
     kOutsideSteps, // from the end of a step to the start of the next
     kInsideSteps,  // during a step (CallFixedUpdateTasks)
+    kOtherThreads, // allocations only: not the thread that runs the steps
+    kAuditWindows
+};
+// Audit mode: allocations and frees while the match is tracked, by window,
+// allocator and call site. Outside the steps they are what a rollback would
+// undo under the code that still uses them (or redo, for a free).
+constexpr std::size_t kMaxAllocSites = 1024;
+struct AllocSite
+{
+    int window;
+    bool allocate;
+    const MemoryAllocator* owner;
+    int depth;
+    void* frames[kSiteDepth];
+    std::uint64_t count, bytes;
+    int steps, lastStep;
 };
 struct Match
 {
@@ -334,11 +366,16 @@ struct State
     int noteWindow;        // the window Note files differences under
     int auditSteps;        // steps audited, the "test" number of their notes
     int auditStarts;       // times tracking started
-    std::uint64_t auditBytes[3], auditMaxBytes[3]; // per window
+    std::uint64_t auditBytes[kAuditWindows], auditMaxBytes[kAuditWindows]; // per window
     std::uint64_t auditNs, auditMaxNs;             // noting a window's changes
     std::uint64_t auditDropped;                    // ranges beyond kMaxDiffs, not named
     InsidePlace* inside;                           // kInsideSlots
     std::size_t insideCount;
+    pthread_t auditThread;                         // the thread that runs the steps
+    AllocSite* allocSites;                         // kMaxAllocSites
+    std::size_t allocSiteCount;
+    std::uint64_t allocCounts[kAuditWindows][2];   // per window: frees, allocations
+    std::uint64_t allocDropped;                    // sites beyond kMaxAllocSites
     struct Profile
     {
         std::uint64_t steps, stepNs, maxStepNs;
@@ -356,6 +393,7 @@ struct State
     int lossyTests;
     Aggregate* aggregates;
     std::size_t aggregateCount;
+    std::uint32_t* aggregateIndex; // kAggregateSlots, aggregate index + 1 (0: empty)
     Match matches[kMaxMatches];
     int matchCount;
     unsigned lastFrame;
@@ -373,6 +411,7 @@ struct State
     std::size_t moduleTotal;
     std::uint8_t* moduleAfter;
     std::uintptr_t moduleBase;
+    std::uintptr_t moduleEnd; // past the last loaded segment (0: unknown)
     const char* moduleName;
     unsigned first[kMaxFrames];
     unsigned second[kMaxFrames];
@@ -386,6 +425,48 @@ struct State
 };
 State* sState;
 bool sInFixedStep; // inside a fixed simulation step (main thread only)
+std::mutex sAllocSiteMutex;
+
+bool AuditingAllocations()
+{
+    return sState && sState->auditTracking && sState->allocSites;
+}
+
+void AuditAllocation(bool allocate, unsigned long bytes, const MemoryAllocator* owner, void* const* frames, int depth)
+{
+    State& s = *sState;
+    const int window = !pthread_equal(pthread_self(), s.auditThread) ? kOtherThreads
+        : sInFixedStep                                                ? kInsideSteps
+                                                                      : kOutsideSteps;
+    std::lock_guard lock(sAllocSiteMutex);
+    ++s.allocCounts[window][allocate];
+    AllocSite* site = nullptr;
+    for (std::size_t i = 0; i < s.allocSiteCount && !site; ++i)
+    {
+        AllocSite& candidate = s.allocSites[i];
+        if (candidate.window == window && candidate.allocate == allocate && candidate.owner == owner
+            && candidate.depth == depth && !std::memcmp(candidate.frames, frames, depth * sizeof(void*)))
+            site = &candidate;
+    }
+    if (!site)
+    {
+        if (s.allocSiteCount == kMaxAllocSites)
+        {
+            ++s.allocDropped;
+            return;
+        }
+        site = &s.allocSites[s.allocSiteCount++];
+        *site = {window, allocate, owner, depth, {}, 0, 0, 0, 0};
+        std::memcpy(site->frames, frames, depth * sizeof(void*));
+    }
+    ++site->count;
+    site->bytes += bytes;
+    if (site->lastStep != s.auditSteps)
+    {
+        ++site->steps;
+        site->lastStep = s.auditSteps;
+    }
+}
 
 int EnvInt(const char* name, int fallback, int low, int high)
 {
@@ -448,10 +529,12 @@ int FindModuleSegments(dl_phdr_info* info, std::size_t, void*)
 {
     State& s = *sState;
     if (info->dlpi_addr != s.moduleBase) return 0;
-    for (int i = 0; i < info->dlpi_phnum && s.moduleCount < kMaxModuleRanges; ++i)
+    for (int i = 0; i < info->dlpi_phnum; ++i)
     {
         const ElfW(Phdr)& header = info->dlpi_phdr[i];
-        if (header.p_type != PT_LOAD || !(header.p_flags & PF_W)) continue;
+        if (header.p_type != PT_LOAD) continue;
+        s.moduleEnd = std::max<std::uintptr_t>(s.moduleEnd, info->dlpi_addr + header.p_vaddr + header.p_memsz);
+        if (!(header.p_flags & PF_W) || s.moduleCount == kMaxModuleRanges) continue;
         s.module[s.moduleCount++] = {reinterpret_cast<std::uint8_t*>(info->dlpi_addr + header.p_vaddr),
                                      header.p_memsz, "module", s.moduleTotal};
         s.moduleTotal += header.p_memsz;
@@ -643,6 +726,12 @@ void PrintCompare(std::uintptr_t address, std::size_t bytes, const std::uint8_t*
 // The module offset of a pointer into this module (a vtable names the class).
 bool ModuleOffset(std::uintptr_t value, std::uintptr_t& offset)
 {
+    if (sState->moduleEnd) // dladdr reads symbol tables: too slow for every block of an audit
+    {
+        if (value < sState->moduleBase || value >= sState->moduleEnd) return false;
+        offset = value - sState->moduleBase;
+        return true;
+    }
     Dl_info info{};
     if (!value || !dladdr(reinterpret_cast<void*>(value), &info)) return false;
     if (reinterpret_cast<std::uintptr_t>(info.dli_fbase) != sState->moduleBase) return false;
@@ -652,10 +741,10 @@ bool ModuleOffset(std::uintptr_t value, std::uintptr_t& offset)
 
 // ", allocated at A < B < C": the call site's frames inside the game module,
 // innermost first, as module offsets (one byte back: inside the call).
-void PrintCallsite(FILE* file, void* const* frames, int depth)
+void PrintCallsite(FILE* file, void* const* frames, int depth, const char* label = "allocated at")
 {
     if (!depth) return;
-    std::fprintf(file, ", allocated at");
+    std::fprintf(file, ", %s", label);
     bool first = true;
     for (int i = 0; i < depth; ++i)
     {
@@ -704,16 +793,23 @@ void Note(int kind, std::uintptr_t key, std::size_t size, std::size_t bytes, std
         return;
     }
     Aggregate* entry = nullptr;
-    for (std::size_t i = 0; i < s.aggregateCount && !entry; ++i)
+    const std::uint64_t hash = (key * 0x9E3779B97F4A7C15ull) ^ (size * 0xC2B2AE3D27D4EB4Full)
+        ^ (static_cast<std::uint64_t>(kind) << 8) ^ s.noteWindow;
+    std::size_t slot = (hash >> 40) & (kAggregateSlots - 1);
+    for (; s.aggregateIndex[slot]; slot = (slot + 1) & (kAggregateSlots - 1))
     {
-        Aggregate& candidate = s.aggregates[i];
+        Aggregate& candidate = s.aggregates[s.aggregateIndex[slot] - 1];
         if (candidate.kind == kind && candidate.key == key && candidate.size == size
             && candidate.window == s.noteWindow)
+        {
             entry = &candidate;
+            break;
+        }
     }
     if (!entry)
     {
         if (s.aggregateCount == kMaxAggregates) return;
+        s.aggregateIndex[slot] = static_cast<std::uint32_t>(s.aggregateCount + 1);
         entry = &s.aggregates[s.aggregateCount++];
         *entry = {kind, key, size, 0, test, 0, 0, offset, 0, {}, s.noteWindow};
         if (site)
@@ -781,7 +877,8 @@ void ClassifyArenaDiffs(bool print, int test)
         }
         const auto base = reinterpret_cast<std::uintptr_t>(span.base);
         Owner* owner = nullptr;
-        for (std::size_t o = 0; o < s.ownerCount; ++o)
+        if (s.ownerCount && s.owners[s.ownerCount - 1].base == base) owner = &s.owners[s.ownerCount - 1];
+        for (std::size_t o = 0; o < s.ownerCount && !owner; ++o)
             if (s.owners[o].base == base) owner = &s.owners[o];
         if (!owner && s.ownerCount < kMaxOwners)
         {
@@ -904,6 +1001,60 @@ void PrintAggregatePlace(FILE* file, const Aggregate& entry)
     }
 }
 
+const char* RegionOf(std::uintptr_t address);
+
+void PrintAllocator(FILE* file, const MemoryAllocator* owner)
+{
+    if (owner == &StandardAllocator)
+        std::fprintf(file, "MEM1 heap");
+    else if (owner == &VirtualAllocator)
+        std::fprintf(file, "MEM2 heap");
+    else if (g_pAudioBackend && owner == &g_pAudioBackend->m_AudioAllocator)
+        std::fprintf(file, "audio heap (kept out of the rollback)");
+    else if (owner)
+        std::fprintf(file, "pool at %p in %s", static_cast<void*>(owner->m_memory),
+                     RegionOf(reinterpret_cast<std::uintptr_t>(owner->m_memory)));
+    else
+        std::fprintf(file, "no allocator");
+}
+
+// Audit mode: the allocations and frees of each window; the sites outside
+// the steps and on other threads in full.
+void WriteAuditAllocations(FILE* file)
+{
+    const State& s = *sState;
+    std::lock_guard lock(sAllocSiteMutex);
+    const char* const windows[kAuditWindows] = {"", "outside the steps", "inside the steps", "on other threads"};
+    for (int w = kOutsideSteps; w < kAuditWindows; ++w)
+        std::fprintf(file, "%s: %llu allocations, %llu frees\n", windows[w],
+                     static_cast<unsigned long long>(s.allocCounts[w][1]),
+                     static_cast<unsigned long long>(s.allocCounts[w][0]));
+    if (s.allocDropped)
+        std::fprintf(file, "allocations and frees at sites beyond the %zu listed: %llu\n", kMaxAllocSites,
+                     static_cast<unsigned long long>(s.allocDropped));
+    for (int w : {kOutsideSteps, kOtherThreads})
+    {
+        std::fprintf(file, "\n== allocations and frees %s\n", windows[w]);
+        const AllocSite* listed[kMaxAllocSites];
+        std::size_t count = 0;
+        for (std::size_t i = 0; i < s.allocSiteCount; ++i)
+            if (s.allocSites[i].window == w) listed[count++] = &s.allocSites[i];
+        std::sort(listed, listed + count,
+                  [](const AllocSite* a, const AllocSite* b) { return a->count > b->count; });
+        if (!count) std::fprintf(file, "none\n");
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            const AllocSite& site = *listed[i];
+            std::fprintf(file, "%7llu %s in %d steps, %llu bytes, ", static_cast<unsigned long long>(site.count),
+                         site.allocate ? "allocations" : "frees", site.steps,
+                         static_cast<unsigned long long>(site.bytes));
+            PrintAllocator(file, site.owner);
+            PrintCallsite(file, site.frames, site.depth, site.allocate ? "allocated at" : "freed at");
+            std::fprintf(file, "\n");
+        }
+    }
+}
+
 // Audit mode: what each window wrote; outside the steps first, each place
 // with how often the steps write it too.
 void WriteAuditSummary(FILE* file)
@@ -928,6 +1079,7 @@ void WriteAuditSummary(FILE* file)
                  static_cast<unsigned long long>(s.auditDropped));
     std::fprintf(file, "pages written behind the tracking (missed): %llu\n",
                  static_cast<unsigned long long>(s.untracked));
+    WriteAuditAllocations(file);
 
     std::fprintf(file, "\n== matches\n");
     for (int m = 0; m < s.matchCount; ++m)
@@ -1540,7 +1692,7 @@ std::mutex sAuditMutex;
 std::uint64_t sAuditLastHookNs;
 constexpr std::uint64_t kAuditIdleNs = 250'000'000; // no step for this long stops the tracking
 constexpr int kAuditSummaryEvery = 600;             // steps (ten seconds)
-constexpr int kAuditUntrackedEvery = 60;            // steps between checks for untracked writes (reads everything)
+constexpr int kAuditUntrackedEvery = 300;           // steps between checks for untracked writes (reads everything)
 
 const char* RegionOf(std::uintptr_t address)
 {
@@ -1612,6 +1764,7 @@ void AuditStart(void* task, unsigned long taskBytes)
     const unsigned frame = static_cast<unsigned>(static_cast<FixedUpdateTask*>(task)->GetFrame());
     CurrentMatch(frame);
     mscharged::platform::BeginRollbackSnapshots();
+    s.auditThread = pthread_self();
     s.auditTracking = true;
     ++s.auditStarts;
     std::fprintf(s.out, "audit: tracking from frame %u (step %d)\n", frame, s.auditSteps + 1);
@@ -1653,6 +1806,7 @@ struct Install
         state->diffs = static_cast<Diff*>(std::calloc(kMaxDiffs, sizeof(Diff)));
         state->owners = static_cast<Owner*>(std::calloc(kMaxOwners, sizeof(Owner)));
         state->aggregates = static_cast<Aggregate*>(std::calloc(kMaxAggregates, sizeof(Aggregate)));
+        state->aggregateIndex = static_cast<std::uint32_t*>(std::calloc(kAggregateSlots, sizeof(std::uint32_t)));
         const std::size_t length = std::strlen(path);
         state->summaryPath = static_cast<char*>(std::malloc(length + sizeof(".summary")));
         if (state->summaryPath)
@@ -1661,7 +1815,8 @@ struct Install
             std::memcpy(state->summaryPath + length, ".summary", sizeof(".summary"));
         }
         state->out = std::fopen(path, "w");
-        if (!state->diffs || !state->owners || !state->aggregates || !state->summaryPath || !state->out)
+        if (!state->diffs || !state->owners || !state->aggregates || !state->aggregateIndex || !state->summaryPath
+            || !state->out)
         {
             std::fprintf(stderr, "RECHARGED_SYNCTEST: cannot prepare %s\n", path);
             return;
@@ -1675,6 +1830,7 @@ struct Install
         if (state->audit)
         {
             state->inside = static_cast<InsidePlace*>(std::calloc(kInsideSlots, sizeof(InsidePlace)));
+            state->allocSites = static_cast<AllocSite*>(std::calloc(kMaxAllocSites, sizeof(AllocSite)));
             std::fprintf(state->out, "sync test audit: no tests, what the frame writes outside the steps; summary in "
                          "%s\n", state->summaryPath);
         }
