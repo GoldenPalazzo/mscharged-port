@@ -537,6 +537,13 @@ void RollBack(int depth, int (*replay)(const MschargedRollbackInputs*), unsigned
         ++s.replayed;
     }
     s.resimulating = false;
+    // The crowd's sprites went back to meshes of an earlier capture, in pool
+    // memory their manager has reused since: the next frame captures anew.
+    if (ImpostorManager* impostors = ImpostorManager::GetInstance())
+    {
+        impostors->mCaptured = false;
+        impostors->mLastRenderChecksum = ~impostors->mLastRenderChecksum;
+    }
     ++s.rollbacks;
     ++s.byDepth[depth];
     Record(NowNs() - start, s.rollbackNs, s.maxRollbackNs);
