@@ -5,6 +5,9 @@
 #include "platform/game_allocation_ownership.h"
 #include <cstdlib>
 #include <limits>
+#if defined(_WIN32)
+#include <malloc.h>
+#endif
 #include <mutex>
 #include <new>
 #include <stdexcept>
@@ -33,7 +36,12 @@ std::mutex recordMutex;
 Store& TheStore()
 {
     static Store* store = [] {
-        void* block = std::aligned_alloc(4096, kStoreBytes); // the host CRT, never the game's arenas
+        // The host CRT, never the game's arenas (never freed).
+#if defined(_WIN32)
+        void* block = _aligned_malloc(kStoreBytes, 4096);
+#else
+        void* block = std::aligned_alloc(4096, kStoreBytes);
+#endif
         if (!block) throw std::bad_alloc();
         auto* created = new (block) Store{};
         const std::size_t header = (sizeof(Store) + 63) & ~std::size_t(63);
