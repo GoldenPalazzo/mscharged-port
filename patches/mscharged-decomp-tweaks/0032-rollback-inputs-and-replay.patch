@@ -42,7 +42,9 @@ outside the inputs, in their own messages, which cGame queues for the
 shooter's fielder on the other machines. The port records the presses
 received before each step and gives them again to its replay
 (RollbackRedeliverMegaStrikeMeter); a replayed step sends none, nor the
-mega ball pointer of a captain's shot.
+mega ball pointer of a captain's shot. Nor does it start rumbles: the pads
+felt them when the steps first ran, and the rumbles' state stays out of the
+rollback with the pads, which PlatPadUpdateTask drives every frame.
 
 The rollback leaves the frame memory alone: it is used afresh every frame,
 with its cursors in glxMemory's statics. mscharged_rollback_frame_memory
@@ -524,6 +526,35 @@ index 298301f..a1d196e 100644
      if (gSuppressMegaBallPointerPackets)
      {
          return;
+diff --git a/src/Game/RumbleActions.cpp b/src/Game/RumbleActions.cpp
+index b3f08c8..caa21f1 100644
+--- a/src/Game/RumbleActions.cpp
++++ b/src/Game/RumbleActions.cpp
+@@ -8,6 +8,9 @@
+ #include "NL/globalpad.h"
+ #include "NL/nlConfig.h"
+ #include "types.h"
++#if defined(MSCHARGED_TWEAKS)
++#include "mscharged_rollback.h"
++#endif
+ 
+ enum eRumbleOpType
+ {
+@@ -158,6 +161,14 @@ static inline void StopRumble(cGlobalPad* pad)
+ 
+ void BeginRumbleAction(eRumbleActionPreset preset, cGlobalPad* pad)
+ {
++#if defined(MSCHARGED_TWEAKS)
++    // A rollback's replay: the pads felt it when its step first ran. The
++    // rumbles' state stays out of the rollback, with the pads.
++    if (mscharged_rollback_resimulating())
++    {
++        return;
++    }
++#endif
+     g_bRumbleOn
+         = WPADIsMotorEnabled() && preset != RUMBLE_POINTER_HOVER;
+     gRumbleEnabledOverride
 diff --git a/src/Game/Task/BeginFrameTask.cpp b/src/Game/Task/BeginFrameTask.cpp
 index baec505..8c23815 100644
 --- a/src/Game/Task/BeginFrameTask.cpp

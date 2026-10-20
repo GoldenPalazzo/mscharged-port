@@ -27,7 +27,7 @@ SECTIONS
         HIDDEN(__rbk_data_start = .);
         EXCLUDE_FILE(*src/Game/Audio/* *src/Game/Network[!IR]* *src/Game/FriendManager* *src/Game/LANLobby*
                      *src/Game/Net.cpp* *src/Game/NetTournManager* *src/Game/NetMessage*
-                     *src/Game/Pad/FlickDetection* *src/Game/FE/feInput*)
+                     *src/Game/Pad/FlickDetection* *src/Game/FE/feInput* *src/Game/RumbleActions*)
         *src/Game/*(.data .data.[!r]* .data.r[!e]* .data.rel .data.rel.local .data.rel.local.*
                     .data.rel.[!rl]*)
         EXCLUDE_FILE(*src/NL/gl/* *src/NL/glx/* *src/NL/gc/* *src/NL/nlFile* *src/NL/nlAsyncFileBuffer*
@@ -60,7 +60,7 @@ SECTIONS
         HIDDEN(__rbk_bss_start = .);
         EXCLUDE_FILE(*src/Game/Audio/* *src/Game/Network[!IR]* *src/Game/FriendManager* *src/Game/LANLobby*
                      *src/Game/Net.cpp* *src/Game/NetTournManager* *src/Game/NetMessage*
-                     *src/Game/Pad/FlickDetection* *src/Game/FE/feInput*)
+                     *src/Game/Pad/FlickDetection* *src/Game/FE/feInput* *src/Game/RumbleActions*)
         *src/Game/*(.bss .bss.* COMMON)
         EXCLUDE_FILE(*src/NL/gl/* *src/NL/glx/* *src/NL/gc/* *src/NL/nlFile* *src/NL/nlAsyncFileBuffer*
                      *src/NL/nlBundleFile* *src/NL/nlDebug* *src/NL/nlTicker* *src/NL/nlTime* *src/NL/nlPrint*
