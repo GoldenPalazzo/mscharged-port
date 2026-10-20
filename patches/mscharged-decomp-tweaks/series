@@ -28,3 +28,4 @@
 0029-sync-test-silent-simulation.patch
 0030-sync-test-deterministic-ai.patch
 0031-sync-test-silent-audio-effects.patch
+0032-rollback-inputs-and-replay.patch

@@ -52,6 +52,7 @@
 #error The sync test belongs to the isolated original game module
 #endif
 #include "mscharged_synctest.h"
+#include "mscharged_rollback.h"
 
 #if defined(_WIN32)
 extern "C" void mscharged_synctest_between_steps(int (*)(void), unsigned (*)(void), void*, unsigned long) {}
@@ -1915,13 +1916,15 @@ extern "C" void mscharged_synctest_fixed_step(int running)
     AuditWindow(kOutsideSteps);
 }
 
+// The rollback test (rollback_test.cpp) keeps the simulation silent too, and
+// uses the deterministic AI clocks.
 extern "C" bool mscharged_synctest_silences_sounds(void)
 {
-    return sState && sState->out && !sState->audit && sInFixedStep;
+    return ((sState && sState->out && !sState->audit) || mscharged_rollback_active()) && sInFixedStep;
 }
 
 extern "C" bool mscharged_synctest_active(void)
 {
-    return sState && sState->out;
+    return (sState && sState->out) || mscharged_rollback_active();
 }
 #endif

@@ -5,12 +5,14 @@
    Every object of src/Game, src/NL and src/ode joins, except code whose
    globals other threads or host devices write: audio (the audio thread and
    the DSP), the network session and its transports, files, real time, the
-   low-level graphics of NL and the host pad backend. Joining is the safe side:
-   only the simulation's steps run between a save and its restore, so a global
-   they leave alone is restored to the very bytes it holds. Leaving out a global
-   the steps change is what breaks a rollback: game code beyond "simulation"
-   joins for that reason (Game/Render holds Presentation, NIS, stadium
-   hazards and items as well as drawing).
+   low-level graphics of NL and the pads (the host pad backend, the Wii Remote
+   and Nunchuk state, flick detection and the front end's pad data: a replayed
+   step reads none of them, the next new step reads the pads as they are).
+   Joining is the safe side: only the simulation's steps run between a save
+   and its restore, so a global they leave alone is restored to the very bytes
+   it holds. Leaving out a global the steps change is what breaks a rollback:
+   game code beyond "simulation" joins for that reason (Game/Render holds
+   Presentation, NIS, stadium hazards and items as well as drawing).
 
    The module is compiled with -fdata-sections, so each global is an input
    section of its own; vtables and other relocated constants (.data.rel.ro*)
@@ -24,13 +26,15 @@ SECTIONS
     {
         HIDDEN(__rbk_data_start = .);
         EXCLUDE_FILE(*src/Game/Audio/* *src/Game/Network[!IR]* *src/Game/FriendManager* *src/Game/LANLobby*
-                     *src/Game/Net.cpp* *src/Game/NetTournManager* *src/Game/NetMessage*)
+                     *src/Game/Net.cpp* *src/Game/NetTournManager* *src/Game/NetMessage*
+                     *src/Game/Pad/FlickDetection* *src/Game/FE/feInput*)
         *src/Game/*(.data .data.[!r]* .data.r[!e]* .data.rel .data.rel.local .data.rel.local.*
                     .data.rel.[!rl]*)
         EXCLUDE_FILE(*src/NL/gl/* *src/NL/glx/* *src/NL/gc/* *src/NL/nlFile* *src/NL/nlAsyncFileBuffer*
                      *src/NL/nlBundleFile* *src/NL/nlDebug* *src/NL/nlTicker* *src/NL/nlTime* *src/NL/nlPrint*
                      *src/NL/nlBufferedWriter* *src/NL/plat/nlFileCache* *src/NL/plat/nlFlash*
-                     *src/NL/plat/PadBackend* *src/NL/plat/*Socket* *src/NL/plat/Transport*)
+                     *src/NL/plat/PadBackend* *src/NL/plat/WiiFreestylePad* *src/NL/plat/*Socket*
+                     *src/NL/plat/Transport*)
         *src/NL/*(.data .data.[!r]* .data.r[!e]* .data.rel .data.rel.local .data.rel.local.*
                   .data.rel.[!rl]*)
         *src/ode/*(.data .data.[!r]* .data.r[!e]* .data.rel .data.rel.local .data.rel.local.*
@@ -55,12 +59,14 @@ SECTIONS
     {
         HIDDEN(__rbk_bss_start = .);
         EXCLUDE_FILE(*src/Game/Audio/* *src/Game/Network[!IR]* *src/Game/FriendManager* *src/Game/LANLobby*
-                     *src/Game/Net.cpp* *src/Game/NetTournManager* *src/Game/NetMessage*)
+                     *src/Game/Net.cpp* *src/Game/NetTournManager* *src/Game/NetMessage*
+                     *src/Game/Pad/FlickDetection* *src/Game/FE/feInput*)
         *src/Game/*(.bss .bss.* COMMON)
         EXCLUDE_FILE(*src/NL/gl/* *src/NL/glx/* *src/NL/gc/* *src/NL/nlFile* *src/NL/nlAsyncFileBuffer*
                      *src/NL/nlBundleFile* *src/NL/nlDebug* *src/NL/nlTicker* *src/NL/nlTime* *src/NL/nlPrint*
                      *src/NL/nlBufferedWriter* *src/NL/plat/nlFileCache* *src/NL/plat/nlFlash*
-                     *src/NL/plat/PadBackend* *src/NL/plat/*Socket* *src/NL/plat/Transport*)
+                     *src/NL/plat/PadBackend* *src/NL/plat/WiiFreestylePad* *src/NL/plat/*Socket*
+                     *src/NL/plat/Transport*)
         *src/NL/*(.bss .bss.* COMMON)
         *src/ode/*(.bss .bss.* COMMON)
         HIDDEN(__rbk_bss_end = .);
