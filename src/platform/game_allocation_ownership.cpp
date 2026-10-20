@@ -174,11 +174,13 @@ using Records = std::map<std::uintptr_t, Allocation, std::less<std::uintptr_t>,
     HostMetadataAllocator<std::pair<const std::uintptr_t, Allocation>>>;
 using HeapOwners = std::set<std::uintptr_t, std::less<std::uintptr_t>, HostMetadataAllocator<std::uintptr_t>>;
 // Sync test checkpoint: an allocation (empty node) or a free (the record it
-// removed), undone in reverse order after the arenas were restored.
+// removed), undone in reverse order after the arenas were restored. A lossy
+// free erased a record that cannot be undone.
 struct CheckpointEntry
 {
     std::uintptr_t key;
     Records::node_type removed;
+    bool lossy = false;
 };
 using CheckpointJournal = std::vector<CheckpointEntry, HostMetadataAllocator<CheckpointEntry>>;
 struct Registry
@@ -197,7 +199,6 @@ struct Registry
     bool checkpoint = false;
     CheckpointJournal journal;
     std::uint64_t checkpoint_incarnation = 0;
-    std::size_t checkpoint_lossy = 0;
     std::uint64_t byte_writes_started = 0;
 };
 Registry& State()
@@ -1649,7 +1650,7 @@ void FinishGameAllocationFree(const void* pointer)
             }
             else
             {
-                ++state.checkpoint_lossy;
+                state.journal.push_back({address, {}, true});
                 EraseBackingRange(state, address, bytes);
             }
         }
@@ -1670,31 +1671,60 @@ void BeginGameAllocationCheckpoint()
     state.checkpoint = true;
     state.journal.clear();
     state.checkpoint_incarnation = state.next_incarnation;
-    state.checkpoint_lossy = 0;
+}
+namespace
+{
+// Undoes the journal back to position, newest first; returns the lossy frees.
+std::size_t UndoJournal(Registry& state, std::size_t position, bool (*keep)(std::uintptr_t address))
+{
+    if (position > state.journal.size()) throw std::logic_error("Game allocation mark beyond the journal");
+    std::size_t lossy = 0;
+    for (auto entry = state.journal.size(); entry-- > position;)
+    {
+        auto& undo = state.journal[entry];
+        if (keep && keep(undo.key)) continue; // memory not restored: keep its records
+        if (undo.lossy)
+            ++lossy;
+        else if (undo.removed)
+        {
+            if (!state.records.insert(std::move(undo.removed)).inserted)
+                throw std::logic_error("Rolled back free overlaps a live allocation");
+        }
+        else
+        {
+            auto found = state.records.find(undo.key);
+            if (found != state.records.end()) EraseBackingRange(state, undo.key, found->second.bytes);
+        }
+    }
+    state.journal.erase(state.journal.begin() + static_cast<std::ptrdiff_t>(position), state.journal.end());
+    return lossy;
+}
 }
 std::size_t RollbackGameAllocationCheckpoint(bool (*keep)(std::uintptr_t address))
 {
     auto& state = State();
     std::lock_guard lock(state.mutex);
     if (!state.checkpoint) throw std::logic_error("No game allocation checkpoint to roll back");
-    for (auto entry = state.journal.rbegin(); entry != state.journal.rend(); ++entry)
-    {
-        if (keep && keep(entry->key)) continue; // memory not restored: keep its records
-        if (entry->removed)
-        {
-            if (!state.records.insert(std::move(entry->removed)).inserted)
-                throw std::logic_error("Rolled back free overlaps a live allocation");
-        }
-        else
-        {
-            auto found = state.records.find(entry->key);
-            if (found != state.records.end()) EraseBackingRange(state, entry->key, found->second.bytes);
-        }
-    }
-    state.journal.clear();
+    const std::size_t lossy = UndoJournal(state, 0, keep);
     state.next_incarnation = state.checkpoint_incarnation;
     state.checkpoint = false;
-    return state.checkpoint_lossy;
+    return lossy;
+}
+GameAllocationMark MarkGameAllocationCheckpoint()
+{
+    auto& state = State();
+    std::lock_guard lock(state.mutex);
+    if (!state.checkpoint) throw std::logic_error("No game allocation checkpoint to mark");
+    return {state.journal.size(), state.next_incarnation};
+}
+std::size_t RollbackGameAllocationCheckpointTo(const GameAllocationMark& mark, bool (*keep)(std::uintptr_t address))
+{
+    auto& state = State();
+    std::lock_guard lock(state.mutex);
+    if (!state.checkpoint) throw std::logic_error("No game allocation checkpoint to roll back");
+    const std::size_t lossy = UndoJournal(state, mark.position, keep);
+    state.next_incarnation = mark.incarnation;
+    return lossy;
 }
 GameByteProducers CurrentGameByteProducers()
 {
