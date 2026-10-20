@@ -18,6 +18,11 @@ end's presentation, HUD, scenes, lighting, models and stadium, the event
 dispatch, then BeginFrameTask's presentation, NIS, mega blend and cameras.
 The port gives each part the time step its frame first had. Replaying the
 steps alone left all of it a little further behind at every rollback.
+The port goes back at the start of a frame, before any task of it runs
+(nlTaskManager::RunAllTasks): restored mid-frame, the cameras and views a
+frame had already set up would draw the current match from an earlier
+point of view.
+
 Drawing has nowhere to go during a replay, whose frame was already drawn:
 the effects' update callbacks are skipped (some draw, like the electric
 fence's; the next new frame places the emitters again), and GLView drops
@@ -66,10 +71,10 @@ index 1c86544..2720aa9 100644
      float mTimeScale;
 diff --git a/include/mscharged_rollback.h b/include/mscharged_rollback.h
 new file mode 100644
-index 0000000..4fa61fb
+index 0000000..220c483
 --- /dev/null
 +++ b/include/mscharged_rollback.h
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,70 @@
 +#if defined(MSCHARGED_TWEAKS)
 +#ifndef MSCHARGED_ROLLBACK_H
 +#define MSCHARGED_ROLLBACK_H
@@ -113,11 +118,14 @@ index 0000000..4fa61fb
 +// The inputs applied for the step about to run.
 +void mscharged_rollback_inputs_applied(const struct MschargedRollbackInputs* inputs);
 +// Between two fixed steps of a match, where the rollback saves the match and
-+// may go back: `replay` runs one step again with the inputs it was given
-+// (1, or -1 when a NIS now stops the simulation), `checksum` is the game's
-+// checksum, `task` and `taskBytes` the fixed update task.
++// decides whether to go back: `replay` runs one step again with the inputs it
++// was given (1, or -1 when a NIS now stops the simulation), `checksum` is the
++// game's checksum, `task` and `taskBytes` the fixed update task.
 +void mscharged_rollback_between_steps(int (*replay)(const struct MschargedRollbackInputs* inputs),
 +                                      unsigned (*checksum)(void), void* task, unsigned long taskBytes);
++// At the start of a frame, before any task sets up its cameras and views:
++// where the rollback goes back and replays, through the end of the last frame.
++void mscharged_rollback_frame_start(void);
 +// The game's: pointers into the frame memory blocks, at most capacity;
 +// returns how many.
 +int mscharged_rollback_frame_memory(const void** pointers, int capacity);
@@ -675,3 +683,28 @@ index ebf1e9a..c5ca54d 100644
 +    return count;
 +}
 +#endif
+diff --git a/src/NL/nlTask.cpp b/src/NL/nlTask.cpp
+index d94c8c9..9023abb 100644
+--- a/src/NL/nlTask.cpp
++++ b/src/NL/nlTask.cpp
+@@ -10,6 +10,9 @@
+ 
+ #include "Game/Sys/movie.h"
+ #include "Game/SharedStaticStorage.h"
++#if defined(MSCHARGED_TWEAKS)
++#include "mscharged_rollback.h"
++#endif
+ 
+ float g_fTaskTimeUpperBound = 0.1f;
+ nlTaskManager* nlTaskManager::m_pInstance;
+@@ -77,6 +80,10 @@ void nlTaskManager::RunAllTasks()
+ {
+ #ifdef MSCHARGED_DIAGNOSTIC_TASKS
+     mscharged::NativeTaskFrame nativeFrame;
++#endif
++#if defined(MSCHARGED_TWEAKS)
++    // Before any task of the frame, a rollback the last step asked for.
++    mscharged_rollback_frame_start();
+ #endif
+     nlTask* currentTask = nlDLRingGetStart<nlTask>(m_pInstance->mTaskList);
+     if (currentTask != 0)
