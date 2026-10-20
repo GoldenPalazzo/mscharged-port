@@ -15,7 +15,8 @@
 // manager, the pads, the tasks' clocks and the fixed update task's
 // accumulated time, the frame memory (used afresh every frame) and the audio
 // memory. Everything else, the drawing included, goes back with the match,
-// and the registry of the game's memory with it (its rollback checkpoint).
+// with the native pool records the game points at (their own heap) and the
+// registry of the game's memory (its rollback checkpoint).
 //
 // A replayed step reads no pads, captures and sends nothing, and queues no
 // deterministic data (it went out the first time). Around it the replay runs
@@ -60,6 +61,7 @@ extern "C" void mscharged_rollback_between_steps(int (*)(const MschargedRollback
 #include "NL/nlTask.h"
 #include "NL/platpad.h"
 #include "platform/game_allocation_ownership.h"
+#include "platform/game_resource_records.h"
 #include "platform/rollback_snapshot.h"
 
 #include <algorithm>
@@ -244,6 +246,11 @@ void FindRanges(FixedUpdateTask* task, unsigned long taskBytes)
     AddRange(AllocatorStack, sizeof(AllocatorStack), "AllocatorStack");
     AddRange(&AllocatorStackDepth, sizeof(AllocatorStackDepth), "AllocatorStackDepth");
     AddRange(task, taskBytes, "fixedUpdateTask");
+    // Native representations of pool records (markers, texture headers) the game points at.
+    const void* records = nullptr;
+    std::size_t recordBytes = 0;
+    mscharged::platform::GameResourceRecordStorage(&records, &recordBytes);
+    AddRange(records, recordBytes, "pool records");
 
     // Audio: the host plays what it describes.
     if (g_pAudioBackend)
