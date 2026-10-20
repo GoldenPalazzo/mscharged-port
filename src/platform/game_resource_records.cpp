@@ -1,8 +1,9 @@
 #include "platform/game_resource_records.h"
 
+#include "NL/MemAlloc.h"
 #include "NL/gl/glMemory.h"
 #include "platform/game_allocation_ownership.h"
-#include "platform/host_metadata.h"
+#include <cstdlib>
 #include <limits>
 #include <mutex>
 #include <new>
@@ -18,8 +19,30 @@ struct Record
     GLResourcePool* pool;
     GameResourceRecordInfo info;
 };
-Record* records;
+// The records and their list live in a heap of their own, an original
+// MemoryAllocator at the start of one page-aligned host block: a rollback
+// saves and restores the block with the game's arenas, so the records go back
+// with the pools holding their quota and the game objects pointing at them.
+constexpr std::size_t kStoreBytes = 16u << 20;
+struct Store
+{
+    MemoryAllocator heap;
+    Record* records;
+};
 std::mutex recordMutex;
+Store& TheStore()
+{
+    static Store* store = [] {
+        void* block = std::aligned_alloc(4096, kStoreBytes); // the host CRT, never the game's arenas
+        if (!block) throw std::bad_alloc();
+        auto* created = new (block) Store{};
+        const std::size_t header = (sizeof(Store) + 63) & ~std::size_t(63);
+        created->heap.Initialize(static_cast<unsigned char*>(block) + header,
+                                 static_cast<unsigned int>(kStoreBytes - header));
+        return created;
+    }();
+    return *store;
+}
 
 std::uint64_t PoolIncarnation(GLResourcePool* pool)
 {
@@ -37,7 +60,10 @@ public:
             native > std::numeric_limits<std::size_t>::max()-sizeof(Record)-31)
             throw std::length_error("Invalid native/Wii resource record size");
         const auto incarnation=PoolIncarnation(pool);
-        record_=static_cast<Record*>(ChargedNativeMetadataAllocate(sizeof(Record)+native+31));
+        {
+            std::lock_guard lock(recordMutex);
+            record_=static_cast<Record*>(TheStore().heap.Allocate(sizeof(Record)+native+31,32,false));
+        }
         new (record_) Record{};
         record_->pool=pool;
         auto address=reinterpret_cast<std::uintptr_t>(record_+1);
@@ -48,7 +74,9 @@ public:
     }
     ~Reservation()
     {
-        if (record_) ChargedNativeMetadataRelease(record_);
+        if (!record_) return;
+        std::lock_guard lock(recordMutex);
+        TheStore().heap.Free(record_);
     }
     void* Complete(void* quota)
     {
@@ -62,8 +90,8 @@ public:
         record_->info.quotaIncarnation=span.allocation.incarnation;
         record_->info.quotaStorageIncarnation=span.incarnation;
         std::lock_guard lock(recordMutex);
-        record_->next=records;
-        records=record_;
+        record_->next=TheStore().records;
+        TheStore().records=record_;
         auto* result=const_cast<void*>(record_->info.native);
         record_=nullptr;
         return result;
@@ -91,7 +119,7 @@ void RetireGameResourceRecords(GLResourcePool* pool, const void* quotaBegin,
     if (!pool || !FindGameAllocationSpan(pool,sizeof(GLResourcePool),owner)) return;
     const auto begin=reinterpret_cast<std::uintptr_t>(quotaBegin);
     std::lock_guard lock(recordMutex);
-    Record** link=&records;
+    Record** link=&TheStore().records;
     while (*link)
     {
         Record* item=*link;
@@ -100,7 +128,7 @@ void RetireGameResourceRecords(GLResourcePool* pool, const void* quotaBegin,
             address>=begin && address-begin<quotaBytes)
         {
             *link=item->next;
-            ChargedNativeMetadataRelease(item);
+            TheStore().heap.Free(item);
         }
         else link=&item->next;
     }
@@ -111,14 +139,14 @@ void ReleaseGameResourceRecords(GLResourcePool* pool) noexcept
     GameAllocationSpan owner{};
     if (!pool || !FindGameAllocationSpan(pool,sizeof(GLResourcePool),owner)) return;
     std::lock_guard lock(recordMutex);
-    Record** link=&records;
+    Record** link=&TheStore().records;
     while (*link)
     {
         Record* item=*link;
         if (item->pool==pool && item->info.poolIncarnation==owner.incarnation)
         {
             *link=item->next;
-            ChargedNativeMetadataRelease(item);
+            TheStore().heap.Free(item);
         }
         else link=&item->next;
     }
@@ -127,8 +155,14 @@ void ReleaseGameResourceRecords(GLResourcePool* pool) noexcept
 bool FindGameResourceRecord(const void* native, GameResourceRecordInfo& info) noexcept
 {
     std::lock_guard lock(recordMutex);
-    for (Record* item=records; item; item=item->next)
+    for (Record* item=TheStore().records; item; item=item->next)
         if (item->info.native==native) { info=item->info; return true; }
     return false;
+}
+
+void GameResourceRecordStorage(const void** base, std::size_t* bytes)
+{
+    *base=&TheStore();
+    *bytes=kStoreBytes;
 }
 }

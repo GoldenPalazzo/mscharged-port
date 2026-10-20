@@ -35,4 +35,7 @@ struct GameResourceRecordInfo
     std::uint64_t quotaStorageIncarnation;
 };
 bool FindGameResourceRecord(const void* native, GameResourceRecordInfo& info) noexcept;
+// The block holding the records, their heap and list, which a rollback saves
+// and restores with the game's arenas.
+void GameResourceRecordStorage(const void** base, std::size_t* bytes);
 }
