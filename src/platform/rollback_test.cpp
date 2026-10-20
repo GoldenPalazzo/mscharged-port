@@ -13,8 +13,9 @@
 // test saves them, except what lives on outside the simulation: the network
 // session (but its players' inputs), sockets and lobby, the input routers and
 // manager, the pads, the tasks' clocks and the fixed update task's
-// accumulated time, and the audio memory. Everything else, drawing included,
-// goes back with the match. A replayed step reads no pads, captures and sends
+// accumulated time, the drawing's memory (frame memory and resource pools,
+// whose suballocations the port tracks for the host) and the audio memory.
+// Everything else, the drawing's objects included, goes back with the match. A replayed step reads no pads, captures and sends
 // nothing, and queues no deterministic data (it went out the first time).
 //
 // The simulation makes no sounds while the test runs, as under the sync test:
@@ -274,6 +275,11 @@ void FindRanges(FixedUpdateTask* task, unsigned long taskBytes)
         }
     }
     ExcludeAllocation(g_pPlatPadManager, 0, "PlatPadManager");
+    // The drawing's memory: the port tracks what it holds for the host (graphics
+    // suballocations), as it is now; restoring a pool's top would allocate over them.
+    const void* graphics[kMaxExcluded];
+    const int graphicsCount = mscharged_rollback_graphics_memory(graphics, kMaxExcluded);
+    for (int i = 0; i < graphicsCount; ++i) ExcludeAllocation(graphics[i], 0, "drawing memory");
     // The clocks: each task's last run, and the time the fixed steps have still to catch up.
     if (nlTaskManager* manager = nlTaskManager::m_pInstance; manager && manager->mTaskList)
     {

@@ -14,8 +14,14 @@ Deterministic data the simulation queues to send (player visibility, mega
 strike results, NIS loaded) is an input of a later step on every machine:
 a replayed step queues none, its data went out when it first ran. While it
 waits in the router's queue it lives outside the game's arenas, which a
-rollback restores while the router's queue goes on. Without
-RECHARGED_ROLLBACK_TEST nothing changes.
+rollback restores while the router's queue goes on.
+
+The rollback leaves the drawing's memory alone (the frame memory and the
+resource pools with their memory): the port tracks its suballocations for
+the host, and a pool restored to an earlier top would allocate over them.
+glxMemory lists the live pools, and mscharged_rollback_graphics_memory
+returns pointers into all of it. Without RECHARGED_ROLLBACK_TEST nothing
+changes.
 
 diff --git a/include/Game/InputRouter.h b/include/Game/InputRouter.h
 index 1b67126..8b3abd2 100644
@@ -34,10 +40,10 @@ index 1b67126..8b3abd2 100644
  #endif // GAME_NETWORK_INPUT_ROUTER_H
 diff --git a/include/mscharged_rollback.h b/include/mscharged_rollback.h
 new file mode 100644
-index 0000000..35c61e6
+index 0000000..798be6d
 --- /dev/null
 +++ b/include/mscharged_rollback.h
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,54 @@
 +#if defined(MSCHARGED_TWEAKS)
 +#ifndef MSCHARGED_ROLLBACK_H
 +#define MSCHARGED_ROLLBACK_H
@@ -82,6 +88,9 @@ index 0000000..35c61e6
 +// checksum, `task` and `taskBytes` the fixed update task.
 +void mscharged_rollback_between_steps(int (*replay)(const struct MschargedRollbackInputs* inputs),
 +                                      unsigned (*checksum)(void), void* task, unsigned long taskBytes);
++// The game's: pointers into the drawing's memory (the frame memory, every
++// resource pool and its memory), at most capacity; returns how many.
++int mscharged_rollback_graphics_memory(const void** pointers, int capacity);
 +
 +#ifdef __cplusplus
 +}
@@ -400,3 +409,88 @@ index b50ce23..26ba8e5 100644
              }
  #endif
  
+diff --git a/src/NL/glx/glxMemory.cpp b/src/NL/glx/glxMemory.cpp
+index ebf1e9a..352005b 100644
+--- a/src/NL/glx/glxMemory.cpp
++++ b/src/NL/glx/glxMemory.cpp
+@@ -29,6 +29,9 @@
+ #if defined(MSCHARGED_NATIVE) && defined(MSCHARGED_GAME_MODULE)
+ #include "platform/game_allocation_ownership.h"
+ #endif
++#if defined(MSCHARGED_TWEAKS)
++#include "mscharged_rollback.h"
++#endif
+ 
+ class GLXResourcePool
+     : public GLResourcePool
+@@ -81,6 +84,13 @@ static GLInventory::ModelReleaseCallback sModelReleaseCallback;
+ 
+ static GLResourceMark sFrameMemory[2][2];
+ static unsigned long sFrameMemoryUsed[2][2];
++#if defined(MSCHARGED_TWEAKS)
++// Rollback: the live resource pools. With the frame memory they are the
++// drawing's memory, which the port tracks for the host as it is now: a
++// rollback leaves it alone (mscharged_rollback_graphics_memory).
++static GLResourcePool* sRollbackPools[64];
++static int sRollbackPoolCount;
++#endif
+ 
+ static inline int GetMemoryPoolIndex(eGLMemory memType)
+ {
+@@ -237,6 +247,12 @@ GLXResourcePool::
+     GLXResourcePool(
+         unsigned long sizes[2], const char* name)
+ {
++#if defined(MSCHARGED_TWEAKS)
++    if (sRollbackPoolCount < (int)(sizeof(sRollbackPools) / sizeof(sRollbackPools[0])))
++    {
++        sRollbackPools[sRollbackPoolCount++] = this;
++    }
++#endif
+ #if defined(MSCHARGED_NATIVE) && defined(MSCHARGED_DIAGNOSTIC_RESOURCE_POOLS)
+     strncpy(mName, name ? name : "", sizeof(mName) - 1);
+     mName[sizeof(mName) - 1] = 0;
+@@ -276,6 +292,16 @@ GLXResourcePool::
+ GLXResourcePool::
+     ~GLXResourcePool()
+ {
++#if defined(MSCHARGED_TWEAKS)
++    for (int i = 0; i < sRollbackPoolCount; ++i)
++    {
++        if (sRollbackPools[i] == this)
++        {
++            sRollbackPools[i] = sRollbackPools[--sRollbackPoolCount];
++            break;
++        }
++    }
++#endif
+ #if defined(MSCHARGED_NATIVE) && defined(MSCHARGED_DIAGNOSTIC_RESOURCE_POOLS)
+     // Inventory callbacks must run while pool-backed object headers still exist.
+     m_inventory->Delete();
+@@ -562,3 +588,26 @@ void glplatValidateMatrix(glMatrixHandle matrix)
+     throw std::invalid_argument("Matrix address is outside live GL storage");
+ }
+ #endif
++
++#if defined(MSCHARGED_TWEAKS)
++extern "C" int mscharged_rollback_graphics_memory(const void** pointers, int capacity)
++{
++    int count = 0;
++    for (int pool = 0; pool < 2 && count < capacity; ++pool)
++    {
++        pointers[count++] = (const void*)sFrameMemory[0][pool];
++    }
++    for (int i = 0; i < sRollbackPoolCount; ++i)
++    {
++        GLXResourcePool* pool = (GLXResourcePool*)sRollbackPools[i];
++        if (count + 3 > capacity)
++        {
++            break;
++        }
++        pointers[count++] = pool;
++        pointers[count++] = (const void*)pool->mPoolMemory[0];
++        pointers[count++] = (const void*)pool->mPoolMemory[1];
++    }
++    return count;
++}
++#endif
