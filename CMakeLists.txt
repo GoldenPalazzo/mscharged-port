@@ -351,6 +351,21 @@ if(BUILD_TESTING)
         add_test(NAME rollback_snapshot COMMAND rollback_snapshot_tests)
         set_tests_properties(rollback_snapshot PROPERTIES TIMEOUT 60)
     endif()
+    # The registry's rollback checkpoint on the original allocator.
+    add_executable(game_allocation_rollback_tests tests/game_allocation_rollback.cpp
+        "${MSCHARGED_PREPARED}/src/NL/MemAlloc.cpp" src/platform/game_allocation_ownership.cpp)
+    add_dependencies(game_allocation_rollback_tests verify_prepared)
+    target_compile_features(game_allocation_rollback_tests PRIVATE cxx_std_17)
+    target_include_directories(game_allocation_rollback_tests PRIVATE src "${MSCHARGED_PREPARED}/include"
+        "${MSCHARGED_PREPARED}/libs/RVL_SDK/include")
+    target_compile_definitions(game_allocation_rollback_tests PRIVATE
+        MSCHARGED_NATIVE=1 MSCHARGED_GAME_MODULE=1 TARGET_PC=1)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU" AND NOT MSVC)
+        target_compile_options(game_allocation_rollback_tests PRIVATE
+            -fno-strict-aliasing -ffp-contract=off -fsigned-char -Wno-unknown-pragmas)
+    endif()
+    add_test(NAME game_allocation_rollback COMMAND game_allocation_rollback_tests)
+    set_tests_properties(game_allocation_rollback PROPERTIES TIMEOUT 60)
     add_test(NAME source_preparation
         COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_prepare_sources.py")
     if(MSCHARGED_PREPARED_FORMATTED)
