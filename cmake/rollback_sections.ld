@@ -7,7 +7,10 @@
    the DSP), the network session and its transports, files, real time, the
    low-level graphics of NL and the pads (the host pad backend, the Wii Remote
    and Nunchuk state, flick detection and the front end's pad data: a replayed
-   step reads none of them, the next new step reads the pads as they are).
+   step reads none of them, the next new step reads the pads as they are)
+   and the drawing's bookkeeping of the resource pools it fills every frame
+   (the goal nets' and the crowd impostors' pools, their marks and turns): the
+   pools stay as they are, so the marks into them must too.
    Joining is the safe side: only the simulation's steps run between a save
    and its restore, so a global they leave alone is restored to the very bytes
    it holds. Leaving out a global the steps change is what breaks a rollback:
@@ -27,7 +30,8 @@ SECTIONS
         HIDDEN(__rbk_data_start = .);
         EXCLUDE_FILE(*src/Game/Audio/* *src/Game/Network[!IR]* *src/Game/FriendManager* *src/Game/LANLobby*
                      *src/Game/Net.cpp* *src/Game/NetTournManager* *src/Game/NetMessage*
-                     *src/Game/Pad/FlickDetection* *src/Game/FE/feInput*)
+                     *src/Game/Pad/FlickDetection* *src/Game/FE/feInput* *src/Game/Drawable/DrawableNetMesh*
+                     *src/Game/Render/ImpostorManager*)
         *src/Game/*(.data .data.[!r]* .data.r[!e]* .data.rel .data.rel.local .data.rel.local.*
                     .data.rel.[!rl]*)
         EXCLUDE_FILE(*src/NL/gl/* *src/NL/glx/* *src/NL/gc/* *src/NL/nlFile* *src/NL/nlAsyncFileBuffer*
@@ -60,7 +64,8 @@ SECTIONS
         HIDDEN(__rbk_bss_start = .);
         EXCLUDE_FILE(*src/Game/Audio/* *src/Game/Network[!IR]* *src/Game/FriendManager* *src/Game/LANLobby*
                      *src/Game/Net.cpp* *src/Game/NetTournManager* *src/Game/NetMessage*
-                     *src/Game/Pad/FlickDetection* *src/Game/FE/feInput*)
+                     *src/Game/Pad/FlickDetection* *src/Game/FE/feInput* *src/Game/Drawable/DrawableNetMesh*
+                     *src/Game/Render/ImpostorManager*)
         *src/Game/*(.bss .bss.* COMMON)
         EXCLUDE_FILE(*src/NL/gl/* *src/NL/glx/* *src/NL/gc/* *src/NL/nlFile* *src/NL/nlAsyncFileBuffer*
                      *src/NL/nlBundleFile* *src/NL/nlDebug* *src/NL/nlTicker* *src/NL/nlTime* *src/NL/nlPrint*

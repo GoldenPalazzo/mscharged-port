@@ -14,7 +14,9 @@
 // session (but its players' inputs), sockets and lobby, the input routers and
 // manager, the pads, the tasks' clocks and the fixed update task's
 // accumulated time, the drawing's memory (frame memory and resource pools,
-// whose suballocations the port tracks for the host) and the audio memory.
+// whose suballocations the port tracks for the host) with the bookkeeping of
+// the pools drawing fills every frame (cmake/rollback_sections.ld), and the
+// audio memory.
 // Everything else, the drawing's objects included, goes back with the match. A replayed step reads no pads, captures and sends
 // nothing, and queues no deterministic data (it went out the first time).
 //
