@@ -233,6 +233,9 @@ struct Registry
     std::uint64_t copies = 0, untracked = 0, failed_copies = 0;
     std::uint64_t checkpoint_incarnation = 0;
     std::uint64_t byte_writes_started = 0;
+    // Byte write reservations alive: producers (disc reads) under way, counted
+    // so that asking needs no walk through every record.
+    std::uint64_t live_reservations = 0;
 };
 Registry& State()
 {
@@ -920,6 +923,7 @@ GameByteWriteReservation::GameByteWriteReservation(void* destination, std::size_
         RetireNativeBackings(owner->second,address,physicalBytes);
         ++owner->second.next_write;
         pending_ = token;
+        ++state.live_reservations;
     }
     catch (...)
     {
@@ -961,9 +965,10 @@ void GameByteWriteReservation::Reset() noexcept
 {
     if (!pending_) return;
     auto& token = *static_cast<PendingBytes*>(pending_);
+    auto& state = State(); std::lock_guard lock(state.mutex);
+    --state.live_reservations;
     if (!token.completed.empty())
     {
-        auto& state = State(); std::lock_guard lock(state.mutex);
         auto owner = state.records.find(token.allocation);
         if (owner != state.records.end() && owner->second.incarnation == token.incarnation)
         {
@@ -1867,9 +1872,7 @@ GameByteProducers CurrentGameByteProducers()
 {
     auto& state = State();
     std::lock_guard lock(state.mutex);
-    GameByteProducers result{0, state.byte_writes_started};
-    for (const auto& [address, allocation] : state.records) result.pending += allocation.pending_writes.size();
-    return result;
+    return {static_cast<std::size_t>(state.live_reservations), state.byte_writes_started};
 }
 void EndGameAllocationCheckpoint()
 {

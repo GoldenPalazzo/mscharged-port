@@ -330,6 +330,8 @@ struct State
     // Where the replays' time goes: each task's, and in the fixed update's the
     // steps' and the saves'.
     std::uint64_t taskNs[kMaxTasks], stepNs, saveNs;
+    std::uint64_t replayFaults, replaySavedPages, replayHotPages; // of the replayed steps and their saves
+    std::uint64_t markNs; // of the replayed saves, the allocation registry's part
 
     // RECHARGED_ROLLBACK: network matches that predict.
     bool netplay;
@@ -649,9 +651,10 @@ void WriteSummary()
     std::fprintf(file, "mega strike meter presses received %llu, given again in replays %llu\n",
                  static_cast<unsigned long long>(s.meterReceived), static_cast<unsigned long long>(s.meterRedelivered));
     if (h.saves)
-        std::fprintf(file, "save: %.1f us avg / %.1f us max; %llu pages avg / %llu max\n", h.saveNs / 1e3 / h.saves,
-                     h.maxSaveNs / 1e3, static_cast<unsigned long long>(h.savedPages / h.saves),
-                     static_cast<unsigned long long>(h.maxSavedPages));
+        std::fprintf(file, "save: %.1f us avg / %.1f us max; %llu pages avg / %llu max; %zu hot now\n",
+                     h.saveNs / 1e3 / h.saves, h.maxSaveNs / 1e3,
+                     static_cast<unsigned long long>(h.savedPages / h.saves),
+                     static_cast<unsigned long long>(h.maxSavedPages), h.hotPages);
     if (s.rollbacks)
     {
         std::fprintf(file, "restore: %.1f us avg / %.1f us max\n", s.restoreNs / 1e3 / s.rollbacks,
@@ -670,8 +673,13 @@ void WriteSummary()
                 std::fprintf(file, " %s %.0f", name ? name : "?", s.taskNs[i] / 1e3 / frames);
             }
         if (s.replayed)
-            std::fprintf(file, "; us per step replayed: step %.0f, save %.0f", s.stepNs / 1e3 / s.replayed,
-                         s.saveNs / 1e3 / s.replayed);
+            std::fprintf(file, "; us per step replayed: step %.0f, save %.0f (registry %.0f); per step replayed: faults %.0f, "
+                               "pages saved %.0f of %.0f hot",
+                         s.stepNs / 1e3 / s.replayed, s.saveNs / 1e3 / s.replayed,
+                         s.markNs / 1e3 / s.replayed,
+                         static_cast<double>(s.replayFaults) / s.replayed,
+                         static_cast<double>(s.replaySavedPages) / s.replayed,
+                         static_cast<double>(s.replayHotPages) / s.replayed);
         std::fprintf(file, "\n");
     }
     const auto registry = mscharged::platform::CurrentGameAllocationCheckpointStats();
@@ -1203,6 +1211,8 @@ void ReplayFrames(std::uint64_t first, std::uint64_t last, int firstTask, unsign
             {
                 Step& step = s.steps[next % kRing];
                 const std::uint64_t stepStart = NowNs();
+                const auto& snapshots = mscharged::platform::RollbackSnapshotStatistics();
+                const std::uint64_t faultsBefore = snapshots.faults;
                 RollbackRedeliverMegaStrikeMeter(step.meter, step.meterCount);
                 s.meterRedelivered += step.meterCount;
                 if (replay(&step.inputs) < 0) ++s.nisInReplay;
@@ -1223,9 +1233,15 @@ void ReplayFrames(std::uint64_t first, std::uint64_t last, int firstTask, unsign
                         std::fprintf(s.out, "REPLAYED FRAME %u (%d back from %u): checksum %08x, first run %08x\n",
                                      next, depth, s.latest, now, step.checksum);
                 }
+                const std::uint64_t pagesBefore = snapshots.savedPages;
+                s.replayHotPages += snapshots.hotPages;
                 step.snapshot = mscharged::platform::SaveRollbackSnapshot();
+                const std::uint64_t markStart = NowNs();
                 step.mark = mscharged::platform::MarkGameAllocationCheckpoint();
+                s.markNs += NowNs() - markStart;
                 s.saveNs += NowNs() - saveStart;
+                s.replayFaults += snapshots.faults - faultsBefore;
+                s.replaySavedPages += snapshots.savedPages - pagesBefore;
                 ++s.replayed;
                 if (s.netplay && !(step.phases == s.steps[(next - 1) % kRing].phases)) StopReplayAt(next);
             }
