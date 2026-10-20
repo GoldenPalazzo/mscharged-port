@@ -15,18 +15,27 @@
 // manager, the pads, the tasks' clocks and the fixed update task's
 // accumulated time, the drawing's memory (frame memory and resource pools,
 // whose suballocations the port tracks for the host) with the bookkeeping of
-// the pools drawing fills every frame (the goal nets' in cmake/rollback_sections.ld,
-// the crowd impostors' here), and the audio memory.
-// Everything else, the drawing's objects included, goes back with the match. A replayed step reads no pads, captures and sends
-// nothing, and queues no deterministic data (it went out the first time).
+// the pools drawing fills every frame (the goal nets' in
+// cmake/rollback_sections.ld, the crowd impostors' here), and the audio
+// memory. Everything else, the drawing's objects included, goes back with the
+// match.
+//
+// A replayed step reads no pads, captures and sends nothing, and queues no
+// deterministic data (it went out the first time). Around it the replay runs
+// what the frame's other tasks do to the match and its presentation (cameras,
+// NIS, particles, HUD, scenes, stadium, events), without drawing, with the
+// time step each frame first had (tweak patch 0033). One presentation update
+// per step: at a frame rate above the steps' the replayed presentation runs
+// fewer, longer updates.
 //
 // The game makes no sounds at all while the test runs, menus included: audio
 // is not part of the rollback yet, and the audio code's slot pools keep their
 // free lists in globals the rollback leaves alone but their blocks in the
-// arenas it restores. A rollback is skipped when a disc read
-// was in flight or the game or task state changed in the steps it would undo
-// (their presentation and loading started outside the simulation). Tracking
-// stops when no step comes for a quarter of a second (pause, end of match).
+// arenas it restores. A rollback is skipped when a disc read was in flight or
+// started, or the game or task state changed, in the steps it would undo
+// (their completion, presentation and loading went into memory it restores).
+// Tracking stops when no step comes for a quarter of a second (pause, end of
+// match).
 #if !defined(MSCHARGED_NATIVE) || !defined(MSCHARGED_GAME_MODULE)
 #error The rollback test belongs to the isolated original game module
 #endif
@@ -113,6 +122,8 @@ struct Step
     unsigned checksum;              // after it, as it first ran
     Phases phases;                  // after it
     bool reading;                   // a disc read in flight after it
+    std::uint64_t readsStarted;     // disc reads started until then
+    float frameTime;                // the time step of the tasks in its frame
 };
 
 struct State
@@ -144,7 +155,7 @@ struct State
     // Counts and costs.
     int starts;
     std::uint64_t stepCount, rollbacks, byDepth[kMaxDepth + 1], replayed;
-    std::uint64_t skippedReads, skippedPhases, skippedEvents, skippedShort;
+    std::uint64_t skippedReads, skippedStarts, skippedPhases, skippedEvents, skippedShort;
     std::uint64_t mismatches, nisInReplay, lossyFrees, failedRestores, untracked;
     unsigned firstMismatchFrame;
     std::uint64_t rollbackNs, maxRollbackNs, restoreNs, maxRestoreNs;
@@ -357,6 +368,16 @@ Phases CurrentPhases()
     return phases;
 }
 
+// What a rollback past this step must check, and the time its frame's tasks ran with.
+void RecordFrame(Step& step)
+{
+    step.phases = CurrentPhases();
+    const auto producers = mscharged::platform::CurrentGameByteProducers();
+    step.reading = producers.pending != 0;
+    step.readsStarted = producers.started;
+    step.frameTime = nlTaskManager::m_pInstance ? nlTaskManager::m_pInstance->mCurrentTimeDelta : 1.0f / 60.0f;
+}
+
 void Record(std::uint64_t value, std::uint64_t& total, std::uint64_t& max)
 {
     total += value;
@@ -382,9 +403,10 @@ void WriteSummary()
                        "pages written behind the tracking %llu\n",
                  static_cast<unsigned long long>(s.failedRestores), static_cast<unsigned long long>(s.nisInReplay),
                  static_cast<unsigned long long>(s.lossyFrees), static_cast<unsigned long long>(s.untracked));
-    std::fprintf(file, "skipped: disc read in flight %llu, game or task state change %llu, too many events %llu, "
-                       "too few steps saved %llu\n",
-                 static_cast<unsigned long long>(s.skippedReads), static_cast<unsigned long long>(s.skippedPhases),
+    std::fprintf(file, "skipped: disc read in flight %llu, disc read started %llu, game or task state change %llu, "
+                       "too many events %llu, too few steps saved %llu\n",
+                 static_cast<unsigned long long>(s.skippedReads), static_cast<unsigned long long>(s.skippedStarts),
+                 static_cast<unsigned long long>(s.skippedPhases),
                  static_cast<unsigned long long>(s.skippedEvents), static_cast<unsigned long long>(s.skippedShort));
     if (h.saves)
         std::fprintf(file, "save: %.1f us avg / %.1f us max; %llu pages avg / %llu max\n", h.saveNs / 1e3 / h.saves,
@@ -427,8 +449,7 @@ bool Start(FixedUpdateTask* task, unsigned long taskBytes, unsigned (*checksum)(
     step.snapshot = mscharged::platform::BeginRollbackSnapshots();
     step.mark = mscharged::platform::MarkGameAllocationCheckpoint();
     step.checksum = checksum();
-    step.phases = CurrentPhases();
-    step.reading = mscharged::platform::CurrentGameByteProducers().pending != 0;
+    RecordFrame(step);
     s.latest = frame;
     s.stored = 1;
     s.haveInputs = false;
@@ -464,6 +485,12 @@ void RollBack(int depth, int (*replay)(const MschargedRollbackInputs*), unsigned
             ++s.skippedReads;
             return;
         }
+        // A read started and done in these steps: its completion went into memory this restores.
+        if (step.readsStarted != s.steps[target % kRing].readsStarted)
+        {
+            ++s.skippedStarts;
+            return;
+        }
         if (!(step.phases == s.steps[s.latest % kRing].phases))
         {
             ++s.skippedPhases;
@@ -491,6 +518,8 @@ void RollBack(int depth, int (*replay)(const MschargedRollbackInputs*), unsigned
     for (unsigned f = target + 1; f <= s.latest; ++f)
     {
         Step& step = s.steps[f % kRing];
+        step.inputs.previousFrameTime = s.steps[(f - 1) % kRing].frameTime;
+        step.inputs.frameTime = step.frameTime;
         if (replay(&step.inputs) < 0) ++s.nisInReplay;
         const unsigned now = checksum();
         if (now != step.checksum)
@@ -618,8 +647,7 @@ extern "C" void mscharged_rollback_between_steps(int (*replay)(const MschargedRo
     step.mark = mscharged::platform::MarkGameAllocationCheckpoint();
     step.inputs = s.pending;
     step.checksum = checksum();
-    step.phases = CurrentPhases();
-    step.reading = mscharged::platform::CurrentGameByteProducers().pending != 0;
+    RecordFrame(step);
     s.haveInputs = false;
     s.latest = frame;
     ++s.stored;
