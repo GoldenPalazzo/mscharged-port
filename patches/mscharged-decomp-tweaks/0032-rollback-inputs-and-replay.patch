@@ -10,14 +10,17 @@ they queue for the simulation, in their order), and ApplyRollbackInputs
 applies a report again. FixedUpdateTask passes the port a replay step:
 those inputs and the simulation, no pads, no capture, nothing sent.
 
-The rollback restores the drawing's objects with the match, so the replay
-step also runs, around the step and in Run's task order, what the frame's
-other tasks do to the match and its presentation, without drawing, reading
-pads or files, sending or making sounds: the particles' update, the front
-end's presentation, HUD, scenes, lighting, models and stadium, the event
-dispatch, then BeginFrameTask's presentation, NIS, mega blend and cameras.
-The port gives each part the time step its frame first had. Replaying the
-steps alone left all of it a little further behind at every rollback.
+The rollback restores the drawing's objects with the match, so the port
+also replays, around the steps, the frames they were played in: what the
+frames' other tasks do to the match and its presentation, without drawing,
+reading pads or files, sending or making sounds: BeginFrameTask's
+presentation, NIS, mega blend and cameras; GameRenderTask's meters,
+indicators, darkening, blur, flashes and frame lock; the particles' update;
+the front end's presentation, HUD, scenes, lighting, models and stadium; the
+event dispatch. The task manager reports every task's time step
+(mscharged_rollback_task_time), so that each part gets the one its task had
+in each frame, slowed down or not. Replaying the steps alone left all of it
+a little further behind at every rollback (a darkened screen flickered).
 The port goes back at the start of a frame, before any task of it runs
 (nlTaskManager::RunAllTasks): restored mid-frame, the cameras and views a
 frame had already set up would draw the current match from an earlier
@@ -38,7 +41,8 @@ The mega strike meter's presses go from the shooter's machine to the others
 outside the inputs, in their own messages, which cGame queues for the
 shooter's fielder on the other machines. The port records the presses
 received before each step and gives them again to its replay
-(RollbackRedeliverMegaStrikeMeter); a replayed step sends none.
+(RollbackRedeliverMegaStrikeMeter); a replayed step sends none, nor the
+mega ball pointer of a captain's shot.
 
 The rollback leaves the frame memory alone: it is used afresh every frame,
 with its cursors in glxMemory's statics. mscharged_rollback_frame_memory
@@ -77,10 +81,10 @@ index 1c86544..2720aa9 100644
      float mTimeScale;
 diff --git a/include/mscharged_rollback.h b/include/mscharged_rollback.h
 new file mode 100644
-index 0000000..7724ad2
+index 0000000..883a06a
 --- /dev/null
 +++ b/include/mscharged_rollback.h
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,76 @@
 +#if defined(MSCHARGED_TWEAKS)
 +#ifndef MSCHARGED_ROLLBACK_H
 +#define MSCHARGED_ROLLBACK_H
@@ -109,10 +113,6 @@ index 0000000..7724ad2
 +    signed char eventMachines[MSCHARGED_ROLLBACK_MAX_EVENTS];
 +    unsigned char events[MSCHARGED_ROLLBACK_MAX_EVENTS][0x24]; // DetermDataEvent
 +    int overflowed;                  // more events than MSCHARGED_ROLLBACK_MAX_EVENTS
-+    // Filled in by the port for a replay: the time step of the tasks in the
-+    // frame of the step before this one, and in this step's frame.
-+    float previousFrameTime;
-+    float frameTime;
 +};
 +
 +// Whether the rollback runs: the routers then report the inputs they apply,
@@ -132,6 +132,9 @@ index 0000000..7724ad2
 +// The presses of a mega strike meter received from the shooter's machine,
 +// outside the inputs: the steps that use them run again with them.
 +void mscharged_rollback_meter_received(const bool* values, int count);
++// Every task the task manager runs, with its time step: the port replays the
++// frames of some around the steps a rollback runs again.
++void mscharged_rollback_task_time(const void* task, float dt);
 +// At the start of a frame, before any task sets up its cameras and views:
 +// where the rollback goes back and replays, through the end of the last frame.
 +void mscharged_rollback_frame_start(void);
@@ -142,12 +145,14 @@ index 0000000..7724ad2
 +#ifdef __cplusplus
 +}
 +
-+// A replayed frame also runs, around its step, what the frame's other tasks
-+// do to the match's state and presentation, without drawing, reading pads or
-+// files, sending or making sounds: BeginFrameTask's presentation, NIS,
-+// characters' mega blend and cameras; the particles' update; the front end's
-+// presentation, HUD and scenes.
++// The port also replays, around the steps, what the frames' other tasks do
++// to the match's state and presentation, each with the time step it had,
++// without drawing, reading pads or files, sending or making sounds:
++// BeginFrameTask's presentation, NIS, characters' mega blend and cameras;
++// GameRenderTask's meters, indicators, darkening, blur and flashes; the
++// particles' update; the front end's presentation, HUD and scenes.
 +void RollbackReplayBeginFrame(float dt);
++void RollbackReplayGameRender(float dt);
 +void RollbackReplayParticles(float dt);
 +void RollbackReplayFrontEnd(float dt);
 +// Gives the match the mega strike meter presses received before a step again.
@@ -491,6 +496,34 @@ index 14e2acd..5ba9b4b 100644
      CheckPeerSynchronization();
  }
  
+diff --git a/src/Game/Render/MegaBallIndicators.cpp b/src/Game/Render/MegaBallIndicators.cpp
+index 298301f..a1d196e 100644
+--- a/src/Game/Render/MegaBallIndicators.cpp
++++ b/src/Game/Render/MegaBallIndicators.cpp
+@@ -24,6 +24,9 @@
+ #include "NL/plat/WiiPad.h"
+ #endif
+ #include <math.h>
++#if defined(MSCHARGED_TWEAKS)
++#include "mscharged_rollback.h"
++#endif
+ 
+ void SendMegaBallPointerUpdate(u16 angle, u32 textureIndex, u32 status,
+     float x, float y);
+@@ -1049,6 +1052,13 @@ void UpdateAndRenderMegaBallIndicators(float fDeltaT)
+ void SendMegaBallPointerUpdate(u16 nAngle, u32 nTextureIndex,
+     u32 nStatus, float fX, float fY)
+ {
++#if defined(MSCHARGED_TWEAKS)
++    // A rollback's replay: the pointer went out when its frame first ran.
++    if (mscharged_rollback_resimulating())
++    {
++        return;
++    }
++#endif
+     if (gSuppressMegaBallPointerPackets)
+     {
+         return;
 diff --git a/src/Game/Task/BeginFrameTask.cpp b/src/Game/Task/BeginFrameTask.cpp
 index baec505..8c23815 100644
 --- a/src/Game/Task/BeginFrameTask.cpp
@@ -525,37 +558,30 @@ index baec505..8c23815 100644
 +}
 +#endif
 diff --git a/src/Game/Task/FixedUpdateTask.cpp b/src/Game/Task/FixedUpdateTask.cpp
-index b50ce23..756116e 100644
+index b50ce23..b50f372 100644
 --- a/src/Game/Task/FixedUpdateTask.cpp
 +++ b/src/Game/Task/FixedUpdateTask.cpp
-@@ -42,6 +42,10 @@
+@@ -42,6 +42,9 @@
  #include "Game/NetworkInput.h"
  #include "Game/NetworkSync.h"
  #include "mscharged_synctest.h"
 +#if defined(MSCHARGED_TWEAKS)
 +#include "mscharged_rollback.h"
-+#include "Game/Task/DispatchEventsTask.h"
 +#endif
  
  #include <math.h>
  
-@@ -339,6 +343,24 @@ static unsigned SyncTestChecksum()
+@@ -339,6 +342,18 @@ static unsigned SyncTestChecksum()
  {
      return fixedUpdateTask.CalculateChecksum();
  }
 +
 +#if defined(MSCHARGED_TWEAKS)
 +// One fixed step again for the rollback, with the inputs the router applied
-+// when it first ran: no pads, no capture, nothing sent. A replay restarts
-+// after a step, so first comes what the tasks after the previous step did
-+// in its frame (particles, front end, events), then what the tasks before
-+// this step did in this one, as Run's task order has them.
++// when it first ran: no pads, no capture, nothing sent. The port replays the
++// other tasks of the frames around it.
 +static int RollbackReplayStep(const MschargedRollbackInputs* inputs)
 +{
-+    RollbackReplayParticles(inputs->previousFrameTime);
-+    RollbackReplayFrontEnd(inputs->previousFrameTime);
-+    gDispatchEventsTask->Run(inputs->previousFrameTime);
-+    RollbackReplayBeginFrame(inputs->frameTime);
 +    ApplyRollbackInputs(inputs);
 +    fixedUpdateTask.CallFixedUpdateTasks();
 +    return IsNisLoadedOnAllMachines(GetPresentation()) ? -1 : 1;
@@ -564,7 +590,7 @@ index b50ce23..756116e 100644
  #endif
  
  void FixedUpdateTask::Run(float dt)
-@@ -428,6 +450,10 @@ void FixedUpdateTask::Run(float dt)
+@@ -428,6 +443,10 @@ void FixedUpdateTask::Run(float dt)
              {
                  mscharged_synctest_between_steps(SyncTestStep, SyncTestChecksum, &fixedUpdateTask,
                                                   sizeof(fixedUpdateTask));
@@ -619,6 +645,88 @@ index e4f3dd8..09c9175 100644
 +        UpdateStadium(dt);
 +    }
 +#endif
++}
++#endif
+diff --git a/src/Game/Task/GameRenderTask.cpp b/src/Game/Task/GameRenderTask.cpp
+index 5a03a53..9878653 100644
+--- a/src/Game/Task/GameRenderTask.cpp
++++ b/src/Game/Task/GameRenderTask.cpp
+@@ -573,4 +573,77 @@ bool IsWarbleParticleRenderingEnabled()
+ {
+     return sWarbleParticleRenderingEnabled;
+ }
++#if defined(MSCHARGED_TWEAKS)
++#include "mscharged_rollback.h"
++#include "Game/RenderSnapshot_fwd.h"
++
++// Run's and RenderFrame's updates of the match's presentation, in their
++// order, for a rollback's replay: what both update and draw draws nothing
++// (GLView drops it). The impostors, the world's models and the replay
++// snapshot are drawn afresh every frame; a secondary NIS stops rollbacks.
++void RollbackReplayGameRender(float fDeltaT)
++{
++    if (gpHBMManager != 0 && gpHBMManager->mActive && gpHBMManager->mReady)
++    {
++        return;
++    }
++    if (TimedObjectManager::Instance() != 0)
++    {
++        TimedObjectManager::Instance()->Update(fDeltaT);
++    }
++    if (NisPlayer::Instance()->HasSecondaryNis() || !g_bRenderWorld)
++    {
++        return;
++    }
++
++    if (GetFixedUpdateTask()->mfFrameLockTime > 0.0f)
++    {
++        FixedUpdateTask::DecrementFrameLock(fDeltaT);
++    }
+ 
++    float dt = (nlTaskManager::m_pInstance->mCurrentState == TASK_PAUSED) ? 0.0f : fDeltaT;
++    UpdateWarble(&gWarble, dt);
++    UpdateAttackSideIndicators();
++    for (int charIndex = 0; charIndex < 10; charIndex++)
++    {
++        if (g_pCharacters[charIndex] != 0)
++        {
++            g_pCharacters[charIndex]->UpdateBlinking(dt);
++        }
++    }
++
++    // RenderSnapshot::Render's timer.
++    if (nlTaskManager::m_pInstance->mCurrentState != TASK_FRONTEND && g_AllActorsHidden > 0.0f)
++    {
++        g_AllActorsHidden -= fDeltaT;
++    }
++
++    u32 currState = nlTaskManager::m_pInstance->mCurrentState;
++    if (currState == TASK_GAMEPLAY
++        || (currState == TASK_PAUSED && nlTaskManager::m_pInstance->mPreviousState == TASK_GAMEPLAY))
++    {
++        float indicatorDt = (currState == TASK_GAMEPLAY) ? fDeltaT : 0.0f;
++        if (g_pGame->mbCaptainShotToScoreOn)
++        {
++            UpdateAndRenderMegaBallIndicators(indicatorDt);
++        }
++        else
++        {
++            UpdateAndRenderIndicators(indicatorDt);
++        }
++        ShootToScoreMeter::instance.UpdateAndRender(fDeltaT);
++        gMegastrikeBackgroundOverlay.UpdateAndRender(fDeltaT);
++    }
++
++    WorldDarkening::Instance().Update(fDeltaT);
++    if ((nlTaskManager::m_pInstance->mCurrentState & 0x00020008) == 0)
++    {
++        BlurManager::Update(fDeltaT);
++    }
++    if (g_bRenderWorldEffects)
++    {
++        PhotoFlash::Render(fDeltaT);
++        UpdateElectricFence(fDeltaT);
++    }
 +}
 +#endif
 diff --git a/src/Game/Task/ParticleUpdateTask.cpp b/src/Game/Task/ParticleUpdateTask.cpp
@@ -732,7 +840,7 @@ index ebf1e9a..c5ca54d 100644
 +}
 +#endif
 diff --git a/src/NL/nlTask.cpp b/src/NL/nlTask.cpp
-index d94c8c9..9023abb 100644
+index d94c8c9..25d980c 100644
 --- a/src/NL/nlTask.cpp
 +++ b/src/NL/nlTask.cpp
 @@ -10,6 +10,9 @@
@@ -756,3 +864,13 @@ index d94c8c9..9023abb 100644
  #endif
      nlTask* currentTask = nlDLRingGetStart<nlTask>(m_pInstance->mTaskList);
      if (currentTask != 0)
+@@ -120,6 +127,9 @@ void nlTaskManager::RunAllTasks()
+ #endif
+             }
+             m_pInstance->mCurrentTimeDelta = deltaTime;
++#if defined(MSCHARGED_TWEAKS)
++            mscharged_rollback_task_time(taskIterator, deltaTime);
++#endif
+             taskIterator->Run(deltaTime);
+             taskIterator->mExecutionTime =
+                 nlGetTickerDifference(taskIterator->mPreviousTicker, nlGetTicker());
