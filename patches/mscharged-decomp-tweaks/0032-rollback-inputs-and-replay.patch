@@ -14,9 +14,10 @@ The rollback restores the drawing's objects with the match, so the port
 also replays, around the steps, the frames they were played in: what the
 frames' other tasks do to the match and its presentation, without drawing,
 reading pads or files, sending or making sounds: BeginFrameTask's
-presentation, NIS, mega blend and cameras; GameRenderTask's meters,
-indicators, darkening, flashes and frame lock (not the blur, whose update
-draws); the particles' update;
+presentation, NIS, mega blend and cameras; GameRenderTask's updates that
+draw nothing (darkening, photo flash, blinks, warble, timers, frame lock;
+its meters, indicators and blur update and draw as one, reading what the
+frame's drawing set up, and stay out); the particles' update;
 the front end's presentation, HUD, scenes, lighting, models and stadium; the
 event dispatch. The task manager reports every task's time step
 (mscharged_rollback_task_time), so that each part gets the one its task had
@@ -84,7 +85,7 @@ index 1c86544..2720aa9 100644
      float mTimeScale;
 diff --git a/include/mscharged_rollback.h b/include/mscharged_rollback.h
 new file mode 100644
-index 0000000..983f3d5
+index 0000000..0bffe6c
 --- /dev/null
 +++ b/include/mscharged_rollback.h
 @@ -0,0 +1,76 @@
@@ -152,7 +153,7 @@ index 0000000..983f3d5
 +// to the match's state and presentation, each with the time step it had,
 +// without drawing, reading pads or files, sending or making sounds:
 +// BeginFrameTask's presentation, NIS, characters' mega blend and cameras;
-+// GameRenderTask's meters, indicators, darkening and flashes; the
++// GameRenderTask's darkening, flashes, blinks and timers; the
 +// particles' update; the front end's presentation, HUD and scenes.
 +void RollbackReplayBeginFrame(float dt);
 +void RollbackReplayGameRender(float dt);
@@ -680,10 +681,10 @@ index e4f3dd8..09c9175 100644
 +}
 +#endif
 diff --git a/src/Game/Task/GameRenderTask.cpp b/src/Game/Task/GameRenderTask.cpp
-index 5a03a53..eaa024d 100644
+index 5a03a53..6c1723f 100644
 --- a/src/Game/Task/GameRenderTask.cpp
 +++ b/src/Game/Task/GameRenderTask.cpp
-@@ -573,4 +573,74 @@ bool IsWarbleParticleRenderingEnabled()
+@@ -573,4 +573,75 @@ bool IsWarbleParticleRenderingEnabled()
  {
      return sWarbleParticleRenderingEnabled;
  }
@@ -691,26 +692,44 @@ index 5a03a53..eaa024d 100644
 +#include "mscharged_rollback.h"
 +#include "Game/RenderSnapshot_fwd.h"
 +
-+// Run's and RenderFrame's updates of the match's presentation, in their
-+// order, for a rollback's replay: what both update and draw draws nothing
-+// (GLView drops it). The impostors, the world's models and the replay
-+// snapshot are drawn afresh every frame; the blur's update draws its meshes
-+// into frame memory as it goes; a secondary NIS stops rollbacks.
++// Run's and RenderFrame's updates of the match's presentation that draw
++// nothing, in their order, for a rollback's replay: the timed objects'
++// clocks (their updates draw), the frame lock, the warble, the attack side
++// indicators, the blinks, the hidden actors' timer, the darkening, the photo
++// flash's count and the electric fence. The functions that update and draw
++// as one (the meters, the player indicators, the blur, the impostors) read
++// what this frame's drawing set up and stay out: a rollback takes their
++// animations back a little.
 +void RollbackReplayGameRender(float fDeltaT)
 +{
 +    if (gpHBMManager != 0 && gpHBMManager->mActive && gpHBMManager->mReady)
 +    {
 +        return;
 +    }
-+    if (TimedObjectManager::Instance() != 0)
++    if (TimedObjectManager* timed = TimedObjectManager::Instance())
 +    {
-+        TimedObjectManager::Instance()->Update(fDeltaT);
++        nlListIterator<TimedObject*> iterator = timed->mObjects.Begin();
++        while (iterator.IsValid())
++        {
++            TimedObject* object = iterator.Current();
++            if (object->mEnabled && object->mElapsedTime < object->mLifetime)
++            {
++                object->mElapsedTime += fDeltaT;
++            }
++            const bool remove = object->HasExpired();
++            iterator.Next();
++            if (remove)
++            {
++                timed->mObjects.RemoveEntry(object);
++                delete object;
++            }
++        }
 +    }
 +    if (NisPlayer::Instance()->HasSecondaryNis() || !g_bRenderWorld)
 +    {
 +        return;
 +    }
-+
+ 
 +    if (GetFixedUpdateTask()->mfFrameLockTime > 0.0f)
 +    {
 +        FixedUpdateTask::DecrementFrameLock(fDeltaT);
@@ -726,28 +745,11 @@ index 5a03a53..eaa024d 100644
 +            g_pCharacters[charIndex]->UpdateBlinking(dt);
 +        }
 +    }
- 
++
 +    // RenderSnapshot::Render's timer.
 +    if (nlTaskManager::m_pInstance->mCurrentState != TASK_FRONTEND && g_AllActorsHidden > 0.0f)
 +    {
 +        g_AllActorsHidden -= fDeltaT;
-+    }
-+
-+    u32 currState = nlTaskManager::m_pInstance->mCurrentState;
-+    if (currState == TASK_GAMEPLAY
-+        || (currState == TASK_PAUSED && nlTaskManager::m_pInstance->mPreviousState == TASK_GAMEPLAY))
-+    {
-+        float indicatorDt = (currState == TASK_GAMEPLAY) ? fDeltaT : 0.0f;
-+        if (g_pGame->mbCaptainShotToScoreOn)
-+        {
-+            UpdateAndRenderMegaBallIndicators(indicatorDt);
-+        }
-+        else
-+        {
-+            UpdateAndRenderIndicators(indicatorDt);
-+        }
-+        ShootToScoreMeter::instance.UpdateAndRender(fDeltaT);
-+        gMegastrikeBackgroundOverlay.UpdateAndRender(fDeltaT);
 +    }
 +
 +    WorldDarkening::Instance().Update(fDeltaT);
