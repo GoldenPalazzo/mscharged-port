@@ -18,6 +18,10 @@ end's presentation, HUD, scenes, lighting, models and stadium, the event
 dispatch, then BeginFrameTask's presentation, NIS, mega blend and cameras.
 The port gives each part the time step its frame first had. Replaying the
 steps alone left all of it a little further behind at every rollback.
+Drawing has nowhere to go during a replay, whose frame was already drawn:
+the effects' update callbacks are skipped (some draw, like the electric
+fence's; the next new frame places the emitters again), and GLView drops
+any model or packet attached meanwhile.
 
 Deterministic data the simulation queues to send (player visibility, mega
 strike results, NIS loaded) is an input of a later step on every machine:
@@ -133,6 +137,36 @@ index 0000000..4fa61fb
 +
 +#endif // MSCHARGED_ROLLBACK_H
 +#endif // MSCHARGED_TWEAKS
+diff --git a/src/Game/Effects/EmissionController.cpp b/src/Game/Effects/EmissionController.cpp
+index 7694981..b661396 100644
+--- a/src/Game/Effects/EmissionController.cpp
++++ b/src/Game/Effects/EmissionController.cpp
+@@ -10,6 +10,9 @@
+ #include "NL/nlFile.h"
+ #include "NL/nlMemory.h"
+ #include "Game/SharedStaticStorage.h"
++#if defined(MSCHARGED_TWEAKS)
++#include "mscharged_rollback.h"
++#endif
+ 
+ static int sNumLingeringControllers;
+ 
+@@ -423,6 +426,15 @@ bool EmissionController::Update(float dt)
+     }
+ 
+     bool positionChanged = false;
++#if defined(MSCHARGED_TWEAKS)
++    // A rollback's replay skips the update callbacks: some draw (the electric
++    // fence) into a frame already drawn, and the next new frame places the
++    // emitters again.
++    if (mUpdateCallback && mscharged_rollback_resimulating())
++    {
++    }
++    else
++#endif
+     if (mUpdateCallback)
+     {
+         nlVector3 oldPosition = m_vPosition;
 diff --git a/src/Game/InputRouter.cpp b/src/Game/InputRouter.cpp
 index 14e2acd..5ba9b4b 100644
 --- a/src/Game/InputRouter.cpp
@@ -568,6 +602,47 @@ index a5ee729..9ff59cd 100644
 +    }
 +}
 +#endif
+diff --git a/src/NL/gl/glView.cpp b/src/NL/gl/glView.cpp
+index 6fc0a98..658569e 100644
+--- a/src/NL/gl/glView.cpp
++++ b/src/NL/gl/glView.cpp
+@@ -14,6 +14,9 @@
+ #include <new>
+ #include <stdexcept>
+ #endif
++#if defined(MSCHARGED_TWEAKS)
++#include "mscharged_rollback.h"
++#endif
+ 
+ const nlMatrix4 gGLViewIdentityMatrix = {
+     { { { 1.0f, 0.0f, 0.0f, 0.0f },
+@@ -404,6 +407,13 @@ GLView::~GLView()
+ 
+ void GLView::AttachPacket(const glModelPacket* packet, unsigned long layer)
+ {
++#if defined(MSCHARGED_TWEAKS)
++    // Drawing during a rollback's replay goes nowhere: its frame was drawn.
++    if (mscharged_rollback_resimulating())
++    {
++        return;
++    }
++#endif
+ #if defined(MSCHARGED_DIAGNOSTIC_VIEWS)
+     if (!packet || !packet->materialProgram || layer > UINT32_MAX)
+         throw std::invalid_argument("Invalid GL packet or sort layer");
+@@ -414,6 +424,12 @@ void GLView::AttachPacket(const glModelPacket* packet, unsigned long layer)
+ 
+ void GLView::AttachModel(const glModel* model, unsigned long layer)
+ {
++#if defined(MSCHARGED_TWEAKS)
++    if (mscharged_rollback_resimulating())
++    {
++        return;
++    }
++#endif
+ #if defined(MSCHARGED_DIAGNOSTIC_VIEWS)
+     if (!model || model->numPackets > 65535 || (model->numPackets && !model->packets) || layer > UINT32_MAX)
+         throw std::invalid_argument("Invalid GL model or sort layer");
 diff --git a/src/NL/glx/glxMemory.cpp b/src/NL/glx/glxMemory.cpp
 index ebf1e9a..c5ca54d 100644
 --- a/src/NL/glx/glxMemory.cpp

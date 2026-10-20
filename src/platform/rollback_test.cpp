@@ -97,7 +97,7 @@ constexpr int kMaxExcluded = 160;
 constexpr int kMaxKept = 16;             // ranges inside excluded ones that are restored after all
 constexpr int kMaxRegions = 256;
 constexpr std::uint64_t kIdleNs = 250'000'000;
-constexpr int kSummaryEvery = 600;       // steps (ten seconds)
+constexpr int kSummaryEvery = 120;       // steps (two seconds)
 constexpr int kUntrackedEvery = 600;     // steps between checks for writes behind the tracking (reads everything)
 constexpr int kListedMismatches = 20;
 
