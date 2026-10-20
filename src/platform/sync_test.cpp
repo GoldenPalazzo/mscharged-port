@@ -26,6 +26,16 @@
 // and a second rollback of another depth and a rerun again, before the same
 // comparisons.
 //
+// RECHARGED_SYNCTEST_AUDIT=1 runs no test: through a whole match the
+// incremental snapshots track the saved memory and, at the start and at the
+// end of every simulation step (CallFixedUpdateTasks), note what changed since
+// the other. <file>.summary then lists what the rest of the frame writes (the
+// network task, drawing, the front end, the next step's pads and inputs, other
+// threads): a rollback that restores it undoes work that is not simulation.
+// Each place says whether the simulation writes it too. The game plays as
+// usual, sounds and all, offline and in network matches; tracking stops when
+// no step comes for a quarter of a second (pause, end of the match).
+//
 // Matches under the test use the deterministic AI clocks of network games
 // (tweak patch 0030); offline the AI otherwise skips scripts by real time.
 //
@@ -72,6 +82,8 @@ extern "C" bool mscharged_synctest_active(void) { return false; }
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <pthread.h>
+#include <time.h>
 
 // Bounds of the simulation's globals (cmake/rollback_sections.ld); weak, so a
 // module linked without the script has none.
@@ -241,6 +253,26 @@ struct Aggregate
     std::uintptr_t offset; // allocations: first differing offset, as first seen
     int depth;             // allocations: call site of the first one seen
     void* frames[kSiteDepth];
+    int window;            // a test's differences, or an audit window (tests count steps there)
+};
+// Audit mode: a place the steps write, in a hash table (there are many: the
+// simulation writes thousands of globals), only to tell whether a place
+// written outside the steps is written inside too.
+struct InsidePlace
+{
+    int kind; // 0: empty slot (kRestoredGlobal is stored as kAggregateKinds)
+    std::uintptr_t key;
+    std::size_t size;
+    int steps;
+    int lastStep;
+};
+constexpr std::size_t kInsideSlots = std::size_t{1} << 16;
+// Audit mode: where a change was made.
+enum AuditWindow
+{
+    kTestDiffs,    // not an audit: differences of a sync test
+    kOutsideSteps, // from the end of a step to the start of the next
+    kInsideSteps,  // during a step (CallFixedUpdateTasks)
 };
 struct Match
 {
@@ -294,6 +326,19 @@ struct State
     std::uint64_t rollbackDepths[kMaxFrames + 1]; // rollbacks by steps undone
     std::uint64_t lostSnapshots; // rollbacks to a save no longer kept
     std::uint64_t trackedSteps, trackedStepNs, maxTrackedStepNs; // steps with tracking (faults included)
+    // RECHARGED_SYNCTEST_AUDIT: tracking through the match, changes noted per
+    // window (AuditWindow) into the aggregates; no test runs.
+    bool audit;
+    bool auditTracking;    // the snapshots track the match
+    bool auditStepEnded;   // a step ended and the hook between steps followed it
+    int noteWindow;        // the window Note files differences under
+    int auditSteps;        // steps audited, the "test" number of their notes
+    int auditStarts;       // times tracking started
+    std::uint64_t auditBytes[3], auditMaxBytes[3]; // per window
+    std::uint64_t auditNs, auditMaxNs;             // noting a window's changes
+    std::uint64_t auditDropped;                    // ranges beyond kMaxDiffs, not named
+    InsidePlace* inside;                           // kInsideSlots
+    std::size_t insideCount;
     struct Profile
     {
         std::uint64_t steps, stepNs, maxStepNs;
@@ -621,22 +666,56 @@ void PrintCallsite(FILE* file, void* const* frames, int depth)
     }
 }
 
+InsidePlace* InsideSlot(int kind, std::uintptr_t key, std::size_t size, bool add)
+{
+    State& s = *sState;
+    if (!s.inside) return nullptr;
+    const int stored = kind ? kind : kAggregateKinds;
+    const std::uint64_t hash = (key * 0x9E3779B97F4A7C15ull) ^ (size * 0xC2B2AE3D27D4EB4Full) ^ stored;
+    for (std::size_t i = (hash >> 48) & (kInsideSlots - 1), n = 0; n < kInsideSlots; i = (i + 1) & (kInsideSlots - 1), ++n)
+    {
+        InsidePlace& place = s.inside[i];
+        if (place.kind == stored && place.key == key && place.size == size) return &place;
+        if (place.kind) continue;
+        if (!add || s.insideCount == kInsideSlots / 2) return nullptr; // half full at most: probes stay short
+        ++s.insideCount;
+        place = {stored, key, size, 0, 0};
+        return &place;
+    }
+    return nullptr;
+}
+const InsidePlace* FindInside(int kind, std::uintptr_t key, std::size_t size)
+{
+    return InsideSlot(kind, key, size, false);
+}
+
 // Counts one difference of test `test` in the session's aggregates.
 void Note(int kind, std::uintptr_t key, std::size_t size, std::size_t bytes, std::uintptr_t offset, int test,
           const Callsite* site = nullptr)
 {
     State& s = *sState;
+    if (s.noteWindow == kInsideSteps)
+    {
+        if (InsidePlace* place = InsideSlot(kind, key, size, true); place && place->lastStep != test)
+        {
+            ++place->steps;
+            place->lastStep = test;
+        }
+        return;
+    }
     Aggregate* entry = nullptr;
     for (std::size_t i = 0; i < s.aggregateCount && !entry; ++i)
     {
         Aggregate& candidate = s.aggregates[i];
-        if (candidate.kind == kind && candidate.key == key && candidate.size == size) entry = &candidate;
+        if (candidate.kind == kind && candidate.key == key && candidate.size == size
+            && candidate.window == s.noteWindow)
+            entry = &candidate;
     }
     if (!entry)
     {
         if (s.aggregateCount == kMaxAggregates) return;
         entry = &s.aggregates[s.aggregateCount++];
-        *entry = {kind, key, size, 0, test, 0, 0, offset, 0, {}};
+        *entry = {kind, key, size, 0, test, 0, 0, offset, 0, {}, s.noteWindow};
         if (site)
         {
             entry->depth = site->depth;
@@ -724,7 +803,9 @@ void ClassifyArenaDiffs(bool print, int test)
         std::uintptr_t vtable = 0, offset = 0;
         if (owner.bytes >= sizeof(vtable))
         {
-            const std::uint8_t* before = Before(owner.base, s.after, s.ranges, s.rangeCount);
+            // An audit keeps no copy: the block as it is now.
+            const std::uint8_t* before = s.audit ? reinterpret_cast<const std::uint8_t*>(owner.base)
+                                                 : Before(owner.base, s.after, s.ranges, s.rangeCount);
             if (before) std::memcpy(&vtable, before, sizeof(vtable));
         }
         const bool named = ModuleOffset(vtable, offset);
@@ -797,12 +878,111 @@ Match* CurrentMatch(unsigned frame)
     return &match;
 }
 
+// The place an aggregate names, without a line break.
+void PrintAggregatePlace(FILE* file, const Aggregate& entry)
+{
+    const State& s = *sState;
+    switch (entry.kind)
+    {
+    case kRestoredGlobal:
+    case kModuleGlobal:
+    case kAudioTouched:
+        std::fprintf(file, "%s+0x%lx", s.moduleName, static_cast<unsigned long>(entry.key));
+        break;
+    case kAllocation:
+        if (entry.key)
+            std::fprintf(file, "%zu-byte allocation, first changed +0x%lx, first word %s+0x%lx", entry.size,
+                         static_cast<unsigned long>(entry.offset), s.moduleName, static_cast<unsigned long>(entry.key));
+        else
+            std::fprintf(file, "%zu-byte allocation, first changed +0x%lx, no vtable", entry.size,
+                         static_cast<unsigned long>(entry.offset));
+        PrintCallsite(file, entry.frames, entry.depth);
+        break;
+    default:
+        std::fprintf(file, "%s", entry.key < static_cast<std::uintptr_t>(s.rangeCount) ? s.ranges[entry.key].name : "?");
+        break;
+    }
+}
+
+// Audit mode: what each window wrote; outside the steps first, each place
+// with how often the steps write it too.
+void WriteAuditSummary(FILE* file)
+{
+    const State& s = *sState;
+    const auto& h = mscharged::platform::RollbackSnapshotStatistics();
+    std::fprintf(file, "sync test audit: what the frame writes outside the simulation steps, module %s\n",
+                 s.moduleName ? s.moduleName : "?");
+    std::fprintf(file, "%d steps audited, tracking started %d times; %zu-byte pages, %zu tracked\n", s.auditSteps,
+                 s.auditStarts, h.pageSize, h.trackedPages);
+    const char* const windows[3] = {"", "outside the steps", "inside the steps"};
+    for (int w = kOutsideSteps; w <= kInsideSteps; ++w)
+        if (s.auditSteps)
+            std::fprintf(file, "changed %s: %llu bytes avg / %llu max per step\n", windows[w],
+                         static_cast<unsigned long long>(s.auditBytes[w] / s.auditSteps),
+                         static_cast<unsigned long long>(s.auditMaxBytes[w]));
+    if (h.saves)
+        std::fprintf(file, "noting a window: %.1f us avg / %.1f us max; save %.1f us avg / %.1f us max; faults %llu\n",
+                     s.auditNs / 1e3 / std::max(1, 2 * s.auditSteps), s.auditMaxNs / 1e3, h.saveNs / 1e3 / h.saves, h.maxSaveNs / 1e3,
+                     static_cast<unsigned long long>(h.faults));
+    std::fprintf(file, "changed ranges not named (over %zu in a window): %llu\n", kMaxDiffs,
+                 static_cast<unsigned long long>(s.auditDropped));
+    std::fprintf(file, "pages written behind the tracking (missed): %llu\n",
+                 static_cast<unsigned long long>(s.untracked));
+
+    std::fprintf(file, "\n== matches\n");
+    for (int m = 0; m < s.matchCount; ++m)
+    {
+        const Match& match = s.matches[m];
+        std::fprintf(file, "match %d: %s vs %s at %s\n", m + 1, NameOf(kCaptainNames, match.teams[0]),
+                     NameOf(kCaptainNames, match.teams[1]), NameOf(kStadiumNames, match.stadium));
+    }
+
+    std::fprintf(file, "places the steps write: %zu%s\n", s.insideCount,
+                 s.insideCount == kInsideSlots / 2 ? " (table full: more not counted)" : "");
+
+    const char* const kinds[kAggregateKinds] = {"game globals (rbk sections), by 8-byte word", "",
+                                                "allocations (by first word, the vtable of a class, and size)",
+                                                "arena memory without a live allocation, and the allocator's globals",
+                                                ""};
+    for (int kind : {kRestoredGlobal, kAllocation, kUnowned})
+    {
+        std::fprintf(file, "\n== %s, written outside the steps\n", kinds[kind]);
+        const Aggregate* listed[kMaxAggregates];
+        std::size_t count = 0;
+        for (std::size_t i = 0; i < s.aggregateCount; ++i)
+            if (s.aggregates[i].kind == kind && s.aggregates[i].window == kOutsideSteps)
+                listed[count++] = &s.aggregates[i];
+        std::sort(listed, listed + count, [](const Aggregate* a, const Aggregate* b) {
+            return a->tests != b->tests ? a->tests > b->tests : a->bytes > b->bytes;
+        });
+        if (!count) std::fprintf(file, "none\n");
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            const Aggregate& entry = *listed[i];
+            std::fprintf(file, "%6d steps (%d..%d), %zu bytes", entry.tests, entry.firstTest, entry.lastTest,
+                         entry.bytes);
+            if (const InsidePlace* inside = FindInside(entry.kind, entry.key, entry.size))
+                std::fprintf(file, ", ALSO INSIDE in %d steps: ", inside->steps);
+            else
+                std::fprintf(file, ", outside only: ");
+            PrintAggregatePlace(file, entry);
+            std::fprintf(file, "\n");
+        }
+    }
+}
+
 // The session so far, rewritten after every test so that it survives a crash.
 void WriteSummary()
 {
     State& s = *sState;
     FILE* file = std::fopen(s.summaryPath, "w");
     if (!file) return;
+    if (s.audit)
+    {
+        WriteAuditSummary(file);
+        std::fclose(file);
+        return;
+    }
     std::fprintf(file, "sync test summary: every %d steps, %d steps rolled back, module %s\n", s.interval, s.frames,
                  s.moduleName ? s.moduleName : "?");
     std::fprintf(file, "%d tests, %d with differences, %d with different checksums, %d with frees not undone, "
@@ -924,7 +1104,7 @@ void WriteSummary()
         const Aggregate* listed[kMaxAggregates];
         std::size_t count = 0;
         for (std::size_t i = 0; i < s.aggregateCount; ++i)
-            if (s.aggregates[i].kind == kind) listed[count++] = &s.aggregates[i];
+            if (s.aggregates[i].kind == kind && s.aggregates[i].window == kTestDiffs) listed[count++] = &s.aggregates[i];
         std::sort(listed, listed + count, [](const Aggregate* a, const Aggregate* b) {
             return a->tests != b->tests ? a->tests > b->tests : a->bytes > b->bytes;
         });
@@ -1098,9 +1278,9 @@ Phases CurrentPhases()
     return phases;
 }
 
-// History mode: the saved ranges without the preserved ones are the snapshot
-// regions; depth and room for every step of a test.
-bool ConfigureSnapshots()
+// History and audit modes: the saved ranges without the preserved ones are
+// the snapshot regions, with depth saves kept and historyPages pages of undo.
+bool ConfigureSnapshots(int depth, std::size_t historyPages)
 {
     State& s = *sState;
     mscharged::platform::RollbackRegion regions[kMaxRanges + kMaxPreserved];
@@ -1129,8 +1309,7 @@ bool ConfigureSnapshots()
             start = resume;
         }
     }
-    return mscharged::platform::ConfigureRollbackSnapshots(regions, count, s.frames,
-                                                           static_cast<std::size_t>(s.frames) * 512 + 2048);
+    return mscharged::platform::ConfigureRollbackSnapshots(regions, count, depth, historyPages);
 }
 
 void RunTest(int (*step)(void), unsigned (*checksum)(void), void* task, unsigned long taskBytes)
@@ -1142,7 +1321,8 @@ void RunTest(int (*step)(void), unsigned (*checksum)(void), void* task, unsigned
         s.out = nullptr;
         return;
     }
-    if (s.history && !ConfigureSnapshots())
+    // Depth and room for every step of a test.
+    if (s.history && !ConfigureSnapshots(s.frames, static_cast<std::size_t>(s.frames) * 512 + 2048))
     {
         std::fprintf(s.out, "sync test: incremental snapshots unavailable; full copies instead\n");
         s.history = false;
@@ -1354,6 +1534,114 @@ void RunTest(int (*step)(void), unsigned (*checksum)(void), void* task, unsigned
     WriteSummary();
 }
 
+// Audit mode. The hooks run on the main thread, the watchdog on its own; both
+// hold sAuditMutex.
+std::mutex sAuditMutex;
+std::uint64_t sAuditLastHookNs;
+constexpr std::uint64_t kAuditIdleNs = 250'000'000; // no step for this long stops the tracking
+constexpr int kAuditSummaryEvery = 600;             // steps (ten seconds)
+constexpr int kAuditUntrackedEvery = 60;            // steps between checks for untracked writes (reads everything)
+
+const char* RegionOf(std::uintptr_t address)
+{
+    const State& s = *sState;
+    for (int i = 0; i < s.rangeCount; ++i)
+    {
+        const auto base = reinterpret_cast<std::uintptr_t>(s.ranges[i].base);
+        if (address >= base && address - base < s.ranges[i].bytes) return s.ranges[i].name;
+    }
+    return "?";
+}
+
+// A run of changed bytes, into the differences (merged with the last one when close).
+void NoteChange(std::uintptr_t address, std::size_t bytes, void*)
+{
+    State& s = *sState;
+    s.diffTotal += bytes;
+    const char* region = RegionOf(address);
+    if (s.diffCount)
+    {
+        Diff& last = s.diffs[s.diffCount - 1];
+        if (last.region == region && address >= last.start && address <= last.start + last.bytes + kMergeGap)
+        {
+            last.bytes = std::max(last.bytes, address + bytes - last.start);
+            return;
+        }
+    }
+    if (s.diffCount < kMaxDiffs)
+        s.diffs[s.diffCount++] = {address, bytes, region};
+    else
+        ++s.auditDropped;
+}
+
+// What changed since the last save, noted under window; then a save.
+void AuditWindow(int window)
+{
+    State& s = *sState;
+    const std::uint64_t start = NowNs();
+    std::uintptr_t first = 0;
+    if (window == kOutsideSteps && s.auditSteps % kAuditUntrackedEvery == 0)
+        if (const std::size_t untracked = mscharged::platform::FindUntrackedRollbackWrites(&first))
+        {
+            if (!s.untracked) s.untrackedAt = first;
+            s.untracked += untracked;
+        }
+    s.diffCount = s.diffTotal = 0;
+    mscharged::platform::VisitRollbackChanges(NoteChange, nullptr);
+    s.noteWindow = window;
+    ClassifyArenaDiffs(false, s.auditSteps);
+    s.noteWindow = kTestDiffs;
+    s.auditBytes[window] += s.diffTotal;
+    s.auditMaxBytes[window] = std::max<std::uint64_t>(s.auditMaxBytes[window], s.diffTotal);
+    mscharged::platform::SaveRollbackSnapshot();
+    const std::uint64_t ns = NowNs() - start;
+    s.auditNs += ns;
+    s.auditMaxNs = std::max(s.auditMaxNs, ns);
+}
+
+void AuditStart(void* task, unsigned long taskBytes)
+{
+    State& s = *sState;
+    if (!Prepare(task, taskBytes) || !ConfigureSnapshots(1, 4096))
+    {
+        std::fprintf(s.out, "sync test audit: cannot track the match; stopped\n");
+        std::fclose(s.out);
+        s.out = nullptr;
+        return;
+    }
+    const unsigned frame = static_cast<unsigned>(static_cast<FixedUpdateTask*>(task)->GetFrame());
+    CurrentMatch(frame);
+    mscharged::platform::BeginRollbackSnapshots();
+    s.auditTracking = true;
+    ++s.auditStarts;
+    std::fprintf(s.out, "audit: tracking from frame %u (step %d)\n", frame, s.auditSteps + 1);
+    std::fflush(s.out);
+}
+
+void AuditStop(const char* why)
+{
+    State& s = *sState;
+    mscharged::platform::EndRollbackSnapshots();
+    s.auditTracking = false;
+    std::fprintf(s.out, "audit: tracking stopped after step %d: %s\n", s.auditSteps, why);
+    std::fflush(s.out);
+    WriteSummary();
+}
+
+// Stops the tracking when the steps stop (a pause, the end of a match), so
+// menus and loading never run with the match's memory protected.
+void* AuditWatchdog(void*)
+{
+    for (;;)
+    {
+        timespec pause{0, 50'000'000};
+        nanosleep(&pause, nullptr);
+        std::lock_guard lock(sAuditMutex);
+        if (!sState->out) return nullptr;
+        if (sState->auditTracking && NowNs() - sAuditLastHookNs > kAuditIdleNs) AuditStop("no step for 250 ms");
+    }
+}
+
 struct Install
 {
     Install()
@@ -1383,10 +1671,21 @@ struct Install
         state->details = EnvInt("RECHARGED_SYNCTEST_DETAILS", 3, 0, 1 << 20);
         state->profile = EnvInt("RECHARGED_SYNCTEST_PROFILE", 0, 0, 1) != 0;
         state->history = EnvInt("RECHARGED_SYNCTEST_HISTORY", 0, 0, 1) != 0;
-        std::fprintf(state->out, "sync test: every %d steps, %d steps rolled back, %d failing tests in full; summary "
-                     "in %s\n", state->interval, state->frames, state->details, state->summaryPath);
+        state->audit = EnvInt("RECHARGED_SYNCTEST_AUDIT", 0, 0, 1) != 0;
+        if (state->audit)
+        {
+            state->inside = static_cast<InsidePlace*>(std::calloc(kInsideSlots, sizeof(InsidePlace)));
+            std::fprintf(state->out, "sync test audit: no tests, what the frame writes outside the steps; summary in "
+                         "%s\n", state->summaryPath);
+        }
+        else
+            std::fprintf(state->out, "sync test: every %d steps, %d steps rolled back, %d failing tests in full; "
+                         "summary in %s\n", state->interval, state->frames, state->details, state->summaryPath);
         std::fflush(state->out);
         sState = state;
+        pthread_t watchdog;
+        if (state->audit && pthread_create(&watchdog, nullptr, AuditWatchdog, nullptr) == 0)
+            pthread_detach(watchdog); // a pthread: std::thread would allocate its state with nlMalloc
         // Call sites of large allocations from now on, the game's boot included.
         sCallsites = static_cast<Callsite*>(std::calloc(kSiteSlots, sizeof(Callsite)));
         if (sCallsites)
@@ -1398,7 +1697,10 @@ struct Install
     }
     ~Install()
     {
-        if (!sState || !sState->out) return;
+        if (!sState) return;
+        std::lock_guard lock(sAuditMutex);
+        if (!sState->out) return;
+        if (sState->auditTracking) AuditStop("exit");
         std::fprintf(sState->out, "sync test: %d tests, %d failed, %d not rolled back for disc reads, %d steps waited for "
                      "reads in flight\n", sState->tests, sState->failures, sState->skipped, sState->postponed);
         WriteSummary();
@@ -1412,6 +1714,14 @@ extern "C" void mscharged_synctest_between_steps(int (*step)(void), unsigned (*c
                                                  unsigned long taskBytes)
 {
     if (!sState || !sState->out) return;
+    if (sState->audit)
+    {
+        std::lock_guard lock(sAuditMutex);
+        sAuditLastHookNs = NowNs();
+        if (!sState->auditTracking) AuditStart(task, taskBytes);
+        sState->auditStepEnded = true;
+        return;
+    }
     if (++sState->steps < sState->interval) return;
     sState->steps = 0;
     // Interrupts stay off for the whole test: no SDK callback (audio frames,
@@ -1426,11 +1736,32 @@ extern "C" void mscharged_synctest_between_steps(int (*step)(void), unsigned (*c
 extern "C" void mscharged_synctest_fixed_step(int running)
 {
     sInFixedStep = running != 0;
+    if (!sState || !sState->audit) return;
+    std::lock_guard lock(sAuditMutex);
+    State& s = *sState;
+    if (!s.out || !s.auditTracking) return;
+    sAuditLastHookNs = NowNs();
+    if (!running)
+    {
+        AuditWindow(kInsideSteps);
+        if (s.auditSteps % kAuditSummaryEvery == 0) WriteSummary();
+        return;
+    }
+    // A step whose predecessor ended without the hook between steps (a NIS,
+    // a pause): the frames between them are no match frames.
+    if (!s.auditStepEnded)
+    {
+        AuditStop("a step not following the hook between steps");
+        return;
+    }
+    s.auditStepEnded = false;
+    ++s.auditSteps;
+    AuditWindow(kOutsideSteps);
 }
 
 extern "C" bool mscharged_synctest_silences_sounds(void)
 {
-    return sState && sState->out && sInFixedStep;
+    return sState && sState->out && !sState->audit && sInFixedStep;
 }
 
 extern "C" bool mscharged_synctest_active(void)
