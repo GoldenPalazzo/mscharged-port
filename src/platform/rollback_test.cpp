@@ -20,8 +20,10 @@
 // Everything else, the drawing's objects included, goes back with the match. A replayed step reads no pads, captures and sends
 // nothing, and queues no deterministic data (it went out the first time).
 //
-// The simulation makes no sounds while the test runs, as under the sync test:
-// audio is not part of the rollback yet. A rollback is skipped when a disc read
+// The game makes no sounds at all while the test runs, menus included: audio
+// is not part of the rollback yet, and the audio code's slot pools keep their
+// free lists in globals the rollback leaves alone but their blocks in the
+// arenas it restores. A rollback is skipped when a disc read
 // was in flight or the game or task state changed in the steps it would undo
 // (their presentation and loading started outside the simulation). Tracking
 // stops when no step comes for a quarter of a second (pause, end of match).
