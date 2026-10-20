@@ -2203,6 +2203,9 @@ extern "C" int mscharged_rollback_network_reset(void)
     s.waitThrough = s.undoFrom = 0;
     s.captured = s.haveConfirmed = false;
     s.remoteCount = 0;
+    // No step's checksum yet: an empty slot must not pass for step 0's (or for
+    // the last match's steps) when another machine's arrives.
+    for (SyncPoint& point : s.history) point.frame = ~0u;
     std::fill(std::begin(s.queuedAhead), std::end(s.queuedAhead), 0.0f);
     std::fill(std::begin(s.haveReported), std::end(s.haveReported), false);
     s.delay = s.inputDelay;
