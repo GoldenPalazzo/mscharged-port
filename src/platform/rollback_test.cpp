@@ -3,7 +3,9 @@
 // anything: after every fixed step it saves the match (platform/rollback_snapshot.h),
 // and every RECHARGED_ROLLBACK_TEST_INTERVAL steps (default 1) it goes back 1
 // to RECHARGED_ROLLBACK_TEST_FRAMES steps (default 8, in turn) and runs them
-// again with the inputs they first had (tweak patch 0032). The game's checksum
+// again with the inputs they first had (tweak patch 0032). It goes back at
+// the start of the next frame, before any task sets up its cameras and views,
+// and replays through the end of the last step's frame. The game's checksum
 // after each replayed step must be the one the step first gave; in a network
 // match the machines also compare their checksums as the original game does.
 // <file> logs the session; <file>.summary, rewritten every ten seconds, holds
@@ -47,6 +49,7 @@ extern "C" void mscharged_rollback_between_steps(int (*)(const MschargedRollback
                                                  unsigned long)
 {
 }
+extern "C" void mscharged_rollback_frame_start(void) {}
 #else
 #include "Game/Audio/AudioBackend.h"
 #include "Game/Game.h"
@@ -54,6 +57,7 @@ extern "C" void mscharged_rollback_between_steps(int (*)(const MschargedRollback
 #include "Game/InputRouter.h"
 #include "Game/NetworkSession.h"
 #include "Game/NetworkSync.h"
+#include "Game/Task/DispatchEventsTask.h"
 #include "Game/Task/FixedUpdateTask.h"
 #include "NL/MemAlloc.h"
 #include "NL/globalpad.h"
@@ -150,6 +154,9 @@ struct State
     unsigned latest;  // frame of the last step saved
     int stored;       // consecutive steps saved since tracking started
     int nextDepth;
+    int pendingDepth;            // steps the next frame start goes back, 0: none
+    int (*replay)(const MschargedRollbackInputs*);
+    unsigned (*checksum)(void);
     std::uint64_t lastHookNs;
 
     // Counts and costs.
@@ -472,16 +479,36 @@ void Stop(const char* why)
     mscharged::platform::EndRollbackSnapshots();
     mscharged::platform::EndGameAllocationCheckpoint();
     s.active = false;
+    s.pendingDepth = 0;
     std::fprintf(s.out, "tracking stopped after frame %u: %s\n", s.latest, why);
     std::fflush(s.out);
     WriteSummary();
 }
 
 // Back `depth` steps and forward again with the same inputs.
+// At the start of a frame: back `depth` steps from the last one, then forward
+// again with the same inputs, through the end of the last step's frame.
 void RollBack(int depth, int (*replay)(const MschargedRollbackInputs*), unsigned (*checksum)(void))
 {
     State& s = *sState;
     const unsigned target = s.latest - depth;
+    // The end of the last step's frame counts as well.
+    const auto producers = mscharged::platform::CurrentGameByteProducers();
+    if (producers.pending)
+    {
+        ++s.skippedReads;
+        return;
+    }
+    if (producers.started != s.steps[target % kRing].readsStarted)
+    {
+        ++s.skippedStarts;
+        return;
+    }
+    if (!(CurrentPhases() == s.steps[s.latest % kRing].phases))
+    {
+        ++s.skippedPhases;
+        return;
+    }
     for (unsigned f = target; f <= s.latest; ++f)
     {
         const Step& step = s.steps[f % kRing];
@@ -538,6 +565,11 @@ void RollBack(int depth, int (*replay)(const MschargedRollbackInputs*), unsigned
         step.mark = mscharged::platform::MarkGameAllocationCheckpoint();
         ++s.replayed;
     }
+    // What the last step's frame did after it (particles, front end, events).
+    const float lastFrame = s.steps[s.latest % kRing].frameTime;
+    RollbackReplayParticles(lastFrame);
+    RollbackReplayFrontEnd(lastFrame);
+    gDispatchEventsTask->Run(lastFrame);
     s.resimulating = false;
     ++s.rollbacks;
     ++s.byDepth[depth];
@@ -686,18 +718,34 @@ extern "C" void mscharged_rollback_between_steps(int (*replay)(const MschargedRo
     const unsigned oldest = frame - static_cast<unsigned>(std::min(s.stored, kRing) - 1);
     mscharged::platform::TrimGameAllocationCheckpoint(s.steps[oldest % kRing].mark);
 
+    // The rollback waits for the start of the next frame: here the frame has
+    // set up its cameras and views already, which a restore would take back.
+    s.replay = replay;
+    s.checksum = checksum;
+    s.pendingDepth = 0;
     if (s.stepCount % s.interval == 0)
     {
         const int depth = s.nextDepth % s.maxDepth + 1;
         if (depth < s.stored)
         {
             ++s.nextDepth;
-            RollBack(depth, replay, checksum);
+            s.pendingDepth = depth;
         }
         else
             ++s.skippedShort;
     }
     if (s.stepCount % kSummaryEvery == 0) WriteSummary();
+}
+
+extern "C" void mscharged_rollback_frame_start(void)
+{
+    if (!sState || !sState->out) return;
+    std::lock_guard lock(sMutex);
+    State& s = *sState;
+    if (!s.active || !s.pendingDepth) return;
+    const int depth = s.pendingDepth;
+    s.pendingDepth = 0;
+    RollBack(depth, s.replay, s.checksum);
 }
 // Calls to __cxa_throw from the game module bind to this one (hidden), which
 // logs the throw and goes on to the C++ runtime's.
