@@ -63,6 +63,7 @@ extern "C" void mscharged_rollback_frame_start(void) {}
 #include "NL/gl/glView.h"
 #include "NL/globalpad.h"
 #include "NL/nlMemory.h"
+#include "NL/nlSlotPool.h"
 #include "NL/nlTask.h"
 #include "NL/platpad.h"
 #include "platform/game_allocation_ownership.h"
@@ -90,6 +91,12 @@ extern "C" char __rbk_bss_end[] __attribute__((weak, visibility("hidden")));
 // The routers (InputRouter.cpp).
 extern InputRouter* gSimpleInputRouter;
 extern NetworkInputRouter* gNetworkInputRouter;
+// The network transport's slot pools (NL/plat/Transport*.cpp), by their common
+// base: a variable's symbol is its name, and SlotPool<NetworkMessageStorage>
+// has no header.
+extern SlotPoolBase gTransportPacketPool;
+extern SlotPoolBase gNetworkMessagePool;
+extern SlotPoolBase gTransportConnectionPool;
 
 // No std containers: in the game module the global operator new is the
 // original nlMalloc, and the test must not allocate in the arenas it restores.
@@ -285,6 +292,11 @@ void FindRanges(FixedUpdateTask* task, unsigned long taskBytes)
         ExcludeAllocation(session->mStatsReporter, 0, "NetworkStatsReporter");
         ExcludeAllocation(session->mRankingReporter, 0, "NetworkRanking");
     }
+    // The transport's slot pools keep their free lists in its globals, left out
+    // with the network, and their slots in blocks of the arenas: the blocks go too.
+    for (SlotPoolBase* pool : {&gTransportPacketPool, &gNetworkMessagePool, &gTransportConnectionPool})
+        for (SlotPoolBlock* block = pool->m_BlockList; block; block = block->next)
+            ExcludeAllocation(block, 0, "network transport pool");
     ExcludeAllocation(gSimpleInputRouter, 0, "SimpleInputRouter");
     ExcludeAllocation(gNetworkInputRouter, 0, "NetworkInputRouter");
     ExcludeAllocation(gInputManager, 0, "NetworkInputManager");
