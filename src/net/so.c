@@ -7,7 +7,10 @@
 #include <netinet/in.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "so_host.h"
 
@@ -108,6 +111,130 @@ static int trsock_drop_fd(int trsock)
     if (fd >= 0)
         sockets.occupied[trsock] = false;
     return fd;
+}
+
+// Test aids for network matches on one computer; unset, nothing changes.
+// RECHARGED_NET_PAIR=0 or 1: one of two instances on this computer. The
+// second binds the game's ports (6767 direct, 6768 broadcast) 100 higher, and
+// each sends what goes to those ports to the other's, broadcasts through the
+// loopback interface (a firewall may drop those the network interface loops back).
+// RECHARGED_NET_DELAY_MS=<ms>: datagrams leave that much later, give or take
+// RECHARGED_NET_JITTER_MS, to play as from far away. They leave when the game
+// next sends, receives or polls, every frame in a match.
+// RECHARGED_NET_TRACE=1: every datagram sent and received, on stderr.
+enum { NET_DIRECT_PORT = 6767, NET_BROADCAST_PORT = 6768, NET_PAIR_SHIFT = 100 };
+enum { NET_DELAYED_MAX = 512, NET_DELAYED_BYTES = 1536 };
+
+struct delayed_datagram {
+    int fd;
+    struct sockaddr_in to;
+    long long due_ns;
+    int len;
+    unsigned char data[NET_DELAYED_BYTES];
+};
+static struct {
+    bool read;
+    bool trace;
+    int pair; // -1: alone
+    int delay_ms, jitter_ms;
+    struct delayed_datagram queue[NET_DELAYED_MAX];
+    int count;
+} net_test = { .pair = -1 };
+
+static int net_test_env(const char* name, int fallback)
+{
+    const char* text = getenv(name);
+    return text && *text ? atoi(text) : fallback;
+}
+
+static void net_test_read(void)
+{
+    if (net_test.read)
+        return;
+    net_test.read = true;
+    net_test.pair = net_test_env("RECHARGED_NET_PAIR", -1);
+    if (net_test.pair != 0 && net_test.pair != 1)
+        net_test.pair = -1;
+    net_test.delay_ms = net_test_env("RECHARGED_NET_DELAY_MS", 0);
+    net_test.jitter_ms = net_test_env("RECHARGED_NET_JITTER_MS", 0);
+    net_test.trace = net_test_env("RECHARGED_NET_TRACE", 0) != 0;
+    if (net_test.delay_ms < 0)
+        net_test.delay_ms = 0;
+    if (net_test.jitter_ms < 0 || net_test.jitter_ms > net_test.delay_ms)
+        net_test.jitter_ms = net_test.delay_ms;
+}
+
+static bool net_test_game_port(u16 port)
+{
+    return port == NET_DIRECT_PORT || port == NET_BROADCAST_PORT;
+}
+
+// A port this instance binds (network byte order).
+static u16 net_test_bound_port(u16 port)
+{
+    net_test_read();
+    if (net_test.pair < 0 || !net_test_game_port(ntohs(port)))
+        return port;
+    return htons((u16)(ntohs(port) + NET_PAIR_SHIFT * net_test.pair));
+}
+
+// A port this instance sends to (network byte order): the other's.
+static u16 net_test_destination_port(u16 port)
+{
+    net_test_read();
+    if (net_test.pair < 0 || !net_test_game_port(ntohs(port)))
+        return port;
+    return htons((u16)(ntohs(port) + NET_PAIR_SHIFT * (1 - net_test.pair)));
+}
+
+static long long net_test_now_ns(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (long long)now.tv_sec * 1000000000LL + now.tv_nsec;
+}
+
+// Sends the delayed datagrams that are due, in the order they fall due.
+static void net_test_flush(void)
+{
+    if (net_test.count == 0)
+        return;
+    const long long now = net_test_now_ns();
+    for (;;)
+    {
+        int next = -1;
+        for (int i = 0; i < net_test.count; i++)
+            if (net_test.queue[i].due_ns <= now && (next < 0 || net_test.queue[i].due_ns < net_test.queue[next].due_ns))
+                next = i;
+        if (next < 0)
+            return;
+        struct delayed_datagram* datagram = &net_test.queue[next];
+        int flags = 0;
+#ifdef MSG_NOSIGNAL
+        flags |= MSG_NOSIGNAL;
+#endif
+        sendto(datagram->fd, datagram->data, (size_t)datagram->len, flags, (struct sockaddr*)&datagram->to,
+               sizeof(datagram->to));
+        net_test.queue[next] = net_test.queue[--net_test.count];
+    }
+}
+
+// Holds a datagram back when a delay is set: true when it did.
+static bool net_test_hold(int fd, const void* buf, int len, const struct sockaddr_in* to)
+{
+    net_test_read();
+    if (net_test.delay_ms == 0 || to == NULL || len > NET_DELAYED_BYTES || net_test.count == NET_DELAYED_MAX)
+        return false;
+    struct delayed_datagram* datagram = &net_test.queue[net_test.count++];
+    int delay = net_test.delay_ms;
+    if (net_test.jitter_ms > 0)
+        delay += rand() % (2 * net_test.jitter_ms + 1) - net_test.jitter_ms;
+    datagram->fd = fd;
+    datagram->to = *to;
+    datagram->due_ns = net_test_now_ns() + (long long)delay * 1000000LL;
+    datagram->len = len;
+    memcpy(datagram->data, buf, (size_t)len);
+    return true;
 }
 
 static short so_pollevent_to_native(int event)
@@ -375,6 +502,7 @@ int SOBind(int s, const void *sockAddr)
         return SO_EBADF;
 
     struct sockaddr_in unixsock = to_native_sockaddr((const SOSockAddrIn*)nlAddr);
+    unixsock.sin_port = net_test_bound_port(unixsock.sin_port);
     if (bind(real_fd, (struct sockaddr *)&unixsock, sizeof(unixsock)) == -1)
         return so_error_from_errno(errno);
     return SO_SUCCESS;
@@ -466,10 +594,18 @@ static int so_send_to(int s, const void* buf, int len, int flags, const void* so
     int real_fd = trsock_get_fd(s);
     if (real_fd == -1)
         return SO_EBADF;
+    net_test_flush();
     ssize_t sent;
     if (sockTo != NULL)
     {
         struct sockaddr_in addrnative = to_native_sockaddr((const SOSockAddrIn*)to);
+        addrnative.sin_port = net_test_destination_port(addrnative.sin_port);
+        if (net_test.pair >= 0 && addrnative.sin_addr.s_addr == htonl(INADDR_BROADCAST))
+            addrnative.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (net_test.trace)
+            fprintf(stderr, "net: send %d bytes to %08x:%d\n", len, ntohl(addrnative.sin_addr.s_addr), ntohs(addrnative.sin_port));
+        if (net_test_hold(real_fd, buf, len, &addrnative))
+            return len;
         sent = sendto(real_fd, buf, (size_t)len, flags, (struct sockaddr *)&addrnative, sizeof(struct sockaddr_in));
     }
     else
@@ -513,6 +649,7 @@ int SORecvFrom(int s, void* buf, int len, int flags, void* sockFrom)
     int real_fd = trsock_get_fd(s);
     if (real_fd == -1)
         return SO_EBADF;
+    net_test_flush();
     struct sockaddr_in addr;
     socklen_t addrlen = sizeof(addr);
     size_t capacity = (size_t)len < sizeof(so_receive_bounce) ? (size_t)len : sizeof(so_receive_bounce);
@@ -521,6 +658,8 @@ int SORecvFrom(int s, void* buf, int len, int flags, void* sockFrom)
         return so_error_from_errno(errno);
     if (received > 0)
         memcpy(buf, so_receive_bounce, (size_t)received);
+    if (received > 0 && net_test.trace)
+        fprintf(stderr, "net: received %d bytes from %08x:%d\n", (int)received, ntohl(addr.sin_addr.s_addr), ntohs(addr.sin_port));
     if (sockFrom != NULL)
         from_native_sockaddr(sockFrom, &addr);
     return (int)received;
@@ -559,6 +698,7 @@ int SOPoll(SOPollFD fds[], unsigned nfds, OSTime timeout)
         return SO_EINVAL; // crash loudly because it should never happen
     if (nfds == 0) // prevent undefined behaviour
         return 0;
+    net_test_flush();
     struct pollfd fdsnative[nfds];
     to_native_pollfds(fdsnative, fds, nfds);
     int time = timeout < -1 ? -1 : (int)timeout;
@@ -599,6 +739,7 @@ int SOConnect(int s, const void* sockAddr)
     if (real_fd == -1)
         return SO_EBADF;
     struct sockaddr_in addrnative = to_native_sockaddr((const SOSockAddrIn*)addr);
+    addrnative.sin_port = net_test_destination_port(addrnative.sin_port);
     int ret = connect(real_fd, (struct sockaddr*)&addrnative, sizeof(addrnative));
     if (ret == -1)
         return so_error_from_errno(errno);
