@@ -20,6 +20,12 @@
 // regions: the host is still playing what they describe. The rest of the
 // module's globals is compared, never restored.
 //
+// RECHARGED_SYNCTEST_HISTORY=1 saves and restores through the incremental
+// snapshots (platform/rollback_snapshot.h) instead of full copies: a save after
+// every step of the first run, then a rollback to one of those saves, a rerun,
+// and a second rollback of another depth and a rerun again, before the same
+// comparisons.
+//
 // Matches under the test use the deterministic AI clocks of network games
 // (tweak patch 0030); offline the AI otherwise skips scripts by real time.
 //
@@ -50,6 +56,7 @@ extern "C" bool mscharged_synctest_active(void) { return false; }
 #include "NL/nlMemory.h"
 #include "NL/nlTask.h"
 #include "platform/game_allocation_ownership.h"
+#include "platform/rollback_snapshot.h"
 #include <dolphin/os.h>
 
 #include <dlfcn.h>
@@ -276,6 +283,17 @@ struct State
     // writes, measured during first runs (what an incremental save would copy).
     bool profile;
     std::uint8_t* profileCopy; // the saved memory as of the previous step
+    // RECHARGED_SYNCTEST_HISTORY: the saves and restores go through the
+    // incremental snapshots (platform/rollback_snapshot), one save after every
+    // step of the first run, and each test rolls back twice to different saves.
+    bool history;
+    std::uint64_t snapshotIds[kMaxFrames + 1]; // the save before step i
+    mscharged::platform::GameAllocationMark marks[kMaxFrames + 1];
+    std::uint64_t untracked; // pages written behind the tracking's back
+    std::uintptr_t untrackedAt;
+    std::uint64_t rollbackDepths[kMaxFrames + 1]; // rollbacks by steps undone
+    std::uint64_t lostSnapshots; // rollbacks to a save no longer kept
+    std::uint64_t trackedSteps, trackedStepNs, maxTrackedStepNs; // steps with tracking (faults included)
     struct Profile
     {
         std::uint64_t steps, stepNs, maxStepNs;
@@ -810,6 +828,44 @@ void WriteSummary()
         std::fprintf(file, "full restore: %.2f ms avg / %.2f ms max over %llu restores\n",
                      p.restoreNs / 1e6 / p.restores, p.maxRestoreNs / 1e6,
                      static_cast<unsigned long long>(p.restores));
+    if (s.history)
+    {
+        const auto& h = mscharged::platform::RollbackSnapshotStatistics();
+        std::fprintf(file, "\n== incremental snapshots (%zu-byte pages)\n", h.pageSize);
+        std::fprintf(file, "tracked: %zu pages, %zu hot after the last save\n", h.trackedPages, h.hotPages);
+        if (s.trackedSteps)
+            std::fprintf(file, "step with tracking (faults included): %.2f ms avg / %.2f ms max over %llu steps\n",
+                         s.trackedStepNs / 1e6 / s.trackedSteps, s.maxTrackedStepNs / 1e6,
+                         static_cast<unsigned long long>(s.trackedSteps));
+        if (h.saves)
+            std::fprintf(file, "save: %.1f us avg / %.1f us max over %llu saves; %llu pages avg / %llu max\n",
+                         h.saveNs / 1e3 / h.saves, h.maxSaveNs / 1e3, static_cast<unsigned long long>(h.saves),
+                         static_cast<unsigned long long>(h.savedPages / h.saves),
+                         static_cast<unsigned long long>(h.maxSavedPages));
+        if (h.restores)
+            std::fprintf(file, "restore: %.1f us avg / %.1f us max over %llu restores; %llu pages avg / %llu max\n",
+                         h.restoreNs / 1e3 / h.restores, h.maxRestoreNs / 1e3,
+                         static_cast<unsigned long long>(h.restores),
+                         static_cast<unsigned long long>(h.restoredPages / h.restores),
+                         static_cast<unsigned long long>(h.maxRestoredPages));
+        std::fprintf(file, "faults %llu; cold pages turned hot %llu, hot turned cold %llu; saves dropped early %llu\n",
+                     static_cast<unsigned long long>(h.faults), static_cast<unsigned long long>(h.promoted),
+                     static_cast<unsigned long long>(h.demoted), static_cast<unsigned long long>(h.evicted));
+        std::fprintf(file, "rollbacks by steps undone:");
+        for (int d = 1; d <= kMaxFrames; ++d)
+            if (s.rollbackDepths[d])
+                std::fprintf(file, " %d: %llu", d, static_cast<unsigned long long>(s.rollbackDepths[d]));
+        std::fprintf(file, "\nrollbacks to a save no longer kept: %llu\n",
+                     static_cast<unsigned long long>(s.lostSnapshots));
+        std::fprintf(file, "pages written behind the tracking (missed): %llu",
+                     static_cast<unsigned long long>(s.untracked));
+        std::uintptr_t offset = 0;
+        if (s.untracked && ModuleOffset(s.untrackedAt, offset))
+            std::fprintf(file, ", first at %s+0x%lx", s.moduleName, static_cast<unsigned long>(offset));
+        else if (s.untracked)
+            std::fprintf(file, ", first at 0x%lx", static_cast<unsigned long>(s.untrackedAt));
+        std::fprintf(file, "\n");
+    }
     if (p.steps)
     {
         std::fprintf(file, "step (one fixed tick, what a resimulation repeats): %.2f ms avg / %.2f ms max over %llu "
@@ -943,9 +999,28 @@ std::uint64_t CopyDirtyChunks(std::uint64_t& copyNs)
     return dirty;
 }
 
-int RunSteps(int (*step)(void), unsigned (*checksum)(void), int count, unsigned* checksums, int* results,
-             bool profile = false)
+// History mode: the incremental save after step `index` (snapshot index + 1),
+// checked first for pages written behind the tracking's back.
+void SaveSnapshot(int index)
 {
+    State& s = *sState;
+    std::uintptr_t first = 0;
+    if (const std::size_t untracked = mscharged::platform::FindUntrackedRollbackWrites(&first))
+    {
+        if (!s.untracked) s.untrackedAt = first;
+        s.untracked += untracked;
+    }
+    s.snapshotIds[index + 1] = mscharged::platform::SaveRollbackSnapshot();
+    s.marks[index + 1] = mscharged::platform::MarkGameAllocationCheckpoint();
+}
+
+// Steps from index `from` of the run (checksums and results there too); with
+// save, a snapshot after each.
+int RunSteps(int (*step)(void), unsigned (*checksum)(void), int from, int count, unsigned* checksums, int* results,
+             bool profile = false, bool save = false)
+{
+    checksums += from;
+    results += from;
     State& s = *sState;
     if (profile) std::memcpy(s.profileCopy, s.saved, s.total); // the live memory, just saved
     std::uint64_t testSteps = 0, testStepNs = 0, testMaxStepNs = 0, testChunks = 0, testMaxChunks = 0,
@@ -953,12 +1028,19 @@ int RunSteps(int (*step)(void), unsigned (*checksum)(void), int count, unsigned*
     int ran = 0;
     while (ran < count)
     {
-        std::fprintf(s.out, "    step %d\n", ran + 1);
+        std::fprintf(s.out, "    step %d\n", from + ran + 1);
         std::fflush(s.out);
         const std::uint64_t start = NowNs();
         results[ran] = step();
         const std::uint64_t stepNs = NowNs() - start;
         checksums[ran] = checksum();
+        if (save)
+        {
+            ++s.trackedSteps;
+            s.trackedStepNs += stepNs;
+            s.maxTrackedStepNs = std::max(s.maxTrackedStepNs, stepNs);
+            SaveSnapshot(from + ran);
+        }
         if (profile)
         {
             std::uint64_t copyNs = 0;
@@ -1016,6 +1098,41 @@ Phases CurrentPhases()
     return phases;
 }
 
+// History mode: the saved ranges without the preserved ones are the snapshot
+// regions; depth and room for every step of a test.
+bool ConfigureSnapshots()
+{
+    State& s = *sState;
+    mscharged::platform::RollbackRegion regions[kMaxRanges + kMaxPreserved];
+    int count = 0;
+    for (int r = 0; r < s.rangeCount; ++r)
+    {
+        auto start = reinterpret_cast<std::uintptr_t>(s.ranges[r].base);
+        const std::uintptr_t end = start + s.ranges[r].bytes;
+        while (start < end)
+        {
+            // Up to the first preserved range in [start, end), then past it.
+            std::uintptr_t cut = end, resume = end;
+            for (int p = 0; p < s.preservedCount; ++p)
+            {
+                const auto base = reinterpret_cast<std::uintptr_t>(s.preserved[p].base);
+                const std::uintptr_t top = base + s.preserved[p].bytes;
+                if (top <= start || base >= end || std::max(base, start) >= cut) continue;
+                cut = std::max(base, start);
+                resume = std::min(top, end);
+            }
+            if (cut > start)
+            {
+                if (count == static_cast<int>(std::size(regions))) return false;
+                regions[count++] = {reinterpret_cast<void*>(start), cut - start};
+            }
+            start = resume;
+        }
+    }
+    return mscharged::platform::ConfigureRollbackSnapshots(regions, count, s.frames,
+                                                           static_cast<std::size_t>(s.frames) * 512 + 2048);
+}
+
 void RunTest(int (*step)(void), unsigned (*checksum)(void), void* task, unsigned long taskBytes)
 {
     State& s = *sState;
@@ -1024,6 +1141,11 @@ void RunTest(int (*step)(void), unsigned (*checksum)(void), void* task, unsigned
         std::fclose(s.out);
         s.out = nullptr;
         return;
+    }
+    if (s.history && !ConfigureSnapshots())
+    {
+        std::fprintf(s.out, "sync test: incremental snapshots unavailable; full copies instead\n");
+        s.history = false;
     }
     // A rollback cannot cross a disc read: the host completes it whatever the
     // game's memory says. Wait for a step with none in flight.
@@ -1043,19 +1165,34 @@ void RunTest(int (*step)(void), unsigned (*checksum)(void), void* task, unsigned
 
     // Save (interrupts are already off for the whole test; these sections nest).
     BOOL level = OSDisableInterrupts();
-    const std::uint64_t saveStart = NowNs();
-    Copy(s.saved, s.ranges, s.rangeCount);
-    const std::uint64_t saveNs = NowNs() - saveStart;
-    ++s.prof.saves;
-    s.prof.saveNs += saveNs;
-    s.prof.maxSaveNs = std::max(s.prof.maxSaveNs, saveNs);
+    if (s.history)
+    {
+        mscharged::platform::BeginGameAllocationCheckpoint();
+        s.snapshotIds[0] = mscharged::platform::BeginRollbackSnapshots();
+        s.marks[0] = mscharged::platform::MarkGameAllocationCheckpoint();
+    }
+    else
+    {
+        const std::uint64_t saveStart = NowNs();
+        Copy(s.saved, s.ranges, s.rangeCount);
+        const std::uint64_t saveNs = NowNs() - saveStart;
+        ++s.prof.saves;
+        s.prof.saveNs += saveNs;
+        s.prof.maxSaveNs = std::max(s.prof.maxSaveNs, saveNs);
+        mscharged::platform::BeginGameAllocationCheckpoint();
+    }
     Copy(s.audioSaved, s.audio, s.audioCount);
-    mscharged::platform::BeginGameAllocationCheckpoint();
     OSRestoreInterrupts(level);
 
     const Phases phases = CurrentPhases();
     Phase(number, "first run");
-    const int firstSteps = RunSteps(step, checksum, s.frames, s.first, s.firstResult, s.profile);
+    const int firstSteps = RunSteps(step, checksum, 0, s.frames, s.first, s.firstResult, s.profile && !s.history,
+                                    s.history);
+    // Not rolled back: the snapshots stop with the checkpoint.
+    auto keepFirstRun = [&] {
+        if (s.history) mscharged::platform::EndRollbackSnapshots();
+        mscharged::platform::EndGameAllocationCheckpoint();
+    };
 
     // The first run changed audio globals, which the save leaves alone: the
     // simulation reached audio code through a way that is not silenced yet.
@@ -1064,7 +1201,7 @@ void RunTest(int (*step)(void), unsigned (*checksum)(void), void* task, unsigned
     CollectDiffs(s.audioSaved, s.audio, s.audioCount, SkipNothing);
     if (s.diffTotal)
     {
-        mscharged::platform::EndGameAllocationCheckpoint();
+        keepFirstRun();
         ++s.audioSkipped;
         std::fprintf(s.out, "=== test %d: %d steps, not rolled back: the first run changed %zu bytes of audio globals:",
                      number, firstSteps, s.diffTotal);
@@ -1085,7 +1222,7 @@ void RunTest(int (*step)(void), unsigned (*checksum)(void), void* task, unsigned
     const Phases changed = CurrentPhases();
     if (!(changed == phases))
     {
-        mscharged::platform::EndGameAllocationCheckpoint();
+        keepFirstRun();
         ++s.stateSkipped;
         std::fprintf(s.out,
                      "=== test %d: %d steps, not rolled back: the first run changed the game state %d -> %d, task "
@@ -1101,7 +1238,7 @@ void RunTest(int (*step)(void), unsigned (*checksum)(void), void* task, unsigned
     const auto started = mscharged::platform::CurrentGameByteProducers().started - producers.started;
     if (started)
     {
-        mscharged::platform::EndGameAllocationCheckpoint();
+        keepFirstRun();
         ++s.skipped;
         std::fprintf(s.out, "=== test %d: %d steps, not rolled back: the first run started %llu disc reads\n", number,
                      firstSteps, static_cast<unsigned long long>(started));
@@ -1114,20 +1251,63 @@ void RunTest(int (*step)(void), unsigned (*checksum)(void), void* task, unsigned
     level = OSDisableInterrupts();
     Copy(s.after, s.ranges, s.rangeCount);
     Copy(s.moduleAfter, s.module, s.moduleCount);
-    // Restore, keeping the preserved regions as they are now.
-    Copy(s.preservedCopy, s.preserved, s.preservedCount);
-    const std::uint64_t restoreStart = NowNs();
-    Paste(s.saved, s.ranges, s.rangeCount);
-    const std::uint64_t restoreNs = NowNs() - restoreStart;
-    ++s.prof.restores;
-    s.prof.restoreNs += restoreNs;
-    s.prof.maxRestoreNs = std::max(s.prof.maxRestoreNs, restoreNs);
-    Paste(s.preservedCopy, s.preserved, s.preservedCount);
-    const std::size_t lossy = mscharged::platform::RollbackGameAllocationCheckpoint(Preserved);
-    OSRestoreInterrupts(level);
+    std::size_t lossy = 0;
+    int secondSteps = 0;
+    bool lost = false;
+    if (s.history)
+    {
+        OSRestoreInterrupts(level);
+        // Back to the save before step `to` (the preserved regions are not in
+        // the snapshots), from the save after step `at`.
+        auto rollBack = [&](int to, int at) {
+            const BOOL inner = OSDisableInterrupts();
+            if (!mscharged::platform::RestoreRollbackSnapshot(s.snapshotIds[to]))
+            {
+                lost = true;
+                ++s.lostSnapshots;
+                std::fprintf(s.out, "  the save before step %d is no longer kept\n", to + 1);
+            }
+            lossy += mscharged::platform::RollbackGameAllocationCheckpointTo(s.marks[to], Preserved);
+            ++s.rollbackDepths[at - to];
+            OSRestoreInterrupts(inner);
+        };
+        // Two rollbacks of different depths: the second one goes back further
+        // than the first (through saves of the first run) or, from the start,
+        // just one step (into a save of the second run).
+        const int to = (number - 1) % firstSteps;
+        std::copy(s.first, s.first + to, s.second);
+        std::copy(s.firstResult, s.firstResult + to, s.secondResult);
+        rollBack(to, firstSteps);
+        Phase(number, "second run");
+        secondSteps = to + RunSteps(step, checksum, to, firstSteps - to, s.second, s.secondResult, false, true);
+        if (secondSteps == firstSteps && !lost)
+        {
+            const int again = to ? to / 2 : firstSteps - 1;
+            rollBack(again, firstSteps);
+            Phase(number, "third run");
+            secondSteps = again + RunSteps(step, checksum, again, firstSteps - again, s.second, s.secondResult, false,
+                                           true);
+        }
+        mscharged::platform::EndRollbackSnapshots();
+        mscharged::platform::EndGameAllocationCheckpoint();
+    }
+    else
+    {
+        // Restore, keeping the preserved regions as they are now.
+        Copy(s.preservedCopy, s.preserved, s.preservedCount);
+        const std::uint64_t restoreStart = NowNs();
+        Paste(s.saved, s.ranges, s.rangeCount);
+        const std::uint64_t restoreNs = NowNs() - restoreStart;
+        ++s.prof.restores;
+        s.prof.restoreNs += restoreNs;
+        s.prof.maxRestoreNs = std::max(s.prof.maxRestoreNs, restoreNs);
+        Paste(s.preservedCopy, s.preserved, s.preservedCount);
+        lossy = mscharged::platform::RollbackGameAllocationCheckpoint(Preserved);
+        OSRestoreInterrupts(level);
 
-    Phase(number, "second run");
-    const int secondSteps = RunSteps(step, checksum, firstSteps, s.second, s.secondResult);
+        Phase(number, "second run");
+        secondSteps = RunSteps(step, checksum, 0, firstSteps, s.second, s.secondResult);
+    }
     Phase(number, "compare");
 
     int mismatch = -1;
@@ -1140,7 +1320,7 @@ void RunTest(int (*step)(void), unsigned (*checksum)(void), void* task, unsigned
     CollectDiffs(s.after, s.ranges, s.rangeCount, Preserved);
     OSRestoreInterrupts(level);
     const std::size_t arenaRanges = s.diffCount, arenaBytes = s.diffTotal;
-    const bool failed = mismatch >= 0 || arenaBytes || lossy;
+    const bool failed = mismatch >= 0 || arenaBytes || lossy || lost;
     if (failed)
     {
         ++s.failures;
@@ -1202,6 +1382,7 @@ struct Install
         state->frames = EnvInt("RECHARGED_SYNCTEST_FRAMES", 8, 1, kMaxFrames);
         state->details = EnvInt("RECHARGED_SYNCTEST_DETAILS", 3, 0, 1 << 20);
         state->profile = EnvInt("RECHARGED_SYNCTEST_PROFILE", 0, 0, 1) != 0;
+        state->history = EnvInt("RECHARGED_SYNCTEST_HISTORY", 0, 0, 1) != 0;
         std::fprintf(state->out, "sync test: every %d steps, %d steps rolled back, %d failing tests in full; summary "
                      "in %s\n", state->interval, state->frames, state->details, state->summaryPath);
         std::fflush(state->out);
