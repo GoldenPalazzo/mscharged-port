@@ -13,9 +13,12 @@
 //
 // RECHARGED_ROLLBACK_TEST_COMPARE=N checks every Nth rollback: it copies the
 // memory the rollback tracks before the restore and compares it after the
-// replay, when it should be as it was. <file> lists the places that differed
-// in the first comparisons, <file>.summary every place with how often: match
-// or presentation state the replay does not bring back as it was.
+// replay, when it should be as it was. It also watches what no rollback
+// restores (the module's other globals, what the test leaves out of the
+// arenas), which a replay should not change. <file> lists the places that
+// differed in the first comparisons, <file>.summary every place with how
+// often: state the replay does not bring back as it was, or moves forward a
+// second time.
 //
 // The rollback restores the original game's arenas and globals, as the sync
 // test saves them, except what lives on outside the simulation: the network
@@ -83,6 +86,7 @@ extern "C" void mscharged_rollback_frame_start(void) {}
 #include <algorithm>
 #include <chrono>
 #include <dlfcn.h>
+#include <link.h>
 #include <execinfo.h>
 #include <iterator>
 #include <typeinfo>
@@ -125,6 +129,7 @@ constexpr int kSummaryEvery = 120;       // steps (two seconds)
 constexpr int kUntrackedEvery = 600;     // steps between checks for writes behind the tracking (reads everything)
 constexpr int kListedMismatches = 20;
 constexpr int kMaxMeter = 64;            // mega strike meter presses received before one step
+constexpr int kMaxWatched = 256;         // ranges the comparison watches although no rollback restores them
 constexpr int kMaxPlaces = 4096;         // places the comparison tells apart
 constexpr int kDetailedCompares = 3;     // comparisons listed in full in the log
 constexpr int kListedPlaces = 60;        // places per detailed comparison, and in the summary
@@ -194,7 +199,8 @@ enum PlaceKind
 {
     kGlobal = 1,
     kAllocation,
-    kUnowned
+    kUnowned,
+    kNotRestored // a replay changed it, and nothing takes it back
 };
 struct Place
 {
@@ -258,6 +264,8 @@ struct State
     std::size_t compareBytes;
     std::uint64_t compares, comparesDiffering, compareDiffBytes, compareRangesDropped;
     std::uintptr_t moduleBase;
+    Range watched[kMaxWatched];
+    int watchedCount;
     Place* places;
     int placeCount;
     std::uint64_t placesDropped;
@@ -493,6 +501,7 @@ void Record(std::uint64_t value, std::uint64_t& total, std::uint64_t& max)
 }
 
 void PrintPlace(FILE* file, const Place& place);
+void BuildWatched();
 
 void WriteSummary()
 {
@@ -609,6 +618,7 @@ bool Start(FixedUpdateTask* task, unsigned long taskBytes, unsigned (*checksum)(
         std::fflush(s.out);
         return false;
     }
+    if (s.compareEvery) BuildWatched();
     const unsigned frame = static_cast<unsigned>(task->GetFrame());
     mscharged::platform::BeginGameAllocationCheckpoint(Excluded);
     Step& step = s.steps[frame % kRing];
@@ -645,12 +655,70 @@ void Stop(const char* why)
     WriteSummary();
 }
 
-// RECHARGED_ROLLBACK_TEST_COMPARE: the tracked memory before a restore.
+// RECHARGED_ROLLBACK_TEST_COMPARE also watches what no rollback restores:
+// the module's other globals, and what the test leaves out of the arenas but
+// the audio and frame memory (the replay draws and the audio thread plays).
+// A replay should not change them; what it does change goes forward twice.
+constexpr const char* kModuleGlobals = "module global";
+
+int AddLoadSegments(dl_phdr_info* info, std::size_t, void* data)
+{
+    State& s = *sState;
+    if (info->dlpi_addr != s.moduleBase) return 0;
+    auto* segments = static_cast<Range*>(data);
+    int count = 0;
+    for (int i = 0; i < info->dlpi_phnum && count < 8; ++i)
+    {
+        const ElfW(Phdr)& header = info->dlpi_phdr[i];
+        if (header.p_type != PT_LOAD || !(header.p_flags & PF_W)) continue;
+        const std::uintptr_t start = info->dlpi_addr + header.p_vaddr;
+        segments[count++] = {start, start + header.p_memsz, kModuleGlobals};
+    }
+    return count;
+}
+
+void BuildWatched()
+{
+    State& s = *sState;
+    s.watchedCount = 0;
+    Range segments[8] = {};
+    dl_iterate_phdr(AddLoadSegments, segments);
+    Range cuts[kMaxRanges];
+    std::copy(s.ranges, s.ranges + s.rangeCount, cuts);
+    std::sort(cuts, cuts + s.rangeCount, [](const Range& a, const Range& b) { return a.start < b.start; });
+    auto add = [&](std::uintptr_t start, std::uintptr_t end, const char* name) {
+        if (start < end && s.watchedCount < kMaxWatched) s.watched[s.watchedCount++] = {start, end, name};
+    };
+    for (const Range& segment : segments)
+    {
+        if (!segment.start) continue;
+        std::uintptr_t at = segment.start;
+        for (int c = 0; c < s.rangeCount; ++c)
+        {
+            if (cuts[c].end <= at || cuts[c].start >= segment.end) continue;
+            add(at, std::max(at, cuts[c].start), kModuleGlobals);
+            at = std::max(at, cuts[c].end);
+        }
+        add(at, segment.end, kModuleGlobals);
+    }
+    for (int i = 0; i < s.excludedCount; ++i)
+    {
+        const char* name = s.excluded[i].name;
+        if (!std::strcmp(name, "audio memory") || !std::strcmp(name, "AudioBackend") || !std::strcmp(name, "frame memory")
+            || !std::strncmp(name, "task ", 5) || !std::strncmp(name, "fixed steps'", 12))
+            continue;
+        add(s.excluded[i].start, s.excluded[i].end, name);
+    }
+}
+
+// RECHARGED_ROLLBACK_TEST_COMPARE: the tracked memory before a restore, and
+// the watched memory.
 bool CopyForCompare()
 {
     State& s = *sState;
     std::size_t bytes = 0;
     for (int i = 0; i < s.regionCount; ++i) bytes += s.regions[i].bytes;
+    for (int i = 0; i < s.watchedCount; ++i) bytes += s.watched[i].end - s.watched[i].start;
     if (bytes != s.compareBytes)
     {
         if (s.compareCopy) munmap(s.compareCopy, s.compareBytes);
@@ -664,6 +732,12 @@ bool CopyForCompare()
     {
         std::memcpy(to, s.regions[i].base, s.regions[i].bytes);
         to += s.regions[i].bytes;
+    }
+    for (int i = 0; i < s.watchedCount; ++i)
+    {
+        const std::size_t length = s.watched[i].end - s.watched[i].start;
+        std::memcpy(to, reinterpret_cast<const void*>(s.watched[i].start), length);
+        to += length;
     }
     return true;
 }
@@ -718,6 +792,12 @@ void PrintPlace(FILE* file, const Place& place)
         else
             std::fprintf(file, "no vtable");
         break;
+    case kNotRestored:
+        if (place.region == kModuleGlobals)
+            std::fprintf(file, "NOT RESTORED module global module+0x%lx", static_cast<unsigned long>(place.key));
+        else
+            std::fprintf(file, "NOT RESTORED %s, +0x%lx", place.region, static_cast<unsigned long>(place.firstOffset));
+        break;
     default:
         std::fprintf(file, "no live allocation (%s)", place.region);
         break;
@@ -731,14 +811,33 @@ void PrintBytes(FILE* file, const char* label, const std::uint8_t* bytes)
     std::fprintf(file, "\n");
 }
 
-// One range that differs, [start, end), with `before` its bytes in the copy.
-void NoteDifference(std::uintptr_t start, std::uintptr_t end, const std::uint8_t* before)
+// One range that differs, [start, end), with `before` its bytes in the copy;
+// `watched` the watched range it lies in, if any.
+void NoteDifference(std::uintptr_t start, std::uintptr_t end, const std::uint8_t* before, const Range* watched)
 {
     State& s = *sState;
     s.compareDiffBytes += end - start;
     int kind = kUnowned;
     std::uintptr_t key = 0, offset = 0;
     std::size_t size = 0;
+    if (watched)
+    {
+        Place* place = FindPlace(kNotRestored,
+                                 watched->name == kModuleGlobals ? start - s.moduleBase : watched->start, 0);
+        if (!place) return;
+        place->bytes += end - start;
+        if (place->lastCompare == s.compares) return;
+        place->lastCompare = s.compares;
+        if (!place->compares++)
+        {
+            place->region = watched->name;
+            place->firstOffset = start - watched->start;
+            const std::size_t shown = std::min<std::size_t>(16, end - start);
+            std::memcpy(place->before, before, shown);
+            std::memcpy(place->after, reinterpret_cast<const void*>(start), shown);
+        }
+        return;
+    }
     const auto data = reinterpret_cast<std::uintptr_t>(__rbk_data_start);
     const auto bss = reinterpret_cast<std::uintptr_t>(__rbk_bss_start);
     mscharged::platform::GameAllocationSpan span{};
@@ -782,10 +881,12 @@ void CompareAfterReplay(unsigned frame, int depth)
     const std::uint64_t bytesBefore = s.compareDiffBytes;
     const int placesBefore = s.placeCount;
     const std::uint8_t* copy = s.compareCopy;
-    for (int r = 0; r < s.regionCount; ++r)
+    for (int r = 0; r < s.regionCount + s.watchedCount; ++r)
     {
-        const auto* live = static_cast<const std::uint8_t*>(s.regions[r].base);
-        const std::size_t bytes = s.regions[r].bytes;
+        const Range* watched = r < s.regionCount ? nullptr : &s.watched[r - s.regionCount];
+        const auto* live = watched ? reinterpret_cast<const std::uint8_t*>(watched->start)
+                                   : static_cast<const std::uint8_t*>(s.regions[r].base);
+        const std::size_t bytes = watched ? watched->end - watched->start : s.regions[r].bytes;
         constexpr std::size_t kPage = 4096;
         std::uintptr_t open = 0, last = 0;
         const std::uint8_t* openBefore = nullptr;
@@ -802,13 +903,13 @@ void CompareAfterReplay(unsigned frame, int depth)
                     last = address + 8;
                     continue;
                 }
-                if (open) NoteDifference(open, last, openBefore);
+                if (open) NoteDifference(open, last, openBefore, watched);
                 open = address;
                 last = address + 8;
                 openBefore = copy + at;
             }
         }
-        if (open) NoteDifference(open, last, openBefore);
+        if (open) NoteDifference(open, last, openBefore, watched);
         copy += bytes;
     }
     const bool differs = s.compareDiffBytes != bytesBefore;

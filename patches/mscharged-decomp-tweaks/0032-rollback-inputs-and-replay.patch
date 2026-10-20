@@ -15,7 +15,8 @@ also replays, around the steps, the frames they were played in: what the
 frames' other tasks do to the match and its presentation, without drawing,
 reading pads or files, sending or making sounds: BeginFrameTask's
 presentation, NIS, mega blend and cameras; GameRenderTask's meters,
-indicators, darkening, blur, flashes and frame lock; the particles' update;
+indicators, darkening, flashes and frame lock (not the blur, whose update
+draws); the particles' update;
 the front end's presentation, HUD, scenes, lighting, models and stadium; the
 event dispatch. The task manager reports every task's time step
 (mscharged_rollback_task_time), so that each part gets the one its task had
@@ -83,7 +84,7 @@ index 1c86544..2720aa9 100644
      float mTimeScale;
 diff --git a/include/mscharged_rollback.h b/include/mscharged_rollback.h
 new file mode 100644
-index 0000000..883a06a
+index 0000000..983f3d5
 --- /dev/null
 +++ b/include/mscharged_rollback.h
 @@ -0,0 +1,76 @@
@@ -151,7 +152,7 @@ index 0000000..883a06a
 +// to the match's state and presentation, each with the time step it had,
 +// without drawing, reading pads or files, sending or making sounds:
 +// BeginFrameTask's presentation, NIS, characters' mega blend and cameras;
-+// GameRenderTask's meters, indicators, darkening, blur and flashes; the
++// GameRenderTask's meters, indicators, darkening and flashes; the
 +// particles' update; the front end's presentation, HUD and scenes.
 +void RollbackReplayBeginFrame(float dt);
 +void RollbackReplayGameRender(float dt);
@@ -679,10 +680,10 @@ index e4f3dd8..09c9175 100644
 +}
 +#endif
 diff --git a/src/Game/Task/GameRenderTask.cpp b/src/Game/Task/GameRenderTask.cpp
-index 5a03a53..9878653 100644
+index 5a03a53..eaa024d 100644
 --- a/src/Game/Task/GameRenderTask.cpp
 +++ b/src/Game/Task/GameRenderTask.cpp
-@@ -573,4 +573,77 @@ bool IsWarbleParticleRenderingEnabled()
+@@ -573,4 +573,74 @@ bool IsWarbleParticleRenderingEnabled()
  {
      return sWarbleParticleRenderingEnabled;
  }
@@ -693,7 +694,8 @@ index 5a03a53..9878653 100644
 +// Run's and RenderFrame's updates of the match's presentation, in their
 +// order, for a rollback's replay: what both update and draw draws nothing
 +// (GLView drops it). The impostors, the world's models and the replay
-+// snapshot are drawn afresh every frame; a secondary NIS stops rollbacks.
++// snapshot are drawn afresh every frame; the blur's update draws its meshes
++// into frame memory as it goes; a secondary NIS stops rollbacks.
 +void RollbackReplayGameRender(float fDeltaT)
 +{
 +    if (gpHBMManager != 0 && gpHBMManager->mActive && gpHBMManager->mReady)
@@ -713,7 +715,7 @@ index 5a03a53..9878653 100644
 +    {
 +        FixedUpdateTask::DecrementFrameLock(fDeltaT);
 +    }
- 
++
 +    float dt = (nlTaskManager::m_pInstance->mCurrentState == TASK_PAUSED) ? 0.0f : fDeltaT;
 +    UpdateWarble(&gWarble, dt);
 +    UpdateAttackSideIndicators();
@@ -724,7 +726,7 @@ index 5a03a53..9878653 100644
 +            g_pCharacters[charIndex]->UpdateBlinking(dt);
 +        }
 +    }
-+
+ 
 +    // RenderSnapshot::Render's timer.
 +    if (nlTaskManager::m_pInstance->mCurrentState != TASK_FRONTEND && g_AllActorsHidden > 0.0f)
 +    {
@@ -749,10 +751,6 @@ index 5a03a53..9878653 100644
 +    }
 +
 +    WorldDarkening::Instance().Update(fDeltaT);
-+    if ((nlTaskManager::m_pInstance->mCurrentState & 0x00020008) == 0)
-+    {
-+        BlurManager::Update(fDeltaT);
-+    }
 +    if (g_bRenderWorldEffects)
 +    {
 +        PhotoFlash::Render(fDeltaT);
