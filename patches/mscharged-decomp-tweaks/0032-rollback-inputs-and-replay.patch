@@ -11,27 +11,22 @@ applies a report again. FixedUpdateTask passes the port a replay step:
 those inputs and the simulation, no pads, no capture, nothing sent.
 
 The rollback restores the drawing's objects with the match, so the port
-also replays, around the steps, the frames they were played in: what the
-frames' other tasks do to the match and its presentation, without drawing,
-reading pads or files, sending or making sounds: BeginFrameTask's
-presentation, NIS, mega blend and cameras; GameRenderTask's updates that
-draw nothing (darkening, photo flash, blinks, warble, timers, frame lock;
-its meters, indicators and blur update and draw as one, reading what the
-frame's drawing set up, and stay out); the particles' update;
-the front end's presentation, HUD, scenes, lighting, models and stadium; the
-event dispatch. The task manager reports every task's time step
-(mscharged_rollback_task_time), so that each part gets the one its task had
-in each frame, slowed down or not. Replaying the steps alone left all of it
-a little further behind at every rollback (a darkened screen flickered).
-The port goes back at the start of a frame, before any task of it runs
-(nlTaskManager::RunAllTasks): restored mid-frame, the cameras and views a
-frame had already set up would draw the current match from an earlier
-point of view.
+replays whole frames around the steps: their tasks run again as they did,
+each with the time step it had (the task manager reports every task's,
+mscharged_rollback_task_time), so that the drawing recomputes its state
+with the match's. A replay leaves out the pads, sound, network, disc and
+movies: BeginFrameTask serves no disc reads, FrontEndTask reads no pads
+and neither resets nor opens the HOME Button Menu. FixedUpdateTask's part
+is its work before the steps (the time scale's transition) and the
+recorded steps (RollbackReplayFixedFrame); EndFrameTask's part ends the
+frame without sending it (RollbackReplayEndFrame): the views emptied and
+the frame's memory used afresh in the same half
+(mscharged_rollback_reuse_frame_memory), as the other may still be read
+for the frame sent before. The port goes back at the start of a frame,
+before any task of it runs (nlTaskManager::RunAllTasks).
 
 Drawing has nowhere to go during a replay, whose frame was already drawn:
-GLView drops any model or packet attached meanwhile. The effects' update
-callbacks still run, since they place the emitters (a shot's charge aura
-born in a replay would stay where its emitter started, at the kickoff).
+GLView drops any model or packet attached meanwhile.
 
 Deterministic data the simulation queues to send (player visibility, mega
 strike results, NIS loaded) is an input of a later step on every machine:
@@ -68,24 +63,9 @@ index 1b67126..8b3abd2 100644
 +#endif
  
  #endif // GAME_NETWORK_INPUT_ROUTER_H
-diff --git a/include/Game/Task/ParticleUpdateTask.h b/include/Game/Task/ParticleUpdateTask.h
-index 1c86544..2720aa9 100644
---- a/include/Game/Task/ParticleUpdateTask.h
-+++ b/include/Game/Task/ParticleUpdateTask.h
-@@ -23,6 +23,10 @@ public:
-     }
- 
-     static ParticleUpdateTask* sInstance;
-+#if defined(MSCHARGED_TWEAKS)
-+    // Rollback: Run's update without the rendering.
-+    void ReplayUpdate(float dt);
-+#endif
- 
- private:
-     float mTimeScale;
 diff --git a/include/mscharged_rollback.h b/include/mscharged_rollback.h
 new file mode 100644
-index 0000000..0bffe6c
+index 0000000..2971b65
 --- /dev/null
 +++ b/include/mscharged_rollback.h
 @@ -0,0 +1,76 @@
@@ -136,8 +116,8 @@ index 0000000..0bffe6c
 +// The presses of a mega strike meter received from the shooter's machine,
 +// outside the inputs: the steps that use them run again with them.
 +void mscharged_rollback_meter_received(const bool* values, int count);
-+// Every task the task manager runs, with its time step: the port replays the
-+// frames of some around the steps a rollback runs again.
++// Every task the task manager runs, with its time step: a rollback replays
++// whole frames, each task with the time step it had.
 +void mscharged_rollback_task_time(const void* task, float dt);
 +// At the start of a frame, before any task sets up its cameras and views:
 +// where the rollback goes back and replays, through the end of the last frame.
@@ -145,20 +125,20 @@ index 0000000..0bffe6c
 +// The game's: pointers into the frame memory blocks, at most capacity;
 +// returns how many.
 +int mscharged_rollback_frame_memory(const void** pointers, int capacity);
++// The game's: the end of a replayed frame, whose frame memory the next one
++// uses afresh.
++void mscharged_rollback_reuse_frame_memory(void);
 +
 +#ifdef __cplusplus
 +}
 +
-+// The port also replays, around the steps, what the frames' other tasks do
-+// to the match's state and presentation, each with the time step it had,
-+// without drawing, reading pads or files, sending or making sounds:
-+// BeginFrameTask's presentation, NIS, characters' mega blend and cameras;
-+// GameRenderTask's darkening, flashes, blinks and timers; the
-+// particles' update; the front end's presentation, HUD and scenes.
-+void RollbackReplayBeginFrame(float dt);
-+void RollbackReplayGameRender(float dt);
-+void RollbackReplayParticles(float dt);
-+void RollbackReplayFrontEnd(float dt);
++// A rollback replays whole frames: their tasks run as they did (drawing with
++// nowhere to go, GLView drops it), but for the pads, sound, network, disc and
++// movies, and for these, which do a replayed frame's part of their task:
++// FixedUpdateTask's work before its steps, and EndFrameTask's end of a frame
++// without sending it.
++void RollbackReplayFixedFrame(float dt);
++void RollbackReplayEndFrame();
 +// Gives the match the mega strike meter presses received before a step again.
 +void RollbackRedeliverMegaStrikeMeter(const bool* values, int count);
 +#endif
@@ -558,40 +538,54 @@ index b3f08c8..caa21f1 100644
          = WPADIsMotorEnabled() && preset != RUMBLE_POINTER_HOVER;
      gRumbleEnabledOverride
 diff --git a/src/Game/Task/BeginFrameTask.cpp b/src/Game/Task/BeginFrameTask.cpp
-index baec505..8c23815 100644
+index baec505..a8cc199 100644
 --- a/src/Game/Task/BeginFrameTask.cpp
 +++ b/src/Game/Task/BeginFrameTask.cpp
-@@ -554,3 +554,28 @@ void BeginFrameTask::Run(float dt)
-         nlScreenPrintf(0, 0, false, 4, "Region %d", GetRegion());
+@@ -28,6 +28,9 @@
+ #include "NL/glx/glxGX.h"
+ #include "NL/glx/glxSwap.h"
+ #include "NL/nlConfig.h"
++#if defined(MSCHARGED_TWEAKS)
++#include "mscharged_rollback.h"
++#endif
+ #include "NL/nlFileGC.h"
+ #include "NL/nlMath.h"
+ #include "NL/platvmath.h"
+@@ -462,6 +465,11 @@ void BeginFrameTask::Run(float dt)
+     HideLayerView(eCLV_ShadowVolume);
+     HideLayerView(eCLV_ShadowVolumeBlend);
+ #endif // both3D shadow views are omitted by existing Anark-only setup
++#if defined(MSCHARGED_TWEAKS)
++    // A rollback's replay serves no disc reads: they went on when the frame
++    // first ran, and no rollback crosses one.
++    if (!mscharged_rollback_resimulating())
++#endif
+     nlServiceFileSystem();
+ 
+     g_FrameCounter.StartTimer(0);
+diff --git a/src/Game/Task/EndFrameTask.cpp b/src/Game/Task/EndFrameTask.cpp
+index f4eabdb..4542cff 100644
+--- a/src/Game/Task/EndFrameTask.cpp
++++ b/src/Game/Task/EndFrameTask.cpp
+@@ -87,3 +87,16 @@ void EndFrameTask::Run(float)
+         }
      }
  }
-+
 +#if defined(MSCHARGED_TWEAKS)
 +#include "mscharged_rollback.h"
 +
-+void RollbackReplayBeginFrame(float dt)
++// Run's end of a frame for a rollback's replay: nothing drawn or sent (the
++// frame was, when it first ran), the views emptied and the frame memory used
++// afresh, as glSendFrame leaves them.
++void RollbackReplayEndFrame()
 +{
-+#if !defined(MSCHARGED_DIAGNOSTIC_FRONTEND_TASK_CADENCE) || (defined(MSCHARGED_NATIVE) && defined(MSCHARGED_DIAGNOSTIC_FRONTEND_MATCH_LOADING))
-+    if (nlTaskManager::m_pInstance->mCurrentState & 0x2001B)
-+    {
-+        GetPresentation()->Update(dt);
-+        NisPlayer::Instance()->Update(dt);
-+    }
-+    for (int i = 0; i < 10; i++)
-+    {
-+        if (g_pCharacters[i] != NULL)
-+        {
-+            g_pCharacters[i]->UpdateMegaBlend(dt);
-+        }
-+    }
-+#endif
-+#if !defined(MSCHARGED_DIAGNOSTIC_FRONTEND_TASK_CADENCE) || defined(MSCHARGED_DIAGNOSTIC_FRONTEND_CAMERAS)
-+    cCameraManager::Update(dt);
-+#endif
++    glEndFrame();
++    gl_ViewReset();
++    mscharged_rollback_reuse_frame_memory();
 +}
 +#endif
 diff --git a/src/Game/Task/FixedUpdateTask.cpp b/src/Game/Task/FixedUpdateTask.cpp
-index b50ce23..b50f372 100644
+index b50ce23..26cf174 100644
 --- a/src/Game/Task/FixedUpdateTask.cpp
 +++ b/src/Game/Task/FixedUpdateTask.cpp
 @@ -42,6 +42,9 @@
@@ -604,7 +598,7 @@ index b50ce23..b50f372 100644
  
  #include <math.h>
  
-@@ -339,6 +342,18 @@ static unsigned SyncTestChecksum()
+@@ -339,6 +342,41 @@ static unsigned SyncTestChecksum()
  {
      return fixedUpdateTask.CalculateChecksum();
  }
@@ -619,11 +613,34 @@ index b50ce23..b50f372 100644
 +    fixedUpdateTask.CallFixedUpdateTasks();
 +    return IsNisLoadedOnAllMachines(GetPresentation()) ? -1 : 1;
 +}
++
++// Run's work in a frame a rollback replays, before its steps: the time
++// scale's transition (the steps' own pads and inputs are the replay's).
++void RollbackReplayFixedFrame(float dt)
++{
++    FixedUpdateTask& task = fixedUpdateTask;
++    if (IsNisLoadedOnAllMachines(GetPresentation()) || !task.mSimulationStarted
++        || nlTaskManager::m_pInstance->mPendingState == TASK_NIS
++        || nlTaskManager::m_pInstance->mCurrentState != TASK_GAMEPLAY || g_pNetworkSession->GetPausedMachineMask())
++    {
++        return;
++    }
++    if (task.mTimeScaleTransitionRemaining != 0.0f)
++    {
++        task.mTimeScaleTransitionRemaining -= dt * task.mTimeScale;
++        if (task.mTimeScaleTransitionRemaining < 0.0f)
++        {
++            task.mTimeScaleTransitionRemaining = 0.0f;
++        }
++        float percent = 1.0f - task.mTimeScaleTransitionRemaining / task.mTimeScaleTransitionTime;
++        task.mTimeScale = Interpolate(task.mTimeScaleTransitionStart, task.mTargetTimeScale, percent);
++    }
++}
 +#endif
  #endif
  
  void FixedUpdateTask::Run(float dt)
-@@ -428,6 +443,10 @@ void FixedUpdateTask::Run(float dt)
+@@ -428,6 +466,10 @@ void FixedUpdateTask::Run(float dt)
              {
                  mscharged_synctest_between_steps(SyncTestStep, SyncTestChecksum, &fixedUpdateTask,
                                                   sizeof(fixedUpdateTask));
@@ -635,168 +652,43 @@ index b50ce23..b50f372 100644
  #endif
  
 diff --git a/src/Game/Task/FrontEndTask.cpp b/src/Game/Task/FrontEndTask.cpp
-index e4f3dd8..09c9175 100644
+index e4f3dd8..2c4bf6f 100644
 --- a/src/Game/Task/FrontEndTask.cpp
 +++ b/src/Game/Task/FrontEndTask.cpp
-@@ -366,3 +366,41 @@ void FEResourceManager::Run(float dt)
-     Update(dt);
- }
- 
+@@ -27,6 +27,9 @@
+ #include "Game/main.h"
+ #include "NL/gl/gl.h"
+ #include "NL/gl/glMemory.h"
 +#if defined(MSCHARGED_TWEAKS)
 +#include "mscharged_rollback.h"
-+
-+// Run's and DrawFrontEndElements' updates of the presentation, HUD, scenes,
-+// lighting, front end models and stadium, without the pads (FEInput), resets,
-+// resource loading, drawing, the resource pool inventory (left out of the
-+// rollback with its pool) or the uptime.
-+void RollbackReplayFrontEnd(float dt)
-+{
-+    FrontEndPresentation::GetInstance()->Update(dt);
-+#if !defined(MSCHARGED_DIAGNOSTIC_FRONTEND_TASK_CADENCE) || defined(MSCHARGED_DIAGNOSTIC_FRONTEND_WORLD_DRAW)
-+    UpdateGameObjectLighting();
 +#endif
-+#if !defined(MSCHARGED_DIAGNOSTIC_FRONTEND_TASK_CADENCE) \
-+    || (defined(MSCHARGED_NATIVE) && defined(MSCHARGED_DIAGNOSTIC_FRONTEND_MATCH_LOADING))
-+    if ((nlTaskManager::m_pInstance->mCurrentState & 0x1b) && !IsHBMActive())
-+    {
-+        FrontEnd::Update(dt);
-+    }
-+#endif
-+    if (FEResourceManager::Instance() != 0 && !IsHBMActive())
-+    {
-+        FESceneManager::Instance()->Update(dt);
-+    }
-+#if !defined(MSCHARGED_DIAGNOSTIC_FRONTEND_TASK_CADENCE) || defined(MSCHARGED_DIAGNOSTIC_FRONTEND_FE_MODELS)
-+    if (FEModelManager::Instance() != 0 && !IsHBMActive())
-+    {
-+        FEModelManager::Instance()->Update(dt);
-+    }
-+#endif
-+#if !defined(MSCHARGED_DIAGNOSTIC_FRONTEND_TASK_CADENCE) || defined(MSCHARGED_DIAGNOSTIC_FRONTEND_WORLD_DRAW)
-+    if (nlTaskManager::m_pInstance->mCurrentState == 4 && IsStadiumWorldLoaded() && !IsHBMActive())
-+    {
-+        UpdateStadium(dt);
-+    }
-+#endif
-+}
-+#endif
-diff --git a/src/Game/Task/GameRenderTask.cpp b/src/Game/Task/GameRenderTask.cpp
-index 5a03a53..6c1723f 100644
---- a/src/Game/Task/GameRenderTask.cpp
-+++ b/src/Game/Task/GameRenderTask.cpp
-@@ -573,4 +573,75 @@ bool IsWarbleParticleRenderingEnabled()
+ #include "NL/globalpad.h"
+ #include "NL/glx/glxSend.h"
+ #include "NL/nlConfig.h"
+@@ -147,13 +150,23 @@ FrontEndTask::FrontEndTask()
+ void FrontEndTask::Run(float dt)
  {
-     return sWarbleParticleRenderingEnabled;
- }
+     g_fUpTime += dt;
 +#if defined(MSCHARGED_TWEAKS)
-+#include "mscharged_rollback.h"
-+#include "Game/RenderSnapshot_fwd.h"
-+
-+// Run's and RenderFrame's updates of the match's presentation that draw
-+// nothing, in their order, for a rollback's replay: the timed objects'
-+// clocks (their updates draw), the frame lock, the warble, the attack side
-+// indicators, the blinks, the hidden actors' timer, the darkening, the photo
-+// flash's count and the electric fence. The functions that update and draw
-+// as one (the meters, the player indicators, the blur, the impostors) read
-+// what this frame's drawing set up and stay out: a rollback takes their
-+// animations back a little.
-+void RollbackReplayGameRender(float fDeltaT)
-+{
-+    if (gpHBMManager != 0 && gpHBMManager->mActive && gpHBMManager->mReady)
-+    {
-+        return;
-+    }
-+    if (TimedObjectManager* timed = TimedObjectManager::Instance())
-+    {
-+        nlListIterator<TimedObject*> iterator = timed->mObjects.Begin();
-+        while (iterator.IsValid())
-+        {
-+            TimedObject* object = iterator.Current();
-+            if (object->mEnabled && object->mElapsedTime < object->mLifetime)
-+            {
-+                object->mElapsedTime += fDeltaT;
-+            }
-+            const bool remove = object->HasExpired();
-+            iterator.Next();
-+            if (remove)
-+            {
-+                timed->mObjects.RemoveEntry(object);
-+                delete object;
-+            }
-+        }
-+    }
-+    if (NisPlayer::Instance()->HasSecondaryNis() || !g_bRenderWorld)
-+    {
-+        return;
-+    }
++    // A rollback's replay reads no pads: the frame did when it first ran.
++    if (!mscharged_rollback_resimulating())
++#endif
+     g_pFEInput->Update(dt);
+     HandleE3IdleReset(dt);
+ #if !defined(MSCHARGED_DIAGNOSTIC_FRONTEND_TASK_CADENCE)
++#if defined(MSCHARGED_TWEAKS)
++    if (!mscharged_rollback_resimulating())
++#endif
+     HandleSoftReset(dt);
+ #endif // physical PAD reset lifecycle remains unqualified
  
-+    if (GetFixedUpdateTask()->mfFrameLockTime > 0.0f)
-+    {
-+        FixedUpdateTask::DecrementFrameLock(fDeltaT);
-+    }
-+
-+    float dt = (nlTaskManager::m_pInstance->mCurrentState == TASK_PAUSED) ? 0.0f : fDeltaT;
-+    UpdateWarble(&gWarble, dt);
-+    UpdateAttackSideIndicators();
-+    for (int charIndex = 0; charIndex < 10; charIndex++)
-+    {
-+        if (g_pCharacters[charIndex] != 0)
-+        {
-+            g_pCharacters[charIndex]->UpdateBlinking(dt);
-+        }
-+    }
-+
-+    // RenderSnapshot::Render's timer.
-+    if (nlTaskManager::m_pInstance->mCurrentState != TASK_FRONTEND && g_AllActorsHidden > 0.0f)
-+    {
-+        g_AllActorsHidden -= fDeltaT;
-+    }
-+
-+    WorldDarkening::Instance().Update(fDeltaT);
-+    if (g_bRenderWorldEffects)
-+    {
-+        PhotoFlash::Render(fDeltaT);
-+        UpdateElectricFence(fDeltaT);
-+    }
-+}
-+#endif
-diff --git a/src/Game/Task/ParticleUpdateTask.cpp b/src/Game/Task/ParticleUpdateTask.cpp
-index a5ee729..9ff59cd 100644
---- a/src/Game/Task/ParticleUpdateTask.cpp
-+++ b/src/Game/Task/ParticleUpdateTask.cpp
-@@ -85,3 +85,32 @@ bool ParticleUpdateTask::FinishLoading(GLResourcePool* context)
- {
-     return EmissionManager::FinishLoading(context);
- }
-+
+ #if !defined(MSCHARGED_DIAGNOSTIC_FRONTEND_TASK_CADENCE) || (defined(MSCHARGED_NATIVE) && defined(MSCHARGED_DIAGNOSTIC_FRONTEND_HOME))
 +#if defined(MSCHARGED_TWEAKS)
-+#include "mscharged_rollback.h"
-+
-+void ParticleUpdateTask::ReplayUpdate(float dt)
-+{
-+    if (mBeforeUpdate)
-+    {
-+        mBeforeUpdate();
-+    }
-+    bool update = true;
-+    if (mCanUpdate)
-+    {
-+        update = mCanUpdate();
-+    }
-+    if (mUpdateEnabled && update)
-+    {
-+        EmissionManager::Instance()->Update(dt * mTimeScale);
-+    }
-+}
-+
-+void RollbackReplayParticles(float dt)
-+{
-+    if (ParticleUpdateTask::sInstance != 0)
-+    {
-+        ParticleUpdateTask::sInstance->ReplayUpdate(dt);
-+    }
-+}
++    if (!mscharged_rollback_resimulating())
 +#endif
+     if (gpHBMManager != 0 && gpHBMManager->mReady)
+     {
+         if (!gpHBMManager->mActive
 diff --git a/src/NL/gl/glView.cpp b/src/NL/gl/glView.cpp
 index 6fc0a98..658569e 100644
 --- a/src/NL/gl/glView.cpp
@@ -839,7 +731,7 @@ index 6fc0a98..658569e 100644
      if (!model || model->numPackets > 65535 || (model->numPackets && !model->packets) || layer > UINT32_MAX)
          throw std::invalid_argument("Invalid GL model or sort layer");
 diff --git a/src/NL/glx/glxMemory.cpp b/src/NL/glx/glxMemory.cpp
-index ebf1e9a..c5ca54d 100644
+index ebf1e9a..234ae9e 100644
 --- a/src/NL/glx/glxMemory.cpp
 +++ b/src/NL/glx/glxMemory.cpp
 @@ -29,6 +29,9 @@
@@ -852,7 +744,7 @@ index ebf1e9a..c5ca54d 100644
  
  class GLXResourcePool
      : public GLResourcePool
-@@ -562,3 +565,17 @@ void glplatValidateMatrix(glMatrixHandle matrix)
+@@ -562,3 +565,34 @@ void glplatValidateMatrix(glMatrixHandle matrix)
      throw std::invalid_argument("Matrix address is outside live GL storage");
  }
  #endif
@@ -868,6 +760,23 @@ index ebf1e9a..c5ca54d 100644
 +        pointers[count++] = (const void*)sFrameMemory[0][pool];
 +    }
 +    return count;
++}
++
++// The end of a frame a rollback replays: the next one uses this frame's memory
++// afresh, as glplatFrameAllocNextFrame lets a frame do, but in the same half,
++// since the other may still be read for the frame sent before.
++extern "C" void mscharged_rollback_reuse_frame_memory(void)
++{
++#if defined(MSCHARGED_NATIVE) && defined(MSCHARGED_GAME_MODULE) && !defined(MSCHARGED_DIAGNOSTIC_RESOURCE_POOLS)
++    mscharged::platform::GameGraphicsRetirementReservation nativeRetirement[2];
++#endif
++    for (int pool = 0; pool < 2; ++pool)
++    {
++        sFrameMemoryUsed[sCurrentFrame][pool] = 0;
++#if defined(MSCHARGED_NATIVE) && defined(MSCHARGED_GAME_MODULE) && !defined(MSCHARGED_DIAGNOSTIC_RESOURCE_POOLS)
++        nativeRetirement[pool].Commit((void*)sFrameMemory[sCurrentFrame][pool], sFrameMemorySizes[pool]);
++#endif
++    }
 +}
 +#endif
 diff --git a/src/NL/nlTask.cpp b/src/NL/nlTask.cpp
