@@ -11,6 +11,12 @@
 // <file> logs the session; <file>.summary, rewritten every ten seconds, holds
 // its counts and costs. Unset, it changes nothing. Diagnostic only.
 //
+// RECHARGED_ROLLBACK_TEST_COMPARE=N checks every Nth rollback: it copies the
+// memory the rollback tracks before the restore and compares it after the
+// replay, when it should be as it was. <file> lists the places that differed
+// in the first comparisons, <file>.summary every place with how often: match
+// or presentation state the replay does not bring back as it was.
+//
 // The rollback restores the original game's arenas and globals, as the sync
 // test saves them, except what lives on outside the simulation: the network
 // session (but its players' inputs), sockets and lobby, the input routers and
@@ -86,6 +92,7 @@ extern "C" void mscharged_rollback_frame_start(void) {}
 #include <cstring>
 #include <mutex>
 #include <pthread.h>
+#include <sys/mman.h>
 #include <time.h>
 
 // Bounds of the simulation's globals (cmake/rollback_sections.ld).
@@ -118,6 +125,9 @@ constexpr int kSummaryEvery = 120;       // steps (two seconds)
 constexpr int kUntrackedEvery = 600;     // steps between checks for writes behind the tracking (reads everything)
 constexpr int kListedMismatches = 20;
 constexpr int kMaxMeter = 64;            // mega strike meter presses received before one step
+constexpr int kMaxPlaces = 4096;         // places the comparison tells apart
+constexpr int kDetailedCompares = 3;     // comparisons listed in full in the log
+constexpr int kListedPlaces = 60;        // places per detailed comparison, and in the summary
 constexpr int kMaxFrames = 8;            // frames ended between two steps (a 240 Hz display has 4 or 5)
 
 // The tasks whose frames a replay runs again around the steps, found by name.
@@ -176,6 +186,28 @@ struct Step
     bool meterOverflowed;
 };
 
+// RECHARGED_ROLLBACK_TEST_COMPARE: a place whose bytes after a replay were not
+// those before the restore. A global by its module offset, an allocation by
+// its first word's (a vtable names the class) and its size, or a range with
+// no live allocation.
+enum PlaceKind
+{
+    kGlobal = 1,
+    kAllocation,
+    kUnowned
+};
+struct Place
+{
+    int kind;
+    std::uintptr_t key;
+    std::size_t size;
+    std::uint64_t compares, bytes; // comparisons it differed in, bytes that differed in all
+    std::uintptr_t firstOffset;    // in the allocation, the first time
+    std::uint64_t lastCompare;
+    const char* region;
+    std::uint8_t before[16], after[16];
+};
+
 struct State
 {
     FILE* out;
@@ -218,6 +250,17 @@ struct State
     std::uint64_t stepCount, rollbacks, byDepth[kMaxDepth + 1], replayed;
     std::uint64_t skippedReads, skippedStarts, skippedPhases, skippedEvents, skippedShort;
     std::uint64_t meterReceived, meterRedelivered, framesReplayed;
+
+    // RECHARGED_ROLLBACK_TEST_COMPARE=N: every Nth rollback, the tracked memory
+    // after the replay against a copy taken before the restore.
+    int compareEvery;
+    std::uint8_t* compareCopy;
+    std::size_t compareBytes;
+    std::uint64_t compares, comparesDiffering, compareDiffBytes, compareRangesDropped;
+    std::uintptr_t moduleBase;
+    Place* places;
+    int placeCount;
+    std::uint64_t placesDropped;
     std::uint64_t mismatches, nisInReplay, lossyFrees, failedRestores, untracked;
     unsigned firstMismatchFrame;
     std::uint64_t rollbackNs, maxRollbackNs, restoreNs, maxRestoreNs;
@@ -449,6 +492,8 @@ void Record(std::uint64_t value, std::uint64_t& total, std::uint64_t& max)
     max = std::max(max, value);
 }
 
+void PrintPlace(FILE* file, const Place& place);
+
 void WriteSummary()
 {
     const State& s = *sState;
@@ -496,6 +541,30 @@ void WriteSummary()
     std::fprintf(file, "faults %llu, cold pages turned hot %llu, hot turned cold %llu, saves dropped early %llu\n",
                  static_cast<unsigned long long>(h.faults), static_cast<unsigned long long>(h.promoted),
                  static_cast<unsigned long long>(h.demoted), static_cast<unsigned long long>(h.evicted));
+    if (s.compareEvery)
+    {
+        std::fprintf(file, "\ncompared every %d rollbacks: %llu, %llu with differences, %llu bytes in all; "
+                           "places %d (%llu not told apart)\n",
+                     s.compareEvery, static_cast<unsigned long long>(s.compares),
+                     static_cast<unsigned long long>(s.comparesDiffering),
+                     static_cast<unsigned long long>(s.compareDiffBytes), s.placeCount,
+                     static_cast<unsigned long long>(s.placesDropped));
+        // The places, most often differing first (sorting a copy of the indices).
+        int order[kMaxPlaces];
+        for (int i = 0; i < s.placeCount; ++i) order[i] = i;
+        std::sort(order, order + s.placeCount, [&](int a, int b) {
+            return s.places[a].compares != s.places[b].compares ? s.places[a].compares > s.places[b].compares
+                                                                : s.places[a].bytes > s.places[b].bytes;
+        });
+        for (int i = 0; i < s.placeCount && i < kListedPlaces * 2; ++i)
+        {
+            const Place& place = s.places[order[i]];
+            std::fprintf(file, "  %llu times, %llu bytes: ", static_cast<unsigned long long>(place.compares),
+                         static_cast<unsigned long long>(place.bytes));
+            PrintPlace(file, place);
+            std::fprintf(file, "\n");
+        }
+    }
     std::fprintf(file, "\nnot restored:\n");
     for (int i = 0; i < s.excludedCount; ++i)
         std::fprintf(file, "  %s: %zu bytes\n", s.excluded[i].name,
@@ -576,6 +645,188 @@ void Stop(const char* why)
     WriteSummary();
 }
 
+// RECHARGED_ROLLBACK_TEST_COMPARE: the tracked memory before a restore.
+bool CopyForCompare()
+{
+    State& s = *sState;
+    std::size_t bytes = 0;
+    for (int i = 0; i < s.regionCount; ++i) bytes += s.regions[i].bytes;
+    if (bytes != s.compareBytes)
+    {
+        if (s.compareCopy) munmap(s.compareCopy, s.compareBytes);
+        void* copy = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        s.compareCopy = copy == MAP_FAILED ? nullptr : static_cast<std::uint8_t*>(copy);
+        s.compareBytes = s.compareCopy ? bytes : 0;
+        if (!s.compareCopy) return false;
+    }
+    std::uint8_t* to = s.compareCopy;
+    for (int i = 0; i < s.regionCount; ++i)
+    {
+        std::memcpy(to, s.regions[i].base, s.regions[i].bytes);
+        to += s.regions[i].bytes;
+    }
+    return true;
+}
+
+bool ModuleOffset(std::uintptr_t value, std::uintptr_t& offset)
+{
+    Dl_info info{};
+    if (!value || !dladdr(reinterpret_cast<void*>(value), &info)) return false;
+    if (reinterpret_cast<std::uintptr_t>(info.dli_fbase) != sState->moduleBase) return false;
+    offset = value - sState->moduleBase;
+    return true;
+}
+
+const char* RangeName(std::uintptr_t address)
+{
+    const State& s = *sState;
+    for (int i = 0; i < s.rangeCount; ++i)
+        if (address >= s.ranges[i].start && address < s.ranges[i].end) return s.ranges[i].name;
+    return "?";
+}
+
+Place* FindPlace(int kind, std::uintptr_t key, std::size_t size)
+{
+    State& s = *sState;
+    for (int i = 0; i < s.placeCount; ++i)
+        if (s.places[i].kind == kind && s.places[i].key == key && s.places[i].size == size) return &s.places[i];
+    if (s.placeCount == kMaxPlaces)
+    {
+        ++s.placesDropped;
+        return nullptr;
+    }
+    Place& place = s.places[s.placeCount++];
+    place = {};
+    place.kind = kind;
+    place.key = key;
+    place.size = size;
+    return &place;
+}
+
+void PrintPlace(FILE* file, const Place& place)
+{
+    switch (place.kind)
+    {
+    case kGlobal:
+        std::fprintf(file, "global module+0x%lx (%s)", static_cast<unsigned long>(place.key), place.region);
+        break;
+    case kAllocation:
+        std::fprintf(file, "%zu-byte allocation (%s), first differing +0x%lx, ", place.size, place.region,
+                     static_cast<unsigned long>(place.firstOffset));
+        if (place.key)
+            std::fprintf(file, "first word module+0x%lx", static_cast<unsigned long>(place.key));
+        else
+            std::fprintf(file, "no vtable");
+        break;
+    default:
+        std::fprintf(file, "no live allocation (%s)", place.region);
+        break;
+    }
+}
+
+void PrintBytes(FILE* file, const char* label, const std::uint8_t* bytes)
+{
+    std::fprintf(file, "      %s", label);
+    for (int i = 0; i < 16; ++i) std::fprintf(file, " %02x", bytes[i]);
+    std::fprintf(file, "\n");
+}
+
+// One range that differs, [start, end), with `before` its bytes in the copy.
+void NoteDifference(std::uintptr_t start, std::uintptr_t end, const std::uint8_t* before)
+{
+    State& s = *sState;
+    s.compareDiffBytes += end - start;
+    int kind = kUnowned;
+    std::uintptr_t key = 0, offset = 0;
+    std::size_t size = 0;
+    const auto data = reinterpret_cast<std::uintptr_t>(__rbk_data_start);
+    const auto bss = reinterpret_cast<std::uintptr_t>(__rbk_bss_start);
+    mscharged::platform::GameAllocationSpan span{};
+    if ((data && start >= data && start < reinterpret_cast<std::uintptr_t>(__rbk_data_end))
+        || (bss && start >= bss && start < reinterpret_cast<std::uintptr_t>(__rbk_bss_end)))
+    {
+        kind = kGlobal;
+        key = start - s.moduleBase;
+    }
+    else if (mscharged::platform::FindGameAllocationSpan(reinterpret_cast<const void*>(start), 1, span))
+    {
+        kind = kAllocation;
+        const auto base = reinterpret_cast<std::uintptr_t>(span.base);
+        size = span.bytes;
+        offset = start - base;
+        std::uintptr_t first = 0;
+        if (span.bytes >= sizeof(first)) std::memcpy(&first, span.base, sizeof(first));
+        if (!ModuleOffset(first, key)) key = 0;
+    }
+    Place* place = FindPlace(kind, key, size);
+    if (!place) return;
+    place->bytes += end - start;
+    if (place->lastCompare == s.compares) return;
+    place->lastCompare = s.compares;
+    if (!place->compares++)
+    {
+        place->firstOffset = offset;
+        place->region = RangeName(start);
+        const std::size_t shown = std::min<std::size_t>(16, end - start);
+        std::memcpy(place->before, before, shown);
+        std::memcpy(place->after, reinterpret_cast<const void*>(start), shown);
+    }
+}
+
+// After a replay: what differs from the copy, in 8-byte words, ranges joined
+// across gaps under 32 bytes.
+void CompareAfterReplay(unsigned frame, int depth)
+{
+    State& s = *sState;
+    ++s.compares;
+    const std::uint64_t bytesBefore = s.compareDiffBytes;
+    const int placesBefore = s.placeCount;
+    const std::uint8_t* copy = s.compareCopy;
+    for (int r = 0; r < s.regionCount; ++r)
+    {
+        const auto* live = static_cast<const std::uint8_t*>(s.regions[r].base);
+        const std::size_t bytes = s.regions[r].bytes;
+        constexpr std::size_t kPage = 4096;
+        std::uintptr_t open = 0, last = 0;
+        const std::uint8_t* openBefore = nullptr;
+        for (std::size_t page = 0; page < bytes; page += kPage)
+        {
+            const std::size_t length = std::min(kPage, bytes - page);
+            if (!std::memcmp(live + page, copy + page, length)) continue;
+            for (std::size_t at = page; at + 8 <= page + length; at += 8)
+            {
+                if (!std::memcmp(live + at, copy + at, 8)) continue;
+                const auto address = reinterpret_cast<std::uintptr_t>(live + at);
+                if (open && address - last < 32)
+                {
+                    last = address + 8;
+                    continue;
+                }
+                if (open) NoteDifference(open, last, openBefore);
+                open = address;
+                last = address + 8;
+                openBefore = copy + at;
+            }
+        }
+        if (open) NoteDifference(open, last, openBefore);
+        copy += bytes;
+    }
+    const bool differs = s.compareDiffBytes != bytesBefore;
+    if (differs) ++s.comparesDiffering;
+    if (!differs || s.comparesDiffering > kDetailedCompares) return;
+    std::fprintf(s.out, "COMPARED rollback of %d steps from frame %u: %llu bytes differ; places first seen now:\n",
+                 depth, frame, static_cast<unsigned long long>(s.compareDiffBytes - bytesBefore));
+    for (int i = placesBefore; i < s.placeCount && i < placesBefore + kListedPlaces; ++i)
+    {
+        std::fprintf(s.out, "  ");
+        PrintPlace(s.out, s.places[i]);
+        std::fprintf(s.out, "\n");
+        PrintBytes(s.out, "before:", s.places[i].before);
+        PrintBytes(s.out, "after: ", s.places[i].after);
+    }
+    std::fflush(s.out);
+}
+
 // What a frame's tasks after its steps did: the drawing's updates, the
 // particles, the front end, the events.
 void ReplayFrameEnd(const FrameTimes& frame)
@@ -654,6 +905,7 @@ void RollBack(int depth, int (*replay)(const MschargedRollbackInputs*), unsigned
         }
     }
 
+    const bool compare = s.compareEvery && s.places && (s.rollbacks + 1) % s.compareEvery == 0 && CopyForCompare();
     const std::uint64_t start = NowNs();
     const Step& from = s.steps[target % kRing];
     if (!mscharged::platform::RestoreRollbackSnapshot(from.snapshot))
@@ -697,6 +949,7 @@ void RollBack(int depth, int (*replay)(const MschargedRollbackInputs*), unsigned
     ++s.rollbacks;
     ++s.byDepth[depth];
     Record(NowNs() - start, s.rollbackNs, s.maxRollbackNs);
+    if (compare) CompareAfterReplay(s.latest, depth);
 }
 
 void* Watchdog(void*)
@@ -762,6 +1015,14 @@ struct Install
         std::memcpy(state->summaryPath + length, ".summary", sizeof(".summary"));
         state->maxDepth = EnvInt("RECHARGED_ROLLBACK_TEST_FRAMES", kMaxDepth, 1, kMaxDepth);
         state->interval = EnvInt("RECHARGED_ROLLBACK_TEST_INTERVAL", 1, 1, 1 << 20);
+        state->compareEvery = EnvInt("RECHARGED_ROLLBACK_TEST_COMPARE", 0, 0, 1 << 20);
+        if (state->compareEvery)
+        {
+            Dl_info info{};
+            if (dladdr(reinterpret_cast<void*>(&mscharged_rollback_active), &info))
+                state->moduleBase = reinterpret_cast<std::uintptr_t>(info.dli_fbase);
+            state->places = static_cast<Place*>(std::calloc(kMaxPlaces, sizeof(Place)));
+        }
         std::fprintf(state->out, "rollback test: up to %d steps back every %d steps; summary in %s\n",
                      state->maxDepth, state->interval, state->summaryPath);
         std::fflush(state->out);
