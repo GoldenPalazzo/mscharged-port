@@ -13,12 +13,9 @@
 // test saves them, except what lives on outside the simulation: the network
 // session (but its players' inputs), sockets and lobby, the input routers and
 // manager, the pads, the tasks' clocks and the fixed update task's
-// accumulated time, the drawing's memory (frame memory and resource pools,
-// whose suballocations the port tracks for the host) with the bookkeeping of
-// the pools drawing fills every frame (the goal nets' in
-// cmake/rollback_sections.ld, the crowd impostors' here), and the audio
-// memory. Everything else, the drawing's objects included, goes back with the
-// match.
+// accumulated time, the frame memory (used afresh every frame) and the audio
+// memory. Everything else, the drawing included, goes back with the match,
+// and the registry of the game's memory with it (its rollback checkpoint).
 //
 // A replayed step reads no pads, captures and sends nothing, and queues no
 // deterministic data (it went out the first time). Around it the replay runs
@@ -56,7 +53,6 @@ extern "C" void mscharged_rollback_between_steps(int (*)(const MschargedRollback
 #include "Game/InputRouter.h"
 #include "Game/NetworkSession.h"
 #include "Game/NetworkSync.h"
-#include "Game/Render/ImpostorManager.h"
 #include "Game/Task/FixedUpdateTask.h"
 #include "NL/MemAlloc.h"
 #include "NL/globalpad.h"
@@ -68,7 +64,6 @@ extern "C" void mscharged_rollback_between_steps(int (*)(const MschargedRollback
 
 #include <algorithm>
 #include <chrono>
-#include <cstddef>
 #include <dlfcn.h>
 #include <execinfo.h>
 #include <typeinfo>
@@ -295,16 +290,10 @@ void FindRanges(FixedUpdateTask* task, unsigned long taskBytes)
         }
     }
     ExcludeAllocation(g_pPlatPadManager, 0, "PlatPadManager");
-    // The drawing's memory: the port tracks what it holds for the host (graphics
-    // suballocations), as it is now; restoring a pool's top would allocate over them.
-    const void* graphics[kMaxExcluded];
-    const int graphicsCount = mscharged_rollback_graphics_memory(graphics, kMaxExcluded);
-    for (int i = 0; i < graphicsCount; ++i) ExcludeAllocation(graphics[i], 0, "drawing memory");
-    // The crowd impostors fill one of two of those pools every frame and release the
-    // other to a mark: their pools, marks, turn and capture state stay together.
-    if (ImpostorManager* impostors = ImpostorManager::GetInstance())
-        Exclude(&impostors->mResources, sizeof(ImpostorManager) - offsetof(ImpostorManager, mResources),
-                "crowd impostors' pools and capture");
+    // The frame memory: used afresh every frame, with its cursors in glxMemory's statics.
+    const void* frame[2];
+    const int frameCount = mscharged_rollback_frame_memory(frame, 2);
+    for (int i = 0; i < frameCount; ++i) ExcludeAllocation(frame[i], 0, "frame memory");
     // The clocks: each task's last run, and the time the fixed steps have still to catch up.
     if (nlTaskManager* manager = nlTaskManager::m_pInstance; manager && manager->mTaskList)
     {
@@ -422,6 +411,12 @@ void WriteSummary()
         std::fprintf(file, "rollback (restore, replay, saves): %.2f ms avg / %.2f ms max\n",
                      s.rollbackNs / 1e6 / s.rollbacks, s.maxRollbackNs / 1e6);
     }
+    const auto registry = mscharged::platform::CurrentGameAllocationCheckpointStats();
+    std::fprintf(file, "registry: %llu copies of an allocation's facts, %zu journal entries held; changes it does "
+                       "not follow %llu, failed copies %llu\n",
+                 static_cast<unsigned long long>(registry.copies), registry.entries,
+                 static_cast<unsigned long long>(registry.untracked),
+                 static_cast<unsigned long long>(registry.failedCopies));
     std::fprintf(file, "faults %llu, cold pages turned hot %llu, hot turned cold %llu, saves dropped early %llu\n",
                  static_cast<unsigned long long>(h.faults), static_cast<unsigned long long>(h.promoted),
                  static_cast<unsigned long long>(h.demoted), static_cast<unsigned long long>(h.evicted));
@@ -446,7 +441,7 @@ bool Start(FixedUpdateTask* task, unsigned long taskBytes, unsigned (*checksum)(
         return false;
     }
     const unsigned frame = static_cast<unsigned>(task->GetFrame());
-    mscharged::platform::BeginGameAllocationCheckpoint();
+    mscharged::platform::BeginGameAllocationCheckpoint(Excluded);
     Step& step = s.steps[frame % kRing];
     step.frame = frame;
     step.snapshot = mscharged::platform::BeginRollbackSnapshots();
@@ -537,13 +532,6 @@ void RollBack(int depth, int (*replay)(const MschargedRollbackInputs*), unsigned
         ++s.replayed;
     }
     s.resimulating = false;
-    // The crowd's sprites went back to meshes of an earlier capture, in pool
-    // memory their manager has reused since: the next frame captures anew.
-    if (ImpostorManager* impostors = ImpostorManager::GetInstance())
-    {
-        impostors->mCaptured = false;
-        impostors->mLastRenderChecksum = ~impostors->mLastRenderChecksum;
-    }
     ++s.rollbacks;
     ++s.byDepth[depth];
     Record(NowNs() - start, s.rollbackNs, s.maxRollbackNs);
@@ -687,6 +675,9 @@ extern "C" void mscharged_rollback_between_steps(int (*replay)(const MschargedRo
     s.haveInputs = false;
     s.latest = frame;
     ++s.stored;
+    // No rollback returns past the oldest step kept: the registry forgets the journal before it.
+    const unsigned oldest = frame - static_cast<unsigned>(std::min(s.stored, kRing) - 1);
+    mscharged::platform::TrimGameAllocationCheckpoint(s.steps[oldest % kRing].mark);
 
     if (s.stepCount % s.interval == 0)
     {
