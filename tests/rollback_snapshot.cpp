@@ -6,6 +6,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -53,6 +54,16 @@ struct Fixture
         }
     }
     ~Fixture() { munmap(block, bytes); }
+
+    // Addresses of the owned bytes that differ from saved (an Owned() state).
+    std::vector<std::uintptr_t> Changed(const std::vector<std::uint8_t>& saved) const
+    {
+        std::vector<std::uintptr_t> changed;
+        std::size_t k = 0;
+        for (std::size_t i = 0; i < bytes; ++i)
+            if (owned[i] && block[i] != saved[k++]) changed.push_back(reinterpret_cast<std::uintptr_t>(block + i));
+        return changed;
+    }
 
     std::vector<std::uint8_t> Owned() const
     {
@@ -114,6 +125,15 @@ void RandomHistory(std::size_t historyPages, int depth, int steps, unsigned seed
             }
             std::uintptr_t first = 0;
             Check(FindUntrackedRollbackWrites(&first) == 0, "a write escaped the tracking");
+            std::vector<std::uintptr_t> visited;
+            VisitRollbackChanges(
+                [](std::uintptr_t address, std::size_t length, void* context) {
+                    auto& list = *static_cast<std::vector<std::uintptr_t>*>(context);
+                    for (std::size_t i = 0; i < length; ++i) list.push_back(address + i);
+                },
+                &visited);
+            std::sort(visited.begin(), visited.end());
+            Check(visited == f.Changed(model[latest]), "the changes visited differ from the bytes written");
             latest = SaveRollbackSnapshot();
             model[latest] = f.Owned();
         }

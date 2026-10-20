@@ -57,5 +57,8 @@ void EndRollbackSnapshots();
 // kernel, a device). Call it right before a save. The first one is returned in
 // first when there is any.
 std::size_t FindUntrackedRollbackWrites(std::uintptr_t* first);
+// Diagnostic: every run of region bytes that differs from the last save, in
+// address order within a page, passed to visit. Call it right before a save.
+void VisitRollbackChanges(void (*visit)(std::uintptr_t address, std::size_t bytes, void* context), void* context);
 const RollbackSnapshotStats& RollbackSnapshotStatistics();
 }

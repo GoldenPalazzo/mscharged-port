@@ -543,6 +543,37 @@ std::size_t FindUntrackedRollbackWrites(std::uintptr_t* first)
     return found;
 }
 
+void VisitRollbackChanges(void (*visit)(std::uintptr_t address, std::size_t bytes, void* context), void* context)
+{
+    const Tracker* t = sTracker;
+    if (!t || !__atomic_load_n(&t->active, __ATOMIC_ACQUIRE)) return;
+    auto scan = [&](std::size_t page) {
+        const std::uint8_t* live = PageAddress(*t, page);
+        const std::uint8_t* saved = t->shadow + page * t->pageSize;
+        for (std::uint32_t s = 0; s < t->segmentCount[page]; ++s)
+        {
+            const Segment& segment = t->segments[t->segmentFirst[page] + s];
+            const std::uint32_t end = segment.offset + segment.bytes;
+            std::uint32_t i = segment.offset;
+            while (i < end)
+            {
+                if (live[i] == saved[i])
+                {
+                    ++i;
+                    continue;
+                }
+                const std::uint32_t run = i;
+                while (i < end && live[i] != saved[i]) ++i;
+                visit(reinterpret_cast<std::uintptr_t>(live + run), i - run, context);
+            }
+        }
+    };
+    for (std::size_t h = 0; h < t->hotCount; ++h)
+        if (Differs(*t, t->hotList[h], PageAddress(*t, t->hotList[h]))) scan(t->hotList[h]);
+    for (std::size_t page = 0; page < t->pages; ++page)
+        if (!t->hot[page] && __atomic_load_n(&t->faulted[page], __ATOMIC_ACQUIRE)) scan(page);
+}
+
 const RollbackSnapshotStats& RollbackSnapshotStatistics()
 {
     static const RollbackSnapshotStats none{};
