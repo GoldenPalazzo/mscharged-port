@@ -349,6 +349,7 @@ struct State
     // RECHARGED_ROLLBACK: network matches that predict.
     bool netplay;
     int inputDelay;
+    unsigned fakeDesyncFrom; // RECHARGED_ROLLBACK_TEST_DESYNC
     StepInputs inputs[kInputRing];
     unsigned lastInputFrame;          // the last step whose inputs were applied
     unsigned firstPredicted[kMachines]; // by machine: its first step still predicted, 0: none
@@ -370,6 +371,9 @@ struct State
     std::uint64_t predictedSteps, lockstepWaits, windowWaits, mispredictions[kMachines], correctionRollbacks;
     std::uint64_t undone, truncated, impossible, desyncs, remoteChecks, predictedDepth[kMaxDepth + 1];
     unsigned firstDesyncFrame;
+    // This match's first divergence, for the game's own sync error.
+    unsigned matchDesyncFrame;
+    bool matchDesync, seedDesync, desyncShown;
     // The time sync: by machine, how far ahead its inputs come here (messages
     // queued, less steps predicted; smoothed), and the same as it measures
     // ours. Half the difference is how far this machine runs ahead of it.
@@ -1538,6 +1542,9 @@ bool RollBack(unsigned target, unsigned replayEnd, int (*replay)(const Mscharged
 // with that machine's last inputs that did, and when its message arrives (at
 // the start of a frame) and says otherwise, the match goes back before the
 // first step it got wrong and runs again with what arrived.
+// RECHARGED_ROLLBACK_TEST_DESYNC=<n> (a test aid) has this machine's
+// checksums say otherwise from step n of each match: every machine shows
+// the game's sync error.
 
 NetworkInputRouter* Router()
 {
@@ -1739,7 +1746,8 @@ void UpdateConfirmed()
     for (unsigned f = from; f <= through && f + kRing > s.latest; ++f)
     {
         const Step& step = s.steps[f % kRing];
-        if (step.frame == f) s.history[f % kConfirmedRing] = {f, step.checksum, step.seed, -1};
+        if (step.frame == f)
+            s.history[f % kConfirmedRing] = {f, step.checksum ^ (s.fakeDesyncFrom && f >= s.fakeDesyncFrom), step.seed, -1};
     }
     if (!s.haveConfirmed || through > s.confirmed)
     {
@@ -1761,6 +1769,12 @@ void UpdateConfirmed()
         if (ours.checksum != remote.checksum || ours.seed != remote.seed)
         {
             if (!s.desyncs) s.firstDesyncFrame = remote.frame;
+            if (!s.matchDesync)
+            {
+                s.matchDesync = true;
+                s.matchDesyncFrame = remote.frame;
+                s.seedDesync = ours.checksum == remote.checksum;
+            }
             if (s.desyncs++ < kListedMismatches)
                 std::fprintf(s.out, "DESYNC at frame %u: checksum %08x seed %08x here, %08x %08x on machine %d\n",
                              remote.frame, ours.checksum, ours.seed, remote.checksum, remote.seed, remote.machine);
@@ -1919,6 +1933,17 @@ void NetplayFrameStart()
     Resolve();
     UpdateConfirmed();
     SyncTime();
+    // A divergence ends the match as the game's own check did (which the
+    // prediction bypasses): the network error, kept by objects no rollback
+    // restores.
+    if (s.matchDesync && !s.desyncShown)
+    {
+        s.desyncShown = true;
+        if (s.seedDesync)
+            gNetworkSyncState->OnRandomSeedMismatch(static_cast<int>(s.matchDesyncFrame));
+        else
+            gNetworkSyncState->OnChecksumMismatch(static_cast<int>(s.matchDesyncFrame));
+    }
 }
 
 void* Watchdog(void*)
@@ -2002,6 +2027,7 @@ struct Install
             sAuditing = sAuditStacks != nullptr;
         }
         state->inputDelay = EnvInt("RECHARGED_ROLLBACK_DELAY", 1, 0, 8);
+        state->fakeDesyncFrom = static_cast<unsigned>(EnvInt("RECHARGED_ROLLBACK_TEST_DESYNC", 0, 0, 1 << 30));
         if (netplay) state->compareEvery = 0;
         if (state->compareEvery)
         {
@@ -2211,6 +2237,7 @@ extern "C" int mscharged_rollback_network_reset(void)
     std::lock_guard lock(sMutex);
     State& s = *sState;
     if (s.active) Stop("a new match");
+    s.matchDesync = s.desyncShown = false;
     for (StepInputs& inputs : s.inputs) inputs.frame = ~0u;
     s.lastInputFrame = 0;
     std::fill(std::begin(s.firstPredicted), std::end(s.firstPredicted), 0u);
