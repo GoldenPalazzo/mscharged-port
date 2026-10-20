@@ -71,6 +71,7 @@ extern "C" int mscharged_rollback_network_reset(void) { return 4; }
 extern "C" bool mscharged_rollback_has_input(void) { return true; }
 extern "C" void mscharged_rollback_input_ready(void) {}
 extern "C" bool mscharged_rollback_can_capture(void) { return true; }
+extern "C" int mscharged_rollback_extra_captures(void) { return 0; }
 extern "C" int mscharged_rollback_sync_data(unsigned*, unsigned*, unsigned*) { return 0; }
 #else
 #include "Game/Audio/AudioBackend.h"
@@ -158,6 +159,8 @@ constexpr int kInputRing = 32;           // RECHARGED_ROLLBACK: steps whose inpu
 constexpr int kConfirmedRing = 64;       // RECHARGED_ROLLBACK: checksums of steps whose inputs all arrived
 constexpr int kRemoteChecks = 32;        // RECHARGED_ROLLBACK: other machines' checksums waiting for ours
 constexpr unsigned kSettleSteps = 25;    // RECHARGED_ROLLBACK: steps after tracking starts that predict nothing
+constexpr int kMaxInputDelay = 6;        // RECHARGED_ROLLBACK: steps
+constexpr unsigned kDelayEvery = 100;    // RECHARGED_ROLLBACK: steps between changes of the input delay
 
 // What a replayed frame does with each task: run it as it ran, leave it out
 // (pads, sound, network, disc, movies, saving), or its replay part.
@@ -364,6 +367,14 @@ struct State
     // ours. Half the difference is how far this machine runs ahead of it.
     float queuedAhead[kMachines], reportedAhead[kMachines];
     bool haveReported[kMachines];
+    int reportedDelay[kMachines]; // each machine's input delay, as it reports it
+    // The input delay: this machine's own, in steps, which it lengthens (one
+    // message more) or shortens (one capture less) so that the others predict
+    // its inputs about a step; at least the starting one.
+    int delay;
+    int delayChange;              // +1 or -1 for the next capture
+    unsigned delayChangedAt;
+    std::uint64_t delayLonger, delayShorter;
     float lead;       // steps this machine runs ahead of the furthest behind
     bool slowing;
     double slowedSeconds, leadSum, maxLead;
@@ -627,6 +638,9 @@ void WriteSummary()
                            "%llu; waits for inputs: as the original router %llu, prediction window full %llu\n",
                      static_cast<unsigned long long>(s.undone), static_cast<unsigned long long>(s.truncated),
                      static_cast<unsigned long long>(s.lockstepWaits), static_cast<unsigned long long>(s.windowWaits));
+        std::fprintf(file, "input delay now %d steps (from %d), lengthened %llu times, shortened %llu\n", s.delay,
+                     s.inputDelay, static_cast<unsigned long long>(s.delayLonger),
+                     static_cast<unsigned long long>(s.delayShorter));
         std::fprintf(file, "replayed steps not saved (no rollback could go back to them) %llu\n",
                      static_cast<unsigned long long>(s.savesSkipped));
         std::fprintf(file, "time sync: ahead of the others by %.2f steps now, %.2f on average, %.2f at most; "
@@ -1558,7 +1572,10 @@ void NoteSync(int machine, const NetMessageInput& message)
     if (machine == g_pNetworkSessionBase->GetLocalMachineId()) return;
     if ((message.mFlags & 6) == 2)
     {
-        s.reportedAhead[machine] = static_cast<float>(static_cast<std::int32_t>(message.mFrame)) / 256.0f;
+        // The input delay in the top byte, the measure in 256ths below it.
+        const std::int32_t measure = static_cast<std::int32_t>(message.mFrame << 8) >> 8;
+        s.reportedAhead[machine] = static_cast<float>(measure) / 256.0f;
+        s.reportedDelay[machine] = static_cast<int>(message.mFrame >> 24);
         s.haveReported[machine] = true;
         return;
     }
@@ -1707,13 +1724,39 @@ void Resolve()
     RollBack(earliest - 1, s.latest, s.replay, s.checksum);
 }
 
+// The input delay: how far ahead of need the others get this machine's
+// inputs (as they report it) tells whether they predict them for long. More
+// than a step and a half: a step more of delay; more than three quarters of a
+// step early: a step less, down to the starting delay. A change at most every
+// two seconds, which the measures need to follow it.
+void ChooseDelay()
+{
+    State& s = *sState;
+    if (s.delayChange || CurrentStep() < s.delayChangedAt + kDelayEvery) return;
+    float worst = 1e9f;
+    bool any = false;
+    for (int machine = 0; machine < MachineCount(); ++machine)
+        if (machine != g_pNetworkSessionBase->GetLocalMachineId() && s.haveReported[machine])
+        {
+            worst = std::min(worst, s.reportedAhead[machine]);
+            any = true;
+        }
+    if (!any) return;
+    if (worst < -1.5f && s.delay < kMaxInputDelay)
+        s.delayChange = 1;
+    else if (worst > 0.75f && s.delay > s.inputDelay)
+        s.delayChange = -1;
+}
+
 // The time sync. A machine that runs ahead predicts the others' inputs for
 // longer, and rolls back further, than one behind it, which gets their inputs
 // early. Each machine measures how far ahead of it each other machine's
-// inputs come (messages waiting less steps predicted: the input delay less
-// the latency less how far it runs ahead), and sends what it measures; half
-// the difference between the two measures is how far it runs ahead, the
-// latency cancelled. The one ahead slows its steps by a tenth until even.
+// inputs come (messages waiting less steps predicted: that machine's input
+// delay less the latency less how far this one runs ahead), and sends what
+// it measures with its own delay; half the difference between the two
+// measures, the delays taken out, is how far it runs ahead, the latency
+// cancelled. The one ahead by more than three quarters of a step slows its
+// steps by a tenth until within a quarter.
 void SyncTime()
 {
     State& s = *sState;
@@ -1728,15 +1771,17 @@ void SyncTime()
                                   : static_cast<float>(router->m_InputQueue[machine].GetCount());
         s.queuedAhead[machine] += (ahead - s.queuedAhead[machine]) * 0.05f;
         if (s.haveReported[machine])
-            s.lead = std::max(s.lead, (s.reportedAhead[machine] - s.queuedAhead[machine]) / 2);
+            s.lead = std::max(s.lead, (s.reportedAhead[machine] - s.queuedAhead[machine]
+                                       - static_cast<float>(s.delay - s.reportedDelay[machine])) / 2);
     }
     if (!s.active || !PredictablePhases(CurrentPhases())) return;
+    ChooseDelay();
     s.leadSum += s.lead;
     s.maxLead = std::max(s.maxLead, static_cast<double>(s.lead));
     ++s.leadSamples;
-    if (s.lead > 0.5f)
+    if (s.lead > 0.75f)
         s.slowing = true;
-    else if (s.lead < 0.2f)
+    else if (s.lead < 0.25f)
         s.slowing = false;
     if (!s.slowing) return;
     auto* fixed = static_cast<FixedUpdateTask*>(s.tasks[fixedIndexOf()]);
@@ -2078,6 +2123,9 @@ extern "C" int mscharged_rollback_network_reset(void)
     s.remoteCount = 0;
     std::fill(std::begin(s.queuedAhead), std::end(s.queuedAhead), 0.0f);
     std::fill(std::begin(s.haveReported), std::end(s.haveReported), false);
+    s.delay = s.inputDelay;
+    s.delayChange = 0;
+    s.delayChangedAt = 0;
     s.lead = 0;
     s.slowing = false;
     std::fprintf(s.out, "network match: input delay %d steps\n", s.inputDelay);
@@ -2175,7 +2223,31 @@ extern "C" bool mscharged_rollback_can_capture(void)
     if (s.captured && frame <= s.capturedFrame) return false;
     s.captured = true;
     s.capturedFrame = frame;
+    if (s.delayChange < 0)
+    {
+        // One step less of input delay: this step's capture is left out.
+        s.delayChange = 0;
+        --s.delay;
+        s.delayChangedAt = frame;
+        ++s.delayShorter;
+        std::fprintf(s.out, "input delay %d steps from frame %u\n", s.delay, frame);
+        return false;
+    }
     return true;
+}
+
+extern "C" int mscharged_rollback_extra_captures(void)
+{
+    std::lock_guard lock(sMutex);
+    State& s = *sState;
+    if (s.delayChange <= 0) return 0;
+    // One step more: the same inputs once more.
+    s.delayChange = 0;
+    ++s.delay;
+    s.delayChangedAt = CurrentStep();
+    ++s.delayLonger;
+    std::fprintf(s.out, "input delay %d steps from frame %u\n", s.delay, s.delayChangedAt);
+    return 1;
 }
 
 extern "C" int mscharged_rollback_sync_data(unsigned* checksum, unsigned* frame, unsigned* seed)
@@ -2201,7 +2273,8 @@ extern "C" int mscharged_rollback_sync_data(unsigned* checksum, unsigned* frame,
             ahead += s.queuedAhead[machine];
             ++others;
         }
-    *frame = static_cast<unsigned>(static_cast<std::int32_t>(std::lround(ahead / std::max(others, 1) * 256.0f)));
+    const auto measure = static_cast<std::int32_t>(std::lround(ahead / std::max(others, 1) * 256.0f));
+    *frame = (static_cast<unsigned>(s.delay) << 24) | (static_cast<unsigned>(measure) & 0xFFFFFFu);
     return 2;
 }
 
