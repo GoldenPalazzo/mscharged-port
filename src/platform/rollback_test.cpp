@@ -69,6 +69,9 @@ extern "C" void mscharged_rollback_between_steps(int (*)(const MschargedRollback
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <dlfcn.h>
+#include <execinfo.h>
+#include <typeinfo>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -551,6 +554,32 @@ void* Watchdog(void*)
     }
 }
 
+// The game module's own code that throws, logged while the test runs: the
+// runtime only reports what() when the game stops.
+constexpr int kListedThrows = 8;
+int sThrows;
+
+void LogThrow(const std::type_info* type)
+{
+    State& s = *sState;
+    void* frames[24];
+    const int depth = backtrace(frames, 24);
+    Dl_info self{};
+    dladdr(reinterpret_cast<void*>(&LogThrow), &self);
+    std::fprintf(s.out, "THROW %s at frame %u, call stack in the game module:", type ? type->name() : "?",
+                 s.latest);
+    for (int i = 2; i < depth; ++i)
+    {
+        Dl_info info{};
+        if (dladdr(frames[i], &info) && info.dli_fbase == self.dli_fbase)
+            std::fprintf(s.out, " +0x%lx",
+                         static_cast<unsigned long>(reinterpret_cast<std::uintptr_t>(frames[i])
+                                                    - reinterpret_cast<std::uintptr_t>(self.dli_fbase) - 1));
+    }
+    std::fprintf(s.out, "\n");
+    std::fflush(s.out);
+}
+
 struct Install
 {
     Install()
@@ -664,5 +693,16 @@ extern "C" void mscharged_rollback_between_steps(int (*replay)(const MschargedRo
             ++s.skippedShort;
     }
     if (s.stepCount % kSummaryEvery == 0) WriteSummary();
+}
+// Calls to __cxa_throw from the game module bind to this one (hidden), which
+// logs the throw and goes on to the C++ runtime's.
+extern "C" __attribute__((visibility("hidden"), noreturn)) void __cxa_throw(void* thrown, std::type_info* type,
+                                                                           void (*destroy)(void*))
+{
+    if (sState && sState->out && sState->active && sThrows++ < kListedThrows) LogThrow(type);
+    using Throw = void (*)(void*, std::type_info*, void (*)(void*));
+    static const Throw next = reinterpret_cast<Throw>(dlsym(RTLD_DEFAULT, "__cxa_throw"));
+    next(thrown, type, destroy);
+    __builtin_unreachable();
 }
 #endif
