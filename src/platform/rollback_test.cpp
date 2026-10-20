@@ -168,7 +168,7 @@ constexpr int kConfirmedRing = 64;       // RECHARGED_ROLLBACK: checksums of ste
 constexpr int kRemoteChecks = 32;        // RECHARGED_ROLLBACK: other machines' checksums waiting for ours
 constexpr unsigned kSettleSteps = 25;    // RECHARGED_ROLLBACK: steps after tracking starts that predict nothing
 constexpr int kMaxInputDelay = 6;        // RECHARGED_ROLLBACK: steps
-constexpr unsigned kDelayEvery = 100;    // RECHARGED_ROLLBACK: steps between changes of the input delay
+constexpr unsigned kDelayEvery = 150;    // RECHARGED_ROLLBACK: steps between changes of the input delay
 
 // What a replayed frame does with each task: run it as it ran, leave it out
 // (pads, sound, network, disc, movies, saving), or its replay part.
@@ -1817,9 +1817,10 @@ void Resolve()
 
 // The input delay: how far ahead of need the others get this machine's
 // inputs (as they report it) tells whether they predict them for long. More
-// than a step and a half: a step more of delay; more than three quarters of a
-// step early: a step less, down to the starting delay. A change at most every
-// two seconds, which the measures need to follow it.
+// than a step and a half: a step more of delay; more than a step and a quarter
+// early: a step less, down to the starting delay (a step's change moves the
+// measure by a step: it cannot cross back). A change at most every three
+// seconds, which the measures need to follow it.
 void ChooseDelay()
 {
     State& s = *sState;
@@ -1835,7 +1836,7 @@ void ChooseDelay()
     if (!any) return;
     if (worst < -1.5f && s.delay < kMaxInputDelay)
         s.delayChange = 1;
-    else if (worst > 0.75f && s.delay > s.inputDelay)
+    else if (worst > 1.25f && s.delay > s.inputDelay)
         s.delayChange = -1;
 }
 
