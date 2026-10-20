@@ -71,7 +71,7 @@ extern "C" int mscharged_rollback_network_reset(void) { return 4; }
 extern "C" bool mscharged_rollback_has_input(void) { return true; }
 extern "C" void mscharged_rollback_input_ready(void) {}
 extern "C" bool mscharged_rollback_can_capture(void) { return true; }
-extern "C" bool mscharged_rollback_sync_data(unsigned*, unsigned*, unsigned*) { return false; }
+extern "C" int mscharged_rollback_sync_data(unsigned*, unsigned*, unsigned*) { return 0; }
 #else
 #include "Game/Audio/AudioBackend.h"
 #include "Game/Game.h"
@@ -352,6 +352,15 @@ struct State
     std::uint64_t predictedSteps, lockstepWaits, windowWaits, mispredictions[kMachines], correctionRollbacks;
     std::uint64_t undone, truncated, impossible, desyncs, remoteChecks, predictedDepth[kMaxDepth + 1];
     unsigned firstDesyncFrame;
+    // The time sync: by machine, how far ahead its inputs come here (messages
+    // queued, less steps predicted; smoothed), and the same as it measures
+    // ours. Half the difference is how far this machine runs ahead of it.
+    float queuedAhead[kMachines], reportedAhead[kMachines];
+    bool haveReported[kMachines];
+    float lead;       // steps this machine runs ahead of the furthest behind
+    bool slowing;
+    double slowedSeconds, leadSum, maxLead;
+    std::uint64_t leadSamples;
 };
 State* sState;
 std::mutex sMutex; // the hooks (main thread) and the watchdog
@@ -611,6 +620,10 @@ void WriteSummary()
                            "%llu; waits for inputs: as the original router %llu, prediction window full %llu\n",
                      static_cast<unsigned long long>(s.undone), static_cast<unsigned long long>(s.truncated),
                      static_cast<unsigned long long>(s.lockstepWaits), static_cast<unsigned long long>(s.windowWaits));
+        std::fprintf(file, "time sync: ahead of the others by %.2f steps now, %.2f on average, %.2f at most; "
+                           "slowed by %.2f s in all\n",
+                     s.lead, s.leadSamples ? s.leadSum / static_cast<double>(s.leadSamples) : 0.0, s.maxLead,
+                     s.slowedSeconds);
     }
     else
         std::fprintf(file, "rollback test: up to %d steps back every %d steps\n", s.maxDepth, s.interval);
@@ -1504,7 +1517,14 @@ void Mirror(int machine, const MachineInput& input)
 void NoteSync(int machine, const NetMessageInput& message)
 {
     State& s = *sState;
-    if (!(message.mFlags & 4) || machine == g_pNetworkSessionBase->GetLocalMachineId()) return;
+    if (machine == g_pNetworkSessionBase->GetLocalMachineId()) return;
+    if ((message.mFlags & 6) == 2)
+    {
+        s.reportedAhead[machine] = static_cast<float>(static_cast<std::int32_t>(message.mFrame)) / 256.0f;
+        s.haveReported[machine] = true;
+        return;
+    }
+    if (!(message.mFlags & 4)) return;
     if (s.remoteCount == kRemoteChecks)
     {
         std::memmove(s.remote, s.remote + 1, sizeof(s.remote[0]) * (kRemoteChecks - 1));
@@ -1642,6 +1662,44 @@ void Resolve()
     RollBack(earliest - 1, s.latest, s.replay, s.checksum);
 }
 
+// The time sync. A machine that runs ahead predicts the others' inputs for
+// longer, and rolls back further, than one behind it, which gets their inputs
+// early. Each machine measures how far ahead of it each other machine's
+// inputs come (messages waiting less steps predicted: the input delay less
+// the latency less how far it runs ahead), and sends what it measures; half
+// the difference between the two measures is how far it runs ahead, the
+// latency cancelled. The one ahead slows its steps by a tenth until even.
+void SyncTime()
+{
+    State& s = *sState;
+    NetworkInputRouter* router = Router();
+    const int local = g_pNetworkSessionBase->GetLocalMachineId();
+    s.lead = 0;
+    for (int machine = 0; machine < MachineCount(); ++machine)
+    {
+        if (machine == local) continue;
+        const unsigned first = s.firstPredicted[machine];
+        const float ahead = first ? -static_cast<float>(s.lastInputFrame - first + 1)
+                                  : static_cast<float>(router->m_InputQueue[machine].GetCount());
+        s.queuedAhead[machine] += (ahead - s.queuedAhead[machine]) * 0.05f;
+        if (s.haveReported[machine])
+            s.lead = std::max(s.lead, (s.reportedAhead[machine] - s.queuedAhead[machine]) / 2);
+    }
+    if (!s.active || !PredictablePhases(CurrentPhases())) return;
+    s.leadSum += s.lead;
+    s.maxLead = std::max(s.maxLead, static_cast<double>(s.lead));
+    ++s.leadSamples;
+    if (s.lead > 0.5f)
+        s.slowing = true;
+    else if (s.lead < 0.2f)
+        s.slowing = false;
+    if (!s.slowing) return;
+    auto* fixed = static_cast<FixedUpdateTask*>(s.tasks[fixedIndexOf()]);
+    const float removed = 0.1f * std::max(Frame(s.hostFrame).dt[fixedIndexOf()], 0.0f);
+    fixed->mAccumulatedDeltaT -= removed;
+    s.slowedSeconds += removed;
+}
+
 // RECHARGED_ROLLBACK, at the start of a frame, before any task sets up its
 // cameras and views.
 void NetplayFrameStart()
@@ -1678,6 +1736,7 @@ void NetplayFrameStart()
     }
     Resolve();
     UpdateConfirmed();
+    SyncTime();
 }
 
 void* Watchdog(void*)
@@ -1972,6 +2031,10 @@ extern "C" int mscharged_rollback_network_reset(void)
     s.waitThrough = s.undoFrom = 0;
     s.captured = s.haveConfirmed = false;
     s.remoteCount = 0;
+    std::fill(std::begin(s.queuedAhead), std::end(s.queuedAhead), 0.0f);
+    std::fill(std::begin(s.haveReported), std::end(s.haveReported), false);
+    s.lead = 0;
+    s.slowing = false;
     std::fprintf(s.out, "network match: input delay %d steps\n", s.inputDelay);
     std::fflush(s.out);
     return s.inputDelay;
@@ -2070,17 +2133,31 @@ extern "C" bool mscharged_rollback_can_capture(void)
     return true;
 }
 
-extern "C" bool mscharged_rollback_sync_data(unsigned* checksum, unsigned* frame, unsigned* seed)
+extern "C" int mscharged_rollback_sync_data(unsigned* checksum, unsigned* frame, unsigned* seed)
 {
     std::lock_guard lock(sMutex);
     const State& s = *sState;
-    if (!s.haveConfirmed) return false;
-    const SyncPoint& point = s.history[s.confirmed % kConfirmedRing];
-    if (point.frame != s.confirmed) return false;
-    *checksum = point.checksum;
-    *frame = point.frame;
-    *seed = point.seed;
-    return true;
+    // Every other step the checksum, the others the time sync's measure (the
+    // other machines' average, by 256ths of a step).
+    if (CurrentStep() % 2 == 0 && s.haveConfirmed)
+    {
+        const SyncPoint& point = s.history[s.confirmed % kConfirmedRing];
+        if (point.frame != s.confirmed) return 0;
+        *checksum = point.checksum;
+        *frame = point.frame;
+        *seed = point.seed;
+        return 1;
+    }
+    float ahead = 0;
+    int others = 0;
+    for (int machine = 0; machine < MachineCount(); ++machine)
+        if (machine != g_pNetworkSessionBase->GetLocalMachineId())
+        {
+            ahead += s.queuedAhead[machine];
+            ++others;
+        }
+    *frame = static_cast<unsigned>(static_cast<std::int32_t>(std::lround(ahead / std::max(others, 1) * 256.0f)));
+    return 2;
 }
 
 // Calls to __cxa_throw from the game module bind to this one (hidden), which
