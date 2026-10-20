@@ -1916,11 +1916,11 @@ extern "C" void mscharged_synctest_fixed_step(int running)
     AuditWindow(kOutsideSteps);
 }
 
-// The rollback test (rollback_test.cpp) keeps the simulation silent too, and
-// uses the deterministic AI clocks.
+// The rollback test (rollback_test.cpp) keeps the whole game silent, menus
+// included, and uses the deterministic AI clocks.
 extern "C" bool mscharged_synctest_silences_sounds(void)
 {
-    return ((sState && sState->out && !sState->audit) || mscharged_rollback_active()) && sInFixedStep;
+    return (sState && sState->out && !sState->audit && sInFixedStep) || mscharged_rollback_active();
 }
 
 extern "C" bool mscharged_synctest_active(void)
