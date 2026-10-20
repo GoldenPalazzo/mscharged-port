@@ -11,6 +11,7 @@
 #include <map>
 #include <set>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -169,18 +170,46 @@ struct Allocation
     MemoryStorageSpans memory_storage;
     HeapMetadataRecords heap_metadata;
     DeviceLease device;
+    std::uint64_t saved_epoch = 0; // the checkpoint epoch its facts were last copied in
 };
 using Records = std::map<std::uintptr_t, Allocation, std::less<std::uintptr_t>,
     HostMetadataAllocator<std::pair<const std::uintptr_t, Allocation>>>;
+// The facts of an allocation a rollback restores: what its bytes hold, its
+// unfinished producers, graphics suballocations and MEM children.
+struct Facets
+{
+    ByteSpans byte_spans;
+    PendingWrites pending_writes;
+    GraphicsStorageSpans graphics_storage;
+    MemoryStorageSpans memory_storage;
+};
+ByteSpans::node_type CloneNode(const ByteSpans::node_type& node)
+{
+    if (node.empty()) return {};
+    ByteSpans temporary;
+    temporary.emplace(node.key(), node.mapped());
+    return temporary.extract(node.key());
+}
+// GraphicsStorage holds a node handle, which a map copy cannot copy.
+GraphicsStorageSpans CloneGraphics(const GraphicsStorageSpans& spans)
+{
+    GraphicsStorageSpans copy;
+    for (const auto& [base, storage] : spans)
+        copy.emplace(base, GraphicsStorage{storage.bytes, storage.incarnation, CloneNode(storage.native_publication),
+                                           storage.array_bounds, storage.array_aliases, storage.rewound});
+    return copy;
+}
 using HeapOwners = std::set<std::uintptr_t, std::less<std::uintptr_t>, HostMetadataAllocator<std::uintptr_t>>;
-// Sync test checkpoint: an allocation (empty node) or a free (the record it
-// removed), undone in reverse order after the arenas were restored. A lossy
-// free erased a record that cannot be undone.
+// Rollback checkpoint: an allocation (empty node), a free (the record it
+// removed) or an allocation's facts before their first change after a mark,
+// undone in reverse order after the arenas were restored. A lossy free erased
+// a record that cannot be undone.
 struct CheckpointEntry
 {
     std::uintptr_t key;
     Records::node_type removed;
     bool lossy = false;
+    std::optional<Facets> facets;
 };
 using CheckpointJournal = std::vector<CheckpointEntry, HostMetadataAllocator<CheckpointEntry>>;
 struct Registry
@@ -198,6 +227,10 @@ struct Registry
     std::uint64_t next_memory_incarnation = 1;
     bool checkpoint = false;
     CheckpointJournal journal;
+    std::size_t journal_base = 0;  // entries trimmed from its front
+    std::uint64_t epoch = 0;       // advanced by Begin, every mark and every rollback
+    bool (*keep)(std::uintptr_t address) = nullptr; // memory the rollback leaves alone
+    std::uint64_t copies = 0, untracked = 0, failed_copies = 0;
     std::uint64_t checkpoint_incarnation = 0;
     std::uint64_t byte_writes_started = 0;
 };
@@ -298,6 +331,31 @@ GameAllocationSpan Describe(Records::iterator found)
 {
     return {reinterpret_cast<void*>(found->first), found->second.bytes,
             found->second.owner, found->second.incarnation};
+}
+// Before an allocation's facts change: the first change after a mark copies
+// them into the journal, which a rollback puts back. Memory a rollback leaves
+// alone keeps its facts as they are.
+void Preserve(Registry& state, std::uintptr_t key, Allocation& allocation)
+{
+    if (!state.checkpoint || allocation.saved_epoch == state.epoch || (state.keep && state.keep(key))) return;
+    CheckpointEntry entry{key, {}};
+    entry.facets.emplace(Facets{allocation.byte_spans, allocation.pending_writes,
+                                CloneGraphics(allocation.graphics_storage), allocation.memory_storage});
+    state.journal.push_back(std::move(entry));
+    allocation.saved_epoch = state.epoch;
+    ++state.copies;
+}
+void Preserve(Registry& state, Records::iterator record) { Preserve(state, record->first, record->second); }
+// Where nothing may throw: a failed copy is counted, the rollback past it is wrong.
+void PreserveNoThrow(Registry& state, Records::iterator record) noexcept
+{
+    try { Preserve(state, record); }
+    catch (...) { ++state.failed_copies; }
+}
+// A change the journal does not follow (native data, MEM headers, device leases).
+void Untracked(Registry& state, std::uintptr_t key)
+{
+    if (state.checkpoint && !(state.keep && state.keep(key))) ++state.untracked;
 }
 struct HeapFound { Records::iterator allocation; HeapMetadataRecords::iterator heap; };
 HeapFound HeapOwner(Registry& state,const void* owner) {
@@ -632,6 +690,8 @@ void GameAllocationReservation::Commit(void* pointer)
             pending.record = std::move(insertion.node);
             throw std::logic_error("Original allocator returned an already live allocation");
         }
+        // New in this epoch: a rollback to the last mark erases it whole.
+        insertion.position->second.saved_epoch = state.epoch;
         if (state.checkpoint) state.journal.push_back({reinterpret_cast<std::uintptr_t>(pointer), {}});
     }
     NotifyAllocationObserver(true, pointer, bytes, owner);
@@ -682,6 +742,7 @@ void GameAllocationDeviceReservation::Commit()
     if (found == state.records.end() || found->second.incarnation != pending.incarnation
         || found->second.device.data)
         throw std::invalid_argument("Game device source allocation was retired/reused");
+    Untracked(state, found->first);
     found->second.device = std::move(pending.lease);
 }
 void RetireGameAllocationDevicePins(const void* pointer)
@@ -691,6 +752,9 @@ void RetireGameAllocationDevicePins(const void* pointer)
     auto found = state.records.find(address);
     if (found == state.records.end())
         throw std::invalid_argument("Device pin retirement has no exact original allocation");
+    // Every original free comes here; count only a lease actually retired.
+    for (auto it = found; it != state.records.end() && it->first < address + found->second.bytes; ++it)
+        if (it->second.device.data) Untracked(state, it->first);
     RetireDeviceRange(state.records, address, found->second.bytes);
 }
 bool FindGameAllocationSpan(const void* pointer, std::size_t bytes, GameAllocationSpan& result)
@@ -797,6 +861,7 @@ void ProjectGameNativeHeaders(const void* source, std::size_t sourceBytes,
         publication.completed.mapped().graphics_native = false;
         reserved.push_back(std::move(publication));
     }
+    Preserve(state, owner);
     // No allocation follows this point. The one registry lock protects domain
     // publication; quiescent caller ownership protects actual payload reads.
     // Retiring native metadata invokes only the host metadata release boundary,
@@ -839,6 +904,7 @@ GameByteWriteReservation::GameByteWriteReservation(void* destination, std::size_
     if (next != writes.end() && Overlaps(next->first, next->second.bytes, address, physicalBytes))
         throw std::logic_error("Concurrent overlapping byte producers are unsupported");
     if (!owner->second.next_write) throw std::overflow_error("Byte write incarnation exhausted");
+    Preserve(state, owner);
     void* storage = ChargedNativeMetadataAllocate(sizeof(PendingBytes));
     PendingBytes* token = nullptr;
     try
@@ -903,7 +969,10 @@ void GameByteWriteReservation::Reset() noexcept
         {
             auto active = owner->second.pending_writes.find(token.completed.key());
             if (active != owner->second.pending_writes.end() && active->second.tag == token.tag)
+            {
+                PreserveNoThrow(state, owner);
                 owner->second.pending_writes.erase(active);
+            }
         }
     }
     token.~PendingBytes(); ChargedNativeMetadataRelease(pending_); pending_ = nullptr;
@@ -938,6 +1007,7 @@ void GameByteWriteReservation::Complete(GameByteDomain domain)
             || graphics->second.incarnation != token.graphics_incarnation)
             throw std::invalid_argument("Byte write graphics storage was retired or reused");
     }
+    Preserve(state, owner);
     auto& complete = token.completed.mapped();
     complete.domain = domain;
     if ((domain != GameByteDomain::WiiSerialized || token.preserve_origin) && token.has_prior_origin)
@@ -1200,6 +1270,7 @@ void GameHeapMetadataReservation::Commit(const void* sourceOwner) {
         }
     }
     token.record.key()=reinterpret_cast<std::uintptr_t>(sourceOwner);
+    Untracked(state,parent->first);
     state.heap_owners.insert(parent->first); // before the record: may throw; a spare owner is harmless
     auto inserted=parent->second.heap_metadata.insert(std::move(token.record));
     if(!inserted.inserted) {token.record=std::move(inserted.node);throw std::logic_error("MEM metadata owner conflict");}
@@ -1265,6 +1336,8 @@ void RetireGameHeapMetadata(const void* sourceOwner) {
     const auto& h=found.heap->second;
     ValidateHeapChildren(state,found,reinterpret_cast<const void*>(h.source),h.source_bytes);
     ValidateHeapStorageRetirement(found);
+    Preserve(state,found.allocation);
+    Untracked(state,found.allocation->first);
     auto& parent=found.allocation->second;
     for(auto i=parent.memory_storage.begin();i!=parent.memory_storage.end();) {
         auto current=i++;
@@ -1305,6 +1378,7 @@ void GameMemoryStorageReservation::Commit(void* pointer) {
         if(Overlaps(base,span.bytes,address,bytes))throw std::invalid_argument("MEM allocation overlaps live graphics storage");
     for(const auto& [base,span]:parent->second.pending_writes)
         if(Overlaps(base,span.bytes,address,bytes))throw std::invalid_argument("MEM allocation overlaps unfinished producer");
+    Preserve(state,parent);
     RetireByteRange(parent->second,address,bytes,token.split);
     RetireNativeBackings(parent->second,address,bytes);
     token.record.key()=address;
@@ -1325,6 +1399,7 @@ void RetireGameMemoryStorage(const void* sourceOwner,const void* pointer) {
     auto child=parent->second.memory_storage.find(address);
     if(child==parent->second.memory_storage.end() || child->second.owner!=sourceOwner)
         throw std::invalid_argument("MEM free requires its exact live source heap child");
+    Preserve(state,parent);
     RetireMemory(parent->second,child);
 }
 void RetireGameMemoryStorageOwner(const void* sourceOwner) {
@@ -1332,7 +1407,9 @@ void RetireGameMemoryStorageOwner(const void* sourceOwner) {
     for(auto& [base,parent]:state.records) {
         for(auto child=parent.memory_storage.begin();child!=parent.memory_storage.end();) {
             auto current=child++;
-            if(current->second.owner==sourceOwner)RetireMemory(parent,current);
+            if(current->second.owner!=sourceOwner)continue;
+            Preserve(state,base,parent);
+            RetireMemory(parent,current);
         }
     }
 }
@@ -1384,6 +1461,7 @@ void GameGraphicsStorageReservation::Commit(void* pointer)
         if (last->first < retireBase) retireBase = last->first;
         if (last->first + last->second.bytes > retireEnd) retireEnd = last->first + last->second.bytes;
     }
+    Preserve(state, owner);
     // Evicted rewound storage takes its stale completed bytes with it. The
     // union is contiguous, so the one reserved split node still suffices.
     RetireByteRange(owner->second, retireBase, retireEnd - retireBase, pending.split);
@@ -1424,6 +1502,7 @@ void RetireGraphicsRange(void* pending_, const void* pointer, std::size_t bytes,
         if (Overlaps(check->first, check->second.bytes, address, bytes)
             && !Contains(address, bytes, check->first, check->second.bytes))
             throw std::invalid_argument("Graphics rewind cuts through a live source suballocation");
+    Preserve(state, owner);
     auto& pending = *static_cast<PendingGraphicsRetirement*>(pending_);
     RetireByteRange(owner->second, address, bytes, pending.split);
     if (!keepRewound) { spans.erase(first, last); return; }
@@ -1469,6 +1548,7 @@ void PublishGameGraphicsNativeBytes(const void* base, const void* writtenEnd)
         if (Overlaps(activeBase, active.bytes, address, count))
             throw std::invalid_argument("Native stream overlaps an unfinished source byte producer");
     const ByteSpan ready{count, GameByteDomain::NativePayload, address, count, graphics->second.incarnation, true};
+    Preserve(state, owner);
     auto& prepared = graphics->second.native_publication;
     if (!prepared.empty())
     {
@@ -1516,6 +1596,7 @@ void RegisterGameGraphicsArray(const void* pointer, std::size_t bytes)
     if (!Completed(owner->second, address, bytes, completed)
         || (completed.domain != GameByteDomain::WiiSerialized && completed.domain != GameByteDomain::NativePayload))
         throw std::invalid_argument("Vertex stream leaves its completed original payload");
+    Preserve(state, owner);
     auto& bounds = graphics->second.array_bounds;
     auto next = bounds.lower_bound(address);
     if (next != bounds.end() && next->first == address)
@@ -1636,14 +1717,13 @@ void FinishGameAllocationFree(const void* pointer)
         bytes = found->second.bytes;
         if (state.checkpoint)
         {
-            // Keep the record whole for a rollback when it owns nothing but its
-            // bytes; a record with native children or data cannot be undone.
+            // Keep the record whole for a rollback, facts and all, unless it
+            // holds nested allocations, native data, MEM headers or a device
+            // lease, which cannot be undone.
             const Allocation& allocation = found->second;
             const auto next = std::next(found);
             const bool alone = next == state.records.end() || next->first >= address + bytes;
-            if (alone && allocation.byte_spans.empty() && allocation.pending_writes.empty()
-                && allocation.graphics_storage.empty() && allocation.native_backings.empty()
-                && allocation.memory_storage.empty() && allocation.heap_metadata.empty()
+            if (alone && allocation.native_backings.empty() && allocation.heap_metadata.empty()
                 && !allocation.device.data && !state.heap_owners.count(address))
             {
                 state.journal.push_back({address, state.records.extract(found)});
@@ -1663,27 +1743,63 @@ void SetGameAllocationObserver(GameAllocationObserver observer) noexcept
 {
     sAllocationObserver.store(observer, std::memory_order_release);
 }
-void BeginGameAllocationCheckpoint()
+void BeginGameAllocationCheckpoint(bool (*keep)(std::uintptr_t address))
 {
     auto& state = State();
     std::lock_guard lock(state.mutex);
     if (state.checkpoint) throw std::logic_error("Game allocation checkpoint already open");
     state.checkpoint = true;
     state.journal.clear();
+    state.journal_base = 0;
+    ++state.epoch;
+    state.keep = keep;
+    state.copies = state.untracked = state.failed_copies = 0;
     state.checkpoint_incarnation = state.next_incarnation;
 }
 namespace
 {
-// Undoes the journal back to position, newest first; returns the lossy frees.
+// Expanded native data whose source bytes, as restored, no longer complete
+// the producer it was made from: its consumer expands them again.
+void DropStaleNativeBackings(Allocation& allocation)
+{
+    for (auto i = allocation.native_backings.begin(); i != allocation.native_backings.end();)
+    {
+        ByteSpan origin{};
+        if (Completed(allocation, i->first, i->second.source_bytes, origin)
+            && origin.logical_tag == i->second.logical_tag)
+            ++i;
+        else
+            i = allocation.native_backings.erase(i);
+    }
+}
+// Undoes the journal back to position (counted from Begin), newest first;
+// returns the lossy frees.
 std::size_t UndoJournal(Registry& state, std::size_t position, bool (*keep)(std::uintptr_t address))
 {
-    if (position > state.journal.size()) throw std::logic_error("Game allocation mark beyond the journal");
+    if (position < state.journal_base || position - state.journal_base > state.journal.size())
+        throw std::logic_error("Game allocation mark outside the journal");
+    const std::size_t first = position - state.journal_base;
     std::size_t lossy = 0;
-    for (auto entry = state.journal.size(); entry-- > position;)
+    for (auto entry = state.journal.size(); entry-- > first;)
     {
         auto& undo = state.journal[entry];
         if (keep && keep(undo.key)) continue; // memory not restored: keep its records
-        if (undo.lossy)
+        if (undo.facets)
+        {
+            auto found = state.records.find(undo.key);
+            if (found == state.records.end())
+            {
+                ++lossy; // freed later by a free that could not be undone
+                continue;
+            }
+            auto& allocation = found->second;
+            allocation.byte_spans = std::move(undo.facets->byte_spans);
+            allocation.pending_writes = std::move(undo.facets->pending_writes);
+            allocation.graphics_storage = std::move(undo.facets->graphics_storage);
+            allocation.memory_storage = std::move(undo.facets->memory_storage);
+            DropStaleNativeBackings(allocation);
+        }
+        else if (undo.lossy)
             ++lossy;
         else if (undo.removed)
         {
@@ -1696,7 +1812,8 @@ std::size_t UndoJournal(Registry& state, std::size_t position, bool (*keep)(std:
             if (found != state.records.end()) EraseBackingRange(state, undo.key, found->second.bytes);
         }
     }
-    state.journal.erase(state.journal.begin() + static_cast<std::ptrdiff_t>(position), state.journal.end());
+    state.journal.erase(state.journal.begin() + static_cast<std::ptrdiff_t>(first), state.journal.end());
+    ++state.epoch; // changes from here copy again
     return lossy;
 }
 }
@@ -1705,8 +1822,10 @@ std::size_t RollbackGameAllocationCheckpoint(bool (*keep)(std::uintptr_t address
     auto& state = State();
     std::lock_guard lock(state.mutex);
     if (!state.checkpoint) throw std::logic_error("No game allocation checkpoint to roll back");
+    if (state.journal_base) throw std::logic_error("A trimmed checkpoint cannot return to its beginning");
     const std::size_t lossy = UndoJournal(state, 0, keep);
     state.next_incarnation = state.checkpoint_incarnation;
+    state.keep = nullptr;
     state.checkpoint = false;
     return lossy;
 }
@@ -1715,7 +1834,25 @@ GameAllocationMark MarkGameAllocationCheckpoint()
     auto& state = State();
     std::lock_guard lock(state.mutex);
     if (!state.checkpoint) throw std::logic_error("No game allocation checkpoint to mark");
-    return {state.journal.size(), state.next_incarnation};
+    ++state.epoch; // the first change from here copies an allocation's facts
+    return {state.journal_base + state.journal.size(), state.next_incarnation};
+}
+void TrimGameAllocationCheckpoint(const GameAllocationMark& oldest)
+{
+    auto& state = State();
+    std::lock_guard lock(state.mutex);
+    if (!state.checkpoint) throw std::logic_error("No game allocation checkpoint to trim");
+    if (oldest.position <= state.journal_base) return;
+    const std::size_t count = oldest.position - state.journal_base;
+    if (count > state.journal.size()) throw std::logic_error("Game allocation mark beyond the journal");
+    state.journal.erase(state.journal.begin(), state.journal.begin() + static_cast<std::ptrdiff_t>(count));
+    state.journal_base = oldest.position;
+}
+GameAllocationCheckpointStats CurrentGameAllocationCheckpointStats()
+{
+    auto& state = State();
+    std::lock_guard lock(state.mutex);
+    return {state.copies, state.journal.size(), state.untracked, state.failed_copies};
 }
 std::size_t RollbackGameAllocationCheckpointTo(const GameAllocationMark& mark, bool (*keep)(std::uintptr_t address))
 {
@@ -1739,6 +1876,8 @@ void EndGameAllocationCheckpoint()
     auto& state = State();
     std::lock_guard lock(state.mutex);
     state.journal.clear();
+    state.journal_base = 0;
+    state.keep = nullptr;
     state.checkpoint = false;
 }
 void DiscardGameAllocatorRecords(MemoryAllocator& owner)
@@ -1748,6 +1887,7 @@ void DiscardGameAllocatorRecords(MemoryAllocator& owner)
     // Preflight all affected regions before retiring any unrelated record.
     for(const auto& [base,allocation]:state.records)
         if(allocation.owner==&owner)ValidateNoLiveHeapMetadata(state,base,allocation.bytes);
+    Untracked(state,reinterpret_cast<std::uintptr_t>(owner.m_memory)); // records erased outside the journal
     // Initialize replaces the original free-list backing. Walk without holding
     // iterators across descendant retirement; reset is infrequent and allocates
     // no native metadata.
