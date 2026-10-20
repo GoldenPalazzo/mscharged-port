@@ -15,8 +15,8 @@
 // manager, the pads, the tasks' clocks and the fixed update task's
 // accumulated time, the drawing's memory (frame memory and resource pools,
 // whose suballocations the port tracks for the host) with the bookkeeping of
-// the pools drawing fills every frame (cmake/rollback_sections.ld), and the
-// audio memory.
+// the pools drawing fills every frame (the goal nets' in cmake/rollback_sections.ld,
+// the crowd impostors' here), and the audio memory.
 // Everything else, the drawing's objects included, goes back with the match. A replayed step reads no pads, captures and sends
 // nothing, and queues no deterministic data (it went out the first time).
 //
@@ -47,6 +47,7 @@ extern "C" void mscharged_rollback_between_steps(int (*)(const MschargedRollback
 #include "Game/InputRouter.h"
 #include "Game/NetworkSession.h"
 #include "Game/NetworkSync.h"
+#include "Game/Render/ImpostorManager.h"
 #include "Game/Task/FixedUpdateTask.h"
 #include "NL/MemAlloc.h"
 #include "NL/globalpad.h"
@@ -58,6 +59,7 @@ extern "C" void mscharged_rollback_between_steps(int (*)(const MschargedRollback
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -284,6 +286,11 @@ void FindRanges(FixedUpdateTask* task, unsigned long taskBytes)
     const void* graphics[kMaxExcluded];
     const int graphicsCount = mscharged_rollback_graphics_memory(graphics, kMaxExcluded);
     for (int i = 0; i < graphicsCount; ++i) ExcludeAllocation(graphics[i], 0, "drawing memory");
+    // The crowd impostors fill one of two of those pools every frame and release the
+    // other to a mark: their pools, marks, turn and capture state stay together.
+    if (ImpostorManager* impostors = ImpostorManager::GetInstance())
+        Exclude(&impostors->mResources, sizeof(ImpostorManager) - offsetof(ImpostorManager, mResources),
+                "crowd impostors' pools and capture");
     // The clocks: each task's last run, and the time the fixed steps have still to catch up.
     if (nlTaskManager* manager = nlTaskManager::m_pInstance; manager && manager->mTaskList)
     {
