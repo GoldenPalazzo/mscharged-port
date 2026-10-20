@@ -60,6 +60,7 @@ extern "C" void mscharged_rollback_frame_start(void) {}
 #include "Game/Task/DispatchEventsTask.h"
 #include "Game/Task/FixedUpdateTask.h"
 #include "NL/MemAlloc.h"
+#include "NL/gl/glView.h"
 #include "NL/globalpad.h"
 #include "NL/nlMemory.h"
 #include "NL/nlTask.h"
@@ -571,6 +572,9 @@ void RollBack(int depth, int (*replay)(const MschargedRollbackInputs*), unsigned
     RollbackReplayFrontEnd(lastFrame);
     gDispatchEventsTask->Run(lastFrame);
     s.resimulating = false;
+    // The views went back to a frame whose packet sorters were in frame memory,
+    // reused since: empty them, as the end of every frame does.
+    gl_ViewReset();
     ++s.rollbacks;
     ++s.byDepth[depth];
     Record(NowNs() - start, s.rollbackNs, s.maxRollbackNs);
