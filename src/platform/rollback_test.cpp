@@ -66,13 +66,24 @@ extern "C" void mscharged_rollback_between_steps(int (*)(const MschargedRollback
 {
 }
 extern "C" void mscharged_rollback_frame_start(void) {}
+extern "C" bool mscharged_rollback_predicting(void) { return false; }
+extern "C" int mscharged_rollback_network_reset(void) { return 4; }
+extern "C" bool mscharged_rollback_has_input(void) { return true; }
+extern "C" void mscharged_rollback_input_ready(void) {}
+extern "C" bool mscharged_rollback_can_capture(void) { return true; }
+extern "C" bool mscharged_rollback_sync_data(unsigned*, unsigned*, unsigned*) { return false; }
 #else
 #include "Game/Audio/AudioBackend.h"
 #include "Game/Game.h"
 #include "Game/InputManager.h"
 #include "Game/InputRouter.h"
+#include "Game/NetworkInput.h"
+#include "Game/NetworkInputMessages.h"
+#include "Game/NetworkPeer.h"
+#include "Game/NetworkRandomSeed.h"
 #include "Game/NetworkSession.h"
 #include "Game/NetworkSync.h"
+#include "Game/Task/GameTaskState.h"
 #include "Game/Effects/EffectsTemplate.h"
 #include "Game/Task/DispatchEventsTask.h"
 #include "Game/Task/FixedUpdateTask.h"
@@ -140,7 +151,12 @@ constexpr int kDetailedCompares = 3;     // comparisons listed in full in the lo
 constexpr int kListedPlaces = 60;        // places per detailed comparison, and in the summary
 constexpr int kMaxTasks = 32;            // tasks the task manager runs
 constexpr float kLongestFrame = 0.1f;    // the task manager's bound on a frame (g_fTaskTimeUpperBound)
-constexpr int kFrameRing = 64;           // frames kept: those of the deepest rollback, at any frame rate
+constexpr int kFrameRing = 256;          // frames kept: those of the deepest rollback, at any frame rate
+constexpr int kMachines = 4;
+constexpr int kMachineEvents = 4;        // deterministic data events in one input message
+constexpr int kInputRing = 32;           // RECHARGED_ROLLBACK: steps whose inputs are kept
+constexpr int kConfirmedRing = 64;       // RECHARGED_ROLLBACK: checksums of steps whose inputs all arrived
+constexpr int kRemoteChecks = 32;        // RECHARGED_ROLLBACK: other machines' checksums waiting for ours
 
 // What a replayed frame does with each task: run it as it ran, leave it out
 // (pads, sound, network, disc, movies, saving), or its replay part.
@@ -185,7 +201,8 @@ struct Step
     std::uint64_t snapshot;
     mscharged::platform::GameAllocationMark mark;
     MschargedRollbackInputs inputs; // what the router applied before it
-    unsigned checksum;              // after it, as it first ran
+    unsigned checksum;              // after it, as it first ran (in a network match, as it ran last)
+    unsigned seed;                  // the network random seed after it
     Phases phases;                  // after it
     bool reading;                   // a disc read in flight after it
     std::uint64_t readsStarted;     // disc reads started until then
@@ -195,6 +212,31 @@ struct Step
     bool meter[kMaxMeter];
     int meterCount;
     bool meterOverflowed;
+};
+
+// RECHARGED_ROLLBACK: one machine's inputs for one step, as its message gave
+// them (each message holds what changed since the machine's previous one) or
+// as predicted: its last inputs that arrived, without events.
+struct MachineInput
+{
+    unsigned char players;
+    unsigned short remap;
+    unsigned char records[4][16];   // PackedDetInput, by the machine's player
+    unsigned char states[4];
+    int eventCount;
+    unsigned char events[kMachineEvents][0x24]; // DetermDataEvent
+};
+struct StepInputs
+{
+    unsigned frame; // the step they are for; another value: none kept
+    int machineCount;
+    MachineInput machines[kMachines];
+    bool predicted[kMachines];
+};
+struct SyncPoint
+{
+    unsigned frame, checksum, seed;
+    int machine;
 };
 
 // RECHARGED_ROLLBACK_TEST_COMPARE: a place whose bytes after a replay were not
@@ -288,6 +330,28 @@ struct State
     // Where the replays' time goes: each task's, and in the fixed update's the
     // steps' and the saves'.
     std::uint64_t taskNs[kMaxTasks], stepNs, saveNs;
+
+    // RECHARGED_ROLLBACK: network matches that predict.
+    bool netplay;
+    int inputDelay;
+    StepInputs inputs[kInputRing];
+    unsigned lastInputFrame;          // the last step whose inputs were applied
+    unsigned firstPredicted[kMachines]; // by machine: its first step still predicted, 0: none
+    bool haveLastReal;
+    MachineInput lastReal[kMachines]; // by machine: its last inputs that arrived
+    unsigned waitThrough;             // steps through this one wait for all their inputs (they were undone)
+    unsigned undoFrom;                // a predicted step changed the match's phase: undone at the frame start
+    unsigned replayEnd;               // the last step a replay runs
+    bool captured;
+    unsigned capturedFrame;           // the local inputs were captured through this frame
+    bool haveConfirmed;
+    unsigned confirmed;               // the last step whose inputs all arrived
+    SyncPoint history[kConfirmedRing];
+    SyncPoint remote[kRemoteChecks];
+    int remoteCount;
+    std::uint64_t predictedSteps, lockstepWaits, windowWaits, mispredictions[kMachines], correctionRollbacks;
+    std::uint64_t undone, truncated, impossible, desyncs, remoteChecks, predictedDepth[kMaxDepth + 1];
+    unsigned firstDesyncFrame;
 };
 State* sState;
 std::mutex sMutex; // the hooks (main thread) and the watchdog
@@ -518,6 +582,7 @@ void Record(std::uint64_t value, std::uint64_t& total, std::uint64_t& max)
 
 void PrintPlace(FILE* file, const Place& place);
 void BuildWatched();
+unsigned OldestPredicted();
 
 void WriteSummary()
 {
@@ -525,7 +590,30 @@ void WriteSummary()
     FILE* file = std::fopen(s.summaryPath, "w");
     if (!file) return;
     const auto& h = mscharged::platform::RollbackSnapshotStatistics();
-    std::fprintf(file, "rollback test: up to %d steps back every %d steps\n", s.maxDepth, s.interval);
+    if (s.netplay)
+    {
+        std::fprintf(file, "rollback: network matches predict, input delay %d steps\n", s.inputDelay);
+        std::fprintf(file, "DESYNCS: %llu", static_cast<unsigned long long>(s.desyncs));
+        if (s.desyncs) std::fprintf(file, " (first at frame %u)", s.firstDesyncFrame);
+        std::fprintf(file, "; checksums compared with other machines %llu; ROLLBACKS IMPOSSIBLE %llu\n",
+                     static_cast<unsigned long long>(s.remoteChecks), static_cast<unsigned long long>(s.impossible));
+        std::fprintf(file, "steps with predicted inputs %llu, by how many steps predicted:",
+                     static_cast<unsigned long long>(s.predictedSteps));
+        for (int d = 1; d <= kMaxDepth; ++d)
+            if (s.predictedDepth[d])
+                std::fprintf(file, " %d: %llu", d, static_cast<unsigned long long>(s.predictedDepth[d]));
+        std::fprintf(file, "\nmispredicted steps by machine:");
+        for (int m = 0; m < kMachines; ++m)
+            std::fprintf(file, " %llu", static_cast<unsigned long long>(s.mispredictions[m]));
+        std::fprintf(file, "; rollbacks to correct them %llu\n",
+                     static_cast<unsigned long long>(s.correctionRollbacks));
+        std::fprintf(file, "steps undone (a phase change on predicted inputs) %llu, replays cut at a phase change "
+                           "%llu; waits for inputs: as the original router %llu, prediction window full %llu\n",
+                     static_cast<unsigned long long>(s.undone), static_cast<unsigned long long>(s.truncated),
+                     static_cast<unsigned long long>(s.lockstepWaits), static_cast<unsigned long long>(s.windowWaits));
+    }
+    else
+        std::fprintf(file, "rollback test: up to %d steps back every %d steps\n", s.maxDepth, s.interval);
     std::fprintf(file, "%llu steps, tracking started %d times; %d regions, %zu pages tracked, %zu hot\n",
                  static_cast<unsigned long long>(s.stepCount), s.starts, s.regionCount, h.trackedPages, h.hotPages);
     std::fprintf(file, "rollbacks: %llu, steps replayed %llu, frames %llu replayed as %llu; by steps undone:",
@@ -703,6 +791,7 @@ bool Start(FixedUpdateTask* task, unsigned long taskBytes, unsigned (*checksum)(
     step.snapshot = mscharged::platform::BeginRollbackSnapshots();
     step.mark = mscharged::platform::MarkGameAllocationCheckpoint();
     step.checksum = checksum();
+    step.seed = GetNetworkRandomSeed();
     step.hostFrame = 0;
     RecordFrame(step);
     s.latest = frame;
@@ -728,6 +817,13 @@ void Stop(const char* why)
     mscharged::platform::EndGameAllocationCheckpoint();
     s.active = false;
     s.pendingDepth = 0;
+    s.undoFrom = 0;
+    if (OldestPredicted())
+    {
+        // Nothing can go back before them any more.
+        std::fprintf(s.out, "STOPPED WITH INPUTS STILL PREDICTED: a misprediction now desyncs\n");
+        for (unsigned& first : s.firstPredicted) first = 0;
+    }
     std::fprintf(s.out, "tracking stopped after frame %u: %s\n", s.latest, why);
     std::fflush(s.out);
     WriteSummary();
@@ -1006,6 +1102,44 @@ void CompareAfterReplay(unsigned frame, int depth)
     std::fflush(s.out);
 }
 
+StepInputs& InputsFor(unsigned frame)
+{
+    return sState->inputs[frame % kInputRing];
+}
+
+bool AnyPredicted(const StepInputs& inputs)
+{
+    for (int machine = 0; machine < inputs.machineCount; ++machine)
+        if (inputs.predicted[machine]) return true;
+    return false;
+}
+
+// RECHARGED_ROLLBACK: a replayed step changed the match's phase (the inputs
+// that arrived made a goal, say): the replay ends with it, and the steps after
+// it run again when their inputs have all arrived. A step with inputs still
+// predicted does not change the phase either, and is undone as well.
+void StopReplayAt(unsigned frame)
+{
+    State& s = *sState;
+    if (!AnyPredicted(InputsFor(frame)))
+    {
+        s.replayEnd = frame;
+        ++s.truncated;
+        return;
+    }
+    const Step& before = s.steps[(frame - 1) % kRing];
+    if (!mscharged::platform::RestoreRollbackSnapshot(before.snapshot))
+    {
+        ++s.failedRestores;
+        std::fprintf(s.out, "ROLLBACK IMPOSSIBLE: the save after frame %u was gone\n", frame - 1);
+        s.replayEnd = frame;
+        return;
+    }
+    s.lossyFrees += mscharged::platform::RollbackGameAllocationCheckpointTo(before.mark, Excluded);
+    s.replayEnd = frame - 1;
+    ++s.undone;
+}
+
 // Replays frames `first` to `last` as one, their tasks from `firstTask` as the
 // task manager ran them, each with the frames' time added up, and the steps in
 // them from `next` (the steps with their inputs, a save after each). Only the
@@ -1052,7 +1186,7 @@ void ReplayFrames(std::uint64_t first, std::uint64_t last, int firstTask, unsign
                 manager->mCurrentTimeDelta = record.dt[i];
                 manager->mRealTimeDelta = record.real[i];
             }
-            for (; next <= s.latest && s.steps[next % kRing].hostFrame <= last; ++next)
+            for (; next <= s.replayEnd && s.steps[next % kRing].hostFrame <= last; ++next)
             {
                 Step& step = s.steps[next % kRing];
                 const std::uint64_t stepStart = NowNs();
@@ -1062,7 +1196,14 @@ void ReplayFrames(std::uint64_t first, std::uint64_t last, int firstTask, unsign
                 const unsigned now = checksum();
                 const std::uint64_t saveStart = NowNs();
                 s.stepNs += saveStart - stepStart;
-                if (now != step.checksum)
+                if (s.netplay)
+                {
+                    // Other inputs, another match: what it is now.
+                    step.checksum = now;
+                    step.seed = GetNetworkRandomSeed();
+                    RecordFrame(step);
+                }
+                else if (now != step.checksum)
                 {
                     if (!s.mismatches) s.firstMismatchFrame = next;
                     if (s.mismatches++ < kListedMismatches)
@@ -1073,6 +1214,7 @@ void ReplayFrames(std::uint64_t first, std::uint64_t last, int firstTask, unsign
                 step.mark = mscharged::platform::MarkGameAllocationCheckpoint();
                 s.saveNs += NowNs() - saveStart;
                 ++s.replayed;
+                if (s.netplay && !(step.phases == s.steps[(next - 1) % kRing].phases)) StopReplayAt(next);
             }
             auto* fixed = static_cast<FixedUpdateTask*>(s.tasks[i]);
             fixed->mAccumulatedDeltaT = record.accumulated;
@@ -1088,35 +1230,34 @@ void ReplayFrames(std::uint64_t first, std::uint64_t last, int firstTask, unsign
     s.framesMerged += last - first;
 }
 
-// Back `depth` steps and forward again with the same inputs.
-// At the start of a frame: back `depth` steps from the last one, then forward
-// again with the same inputs, through the end of the last step's frame.
-void RollBack(int depth, int (*replay)(const MschargedRollbackInputs*), unsigned (*checksum)(void))
+// Why a rollback cannot go back to `target`, or null when it can: a disc
+// read in flight or started since (its completion went into memory a restore
+// takes back), more frames than are kept, or (in the test) a change of the
+// game's or tasks' state, or more events than a step keeps.
+const char* CannotRollBack(unsigned target)
 {
     State& s = *sState;
-    const unsigned target = s.latest - depth;
     // The end of the last step's frame counts as well.
     const auto producers = mscharged::platform::CurrentGameByteProducers();
     if (producers.pending)
     {
         ++s.skippedReads;
-        return;
+        return "a disc read in flight";
     }
     if (producers.started != s.steps[target % kRing].readsStarted)
     {
         ++s.skippedStarts;
-        return;
+        return "a disc read started";
     }
-    if (!(CurrentPhases() == s.steps[s.latest % kRing].phases))
+    if (!s.netplay && !(CurrentPhases() == s.steps[s.latest % kRing].phases))
     {
         ++s.skippedPhases;
-        return;
+        return "a state change";
     }
-    const std::uint64_t firstFrame = s.steps[target % kRing].hostFrame;
-    if (s.receivedOverflowed || s.hostFrame - firstFrame >= kFrameRing)
+    if (s.receivedOverflowed || s.hostFrame - s.steps[target % kRing].hostFrame >= kFrameRing)
     {
         ++s.skippedEvents;
-        return;
+        return "too many events or frames";
     }
     for (unsigned f = target; f <= s.latest; ++f)
     {
@@ -1124,25 +1265,46 @@ void RollBack(int depth, int (*replay)(const MschargedRollbackInputs*), unsigned
         if (step.reading)
         {
             ++s.skippedReads;
-            return;
+            return "a disc read in flight";
         }
-        // A read started and done in these steps: its completion went into memory this restores.
         if (step.readsStarted != s.steps[target % kRing].readsStarted)
         {
             ++s.skippedStarts;
-            return;
+            return "a disc read started";
         }
-        if (!(step.phases == s.steps[s.latest % kRing].phases))
+        if (!s.netplay && !(step.phases == s.steps[s.latest % kRing].phases))
         {
             ++s.skippedPhases;
-            return;
+            return "a state change";
         }
         if (f > target && (step.inputs.overflowed || step.meterOverflowed))
         {
             ++s.skippedEvents;
-            return;
+            return "too many events or frames";
         }
     }
+    return nullptr;
+}
+
+// At the start of a frame: back to the save after step `target`, then
+// forward again through the end of the frame that just ended, running the
+// steps through `replayEnd` with the inputs their records hold. False when
+// it cannot (CannotRollBack).
+bool RollBack(unsigned target, unsigned replayEnd, int (*replay)(const MschargedRollbackInputs*),
+              unsigned (*checksum)(void))
+{
+    State& s = *sState;
+    const int depth = static_cast<int>(s.latest - target);
+    if (const char* why = CannotRollBack(target))
+    {
+        if (s.netplay)
+        {
+            ++s.impossible;
+            std::fprintf(s.out, "ROLLBACK IMPOSSIBLE to frame %u from %u: %s\n", target, s.latest, why);
+        }
+        return false;
+    }
+    const std::uint64_t firstFrame = s.steps[target % kRing].hostFrame;
 
     const bool compare = s.compareEvery && s.places && (s.rollbacks + 1) % s.compareEvery == 0 && CopyForCompare();
     const std::uint64_t start = NowNs();
@@ -1151,7 +1313,7 @@ void RollBack(int depth, int (*replay)(const MschargedRollbackInputs*), unsigned
     {
         ++s.failedRestores;
         Stop("a save to roll back to was gone");
-        return;
+        return false;
     }
     s.lossyFrees += mscharged::platform::RollbackGameAllocationCheckpointTo(from.mark, Excluded);
     Record(NowNs() - start, s.restoreNs, s.maxRestoreNs);
@@ -1166,6 +1328,10 @@ void RollBack(int depth, int (*replay)(const MschargedRollbackInputs*), unsigned
     mscharged_tweak_save_frame_state(&now);
     auto* fixed = static_cast<FixedUpdateTask*>(s.tasks[fixedIndexOf()]);
     const float accumulated = fixed->mAccumulatedDeltaT, interpolation = fixed->mInterpolationDeltaT;
+    // In a network match, the steps whose inputs were applied (some after the
+    // last saved, when a step's presentation stopped the hook).
+    const unsigned ran = s.netplay ? std::max(s.lastInputFrame, s.latest) : s.latest;
+    s.replayEnd = replayEnd;
     s.resimulating = true;
     unsigned next = target + 1;
     const int fixedIndex = fixedIndexOf();
@@ -1175,7 +1341,7 @@ void RollBack(int depth, int (*replay)(const MschargedRollbackInputs*), unsigned
     for (std::uint64_t frame = firstFrame + 1, from = frame; frame <= s.hostFrame; ++frame)
     {
         time += std::max(Frame(frame).dt[fixedIndex], 0.0f);
-        const bool steps = next <= s.latest && s.steps[next % kRing].hostFrame <= frame;
+        const bool steps = next <= s.replayEnd && s.steps[next % kRing].hostFrame <= frame;
         if (s.merge && !steps && frame < s.hostFrame && time + Frame(frame + 1).dt[fixedIndex] <= kLongestFrame)
             continue;
         mscharged_tweak_load_frame_state(&Frame(from).tweak);
@@ -1190,11 +1356,328 @@ void RollBack(int depth, int (*replay)(const MschargedRollbackInputs*), unsigned
     RollbackRedeliverMegaStrikeMeter(s.received, s.receivedCount);
     s.meterRedelivered += s.receivedCount;
     s.resimulating = false;
-    if (next != s.latest + 1) std::fprintf(s.out, "REPLAY MISSED STEPS %u to %u\n", next, s.latest);
+    if (next != s.replayEnd + 1) std::fprintf(s.out, "REPLAY MISSED STEPS %u to %u\n", next, s.replayEnd);
+    if (s.netplay && s.replayEnd < ran)
+    {
+        // Steps undone: they run again when their inputs have all arrived (the
+        // inputs that did arrive are kept), and their time goes back to the
+        // fixed update, to catch up.
+        s.latest = s.replayEnd;
+        s.lastInputFrame = s.replayEnd;
+        s.waitThrough = std::max(s.waitThrough, ran);
+        for (unsigned& first : s.firstPredicted)
+            if (first > s.replayEnd) first = 0;
+        fixed->mAccumulatedDeltaT += static_cast<float>(ran - s.replayEnd) * g_fFixedUpdateTick;
+    }
     ++s.rollbacks;
-    ++s.byDepth[depth];
+    ++s.byDepth[std::min(depth, kMaxDepth)];
     Record(NowNs() - start, s.rollbackNs, s.maxRollbackNs);
     if (compare) CompareAfterReplay(s.latest, depth);
+    return true;
+}
+
+// RECHARGED_ROLLBACK: network matches that predict. The network router's
+// queues hold each machine's input messages in the order it sent them, one
+// per step after the input delay; a step whose message has not arrived runs
+// with that machine's last inputs that did, and when its message arrives (at
+// the start of a frame) and says otherwise, the match goes back before the
+// first step it got wrong and runs again with what arrived.
+
+NetworkInputRouter* Router()
+{
+    return gNetworkInputRouter;
+}
+
+int MachineCount()
+{
+    return std::min<int>(g_pNetworkSessionBase->GetNumMachines(), kMachines);
+}
+
+// The fixed update's frame: the last step that ran.
+unsigned CurrentStep()
+{
+    return static_cast<unsigned>(GetFixedUpdateTask()->GetFrame());
+}
+
+// A machine's inputs as the router holds them (before any arrived, and while
+// the router repeats them for the input delay).
+MachineInput FromRouter(int machine)
+{
+    NetworkInputRouter* router = Router();
+    MachineInput input{};
+    input.players = static_cast<unsigned char>(
+        std::min<int>(g_pNetworkSessionBase->GetPeer(static_cast<s8>(machine))->mPlayerCount, 4));
+    input.remap = router->mRemapAngles[machine];
+    for (int player = 0; player < input.players; ++player)
+    {
+        const s8 id = GetNetworkPlayerId(static_cast<s8>(player), static_cast<s8>(machine));
+        std::memcpy(input.records[player], &router->mInputRecords[id], sizeof(PackedDetInput));
+        input.states[player] = router->mInputStates[id];
+    }
+    return input;
+}
+
+// A machine's inputs from its message: what changed since `previous`, its
+// previous message's.
+MachineInput FromMessage(NetMessageInput& message, const MachineInput& previous)
+{
+    MachineInput input = previous;
+    message.GetNetworkInputMessageRemapAngle(&input.remap);
+    for (int player = 0; player < input.players; ++player)
+    {
+        PackedDetInput record;
+        std::memcpy(&record, input.records[player], sizeof(record));
+        message.ApplyNetworkInputMessageRecord(static_cast<s8>(player), &record);
+        std::memcpy(input.records[player], &record, sizeof(record));
+        input.states[player] = message.GetNetworkInputMessagePlayerState(static_cast<s8>(player));
+    }
+    input.eventCount = std::min<int>(message.mEventCount, kMachineEvents);
+    for (int event = 0; event < input.eventCount; ++event)
+        std::memcpy(input.events[event], message.GetNetworkInputMessageEvent(event), sizeof(input.events[event]));
+    return input;
+}
+
+MachineInput Predicted(int machine)
+{
+    MachineInput input = sState->lastReal[machine];
+    input.eventCount = 0;
+    return input;
+}
+
+bool Same(const MachineInput& a, const MachineInput& b)
+{
+    if (a.players != b.players || a.remap != b.remap || a.eventCount != b.eventCount) return false;
+    for (int player = 0; player < a.players; ++player)
+        if (std::memcmp(a.records[player], b.records[player], sizeof(a.records[player]))
+            || a.states[player] != b.states[player])
+            return false;
+    return !std::memcmp(a.events, b.events, sizeof(a.events[0]) * static_cast<std::size_t>(a.eventCount));
+}
+
+// What the router applies, in its order: machine by machine, its events, then
+// its players' inputs.
+void Compose(const StepInputs& step, MschargedRollbackInputs& out)
+{
+    out = {};
+    out.machineCount = step.machineCount;
+    for (int machine = 0; machine < step.machineCount; ++machine)
+    {
+        const MachineInput& input = step.machines[machine];
+        out.machines[machine] = static_cast<signed char>(machine);
+        out.players[machine] = input.players;
+        out.remapAngles[machine] = input.remap;
+        for (int player = 0; player < input.players; ++player)
+        {
+            const s8 id = GetNetworkPlayerId(static_cast<s8>(player), static_cast<s8>(machine));
+            std::memcpy(out.records[id], input.records[player], sizeof(out.records[id]));
+            out.states[id] = input.states[player];
+        }
+        for (int event = 0; event < input.eventCount; ++event)
+        {
+            if (out.eventCount == MSCHARGED_ROLLBACK_MAX_EVENTS)
+            {
+                out.overflowed = 1;
+                break;
+            }
+            out.eventMachines[out.eventCount] = static_cast<signed char>(machine);
+            std::memcpy(out.events[out.eventCount++], input.events[event], sizeof(out.events[0]));
+        }
+    }
+}
+
+// The router's records follow the inputs that arrived: the next message
+// changes them, and the original router reads them.
+void Mirror(int machine, const MachineInput& input)
+{
+    NetworkInputRouter* router = Router();
+    router->mRemapAngles[machine] = input.remap;
+    for (int player = 0; player < input.players; ++player)
+    {
+        const s8 id = GetNetworkPlayerId(static_cast<s8>(player), static_cast<s8>(machine));
+        std::memcpy(&router->mInputRecords[id], input.records[player], sizeof(PackedDetInput));
+        router->mInputStates[id] = input.states[player];
+    }
+}
+
+// The checksum another machine sends: that of the last step whose inputs had
+// all arrived there, compared when ours are in too.
+void NoteSync(int machine, const NetMessageInput& message)
+{
+    State& s = *sState;
+    if (!(message.mFlags & 4) || machine == g_pNetworkSessionBase->GetLocalMachineId()) return;
+    if (s.remoteCount == kRemoteChecks)
+    {
+        std::memmove(s.remote, s.remote + 1, sizeof(s.remote[0]) * (kRemoteChecks - 1));
+        --s.remoteCount;
+    }
+    s.remote[s.remoteCount++] = {message.mFrame, message.mChecksum, message.mRandomSeed, machine};
+}
+
+MachineInput Arrived(int machine, NetMessageInput& message)
+{
+    State& s = *sState;
+    NoteSync(machine, message);
+    MachineInput input = FromMessage(message, s.lastReal[machine]);
+    s.lastReal[machine] = input;
+    Mirror(machine, input);
+    return input;
+}
+
+// The phases a step may predict in: the match being played, nothing paused.
+bool PredictablePhases(const Phases& phases)
+{
+    return (phases.game == GS_KICKOFF || phases.game == GS_GAMEPLAY || phases.game == GS_OVERTIME)
+        && phases.current == TASK_GAMEPLAY && phases.pending == TASK_GAMEPLAY
+        && !g_pNetworkSession->GetPausedMachineMask();
+}
+
+unsigned OldestPredicted()
+{
+    const State& s = *sState;
+    unsigned oldest = 0;
+    for (const unsigned first : s.firstPredicted)
+        if (first && (!oldest || first < oldest)) oldest = first;
+    return oldest;
+}
+
+// Whether step `frame` may run with predicted inputs: the rollback follows the
+// match and could go back before the oldest step predicted, through as many
+// frames as it keeps and without a disc read in between.
+bool CanPredict(unsigned frame)
+{
+    State& s = *sState;
+    if (!s.active || s.latest + 1 != frame || frame <= s.waitThrough) return false;
+    const Phases phases = CurrentPhases();
+    if (!PredictablePhases(phases) || !(phases == s.steps[s.latest % kRing].phases)) return false;
+    const unsigned oldest = OldestPredicted();
+    const unsigned target = oldest ? oldest - 1 : s.latest;
+    if (frame - target > static_cast<unsigned>(kMaxDepth)) return false;
+    const Step& from = s.steps[target % kRing];
+    if (from.frame != target || s.hostFrame - from.hostFrame >= kFrameRing - 2) return false;
+    const auto producers = mscharged::platform::CurrentGameByteProducers();
+    return !producers.pending && producers.started == from.readsStarted;
+}
+
+// The steps whose inputs have all arrived: their checksums are the match's,
+// sent to the other machines and compared with theirs.
+void UpdateConfirmed()
+{
+    State& s = *sState;
+    if (!s.active) return;
+    unsigned through = std::min(s.lastInputFrame, s.latest);
+    if (const unsigned oldest = OldestPredicted()) through = std::min(through, oldest - 1);
+    const unsigned from = s.haveConfirmed && s.confirmed < through ? s.confirmed + 1 : through;
+    for (unsigned f = from; f <= through && f + kRing > s.latest; ++f)
+    {
+        const Step& step = s.steps[f % kRing];
+        if (step.frame == f) s.history[f % kConfirmedRing] = {f, step.checksum, step.seed, -1};
+    }
+    if (!s.haveConfirmed || through > s.confirmed)
+    {
+        s.confirmed = through;
+        s.haveConfirmed = true;
+    }
+    int kept = 0;
+    for (int i = 0; i < s.remoteCount; ++i)
+    {
+        const SyncPoint& remote = s.remote[i];
+        if (remote.frame > s.confirmed && remote.frame < s.confirmed + kConfirmedRing)
+        {
+            s.remote[kept++] = remote; // ours is not in yet
+            continue;
+        }
+        const SyncPoint& ours = s.history[remote.frame % kConfirmedRing];
+        if (ours.frame != remote.frame) continue; // not kept (or a step the hook did not see)
+        ++s.remoteChecks;
+        if (ours.checksum != remote.checksum || ours.seed != remote.seed)
+        {
+            if (!s.desyncs) s.firstDesyncFrame = remote.frame;
+            if (s.desyncs++ < kListedMismatches)
+                std::fprintf(s.out, "DESYNC at frame %u: checksum %08x seed %08x here, %08x %08x on machine %d\n",
+                             remote.frame, ours.checksum, ours.seed, remote.checksum, remote.seed, remote.machine);
+            std::fflush(s.out);
+        }
+    }
+    s.remoteCount = kept;
+}
+
+// At the start of a frame: the messages that arrived for the steps predicted.
+// Each one replaces its prediction, the steps still predicted are predicted
+// again from the last that arrived, and when any changed the match goes back
+// before the first.
+void Resolve()
+{
+    State& s = *sState;
+    NetworkInputRouter* router = Router();
+    unsigned earliest = 0;
+    const auto changed = [&](unsigned frame) { earliest = earliest ? std::min(earliest, frame) : frame; };
+    for (int machine = 0; machine < MachineCount(); ++machine)
+    {
+        unsigned frame = s.firstPredicted[machine];
+        if (!frame) continue;
+        NetworkInputMessageQueue& queue = router->m_InputQueue[machine];
+        for (; frame <= s.lastInputFrame && queue.GetCount() > 0; ++frame)
+        {
+            StepInputs& step = InputsFor(frame);
+            const MachineInput input = Arrived(machine, queue.Pop());
+            if (!Same(step.machines[machine], input))
+            {
+                changed(frame);
+                ++s.mispredictions[machine];
+            }
+            step.machines[machine] = input;
+            step.predicted[machine] = false;
+        }
+        for (unsigned later = frame; later <= s.lastInputFrame; ++later)
+        {
+            const MachineInput input = Predicted(machine);
+            if (!Same(InputsFor(later).machines[machine], input)) changed(later);
+            InputsFor(later).machines[machine] = input;
+        }
+        s.firstPredicted[machine] = frame <= s.lastInputFrame ? frame : 0;
+    }
+    if (!earliest || earliest > s.latest) return;
+    for (unsigned f = earliest; f <= s.latest; ++f) Compose(InputsFor(f), s.steps[f % kRing].inputs);
+    ++s.correctionRollbacks;
+    RollBack(earliest - 1, s.latest, s.replay, s.checksum);
+}
+
+// RECHARGED_ROLLBACK, at the start of a frame, before any task sets up its
+// cameras and views.
+void NetplayFrameStart()
+{
+    State& s = *sState;
+    // Steps the hook between steps did not see (one whose presentation stopped
+    // the simulation): undone when they predicted, the match goes on without
+    // the rollback otherwise.
+    const unsigned now = CurrentStep();
+    if (now != s.latest)
+    {
+        bool predicted = false;
+        for (unsigned f = s.latest + 1; f <= now; ++f)
+            predicted = predicted || (InputsFor(f).frame == f && AnyPredicted(InputsFor(f)));
+        if (!predicted || now < s.latest)
+        {
+            Stop("a step the rollback did not see");
+            return;
+        }
+        ++s.undone;
+        RollBack(s.latest, s.latest, s.replay, s.checksum);
+    }
+    // A step that predicted and changed the match's phase: it runs again when
+    // its inputs have all arrived.
+    if (s.undoFrom)
+    {
+        const unsigned from = s.undoFrom;
+        s.undoFrom = 0;
+        if (from <= s.latest && from > 0)
+        {
+            ++s.undone;
+            RollBack(from - 1, from - 1, s.replay, s.checksum);
+        }
+    }
+    Resolve();
+    UpdateConfirmed();
 }
 
 void* Watchdog(void*)
@@ -1205,7 +1688,8 @@ void* Watchdog(void*)
         nanosleep(&pause, nullptr);
         std::lock_guard lock(sMutex);
         if (!sState->out) return nullptr;
-        if (sState->active && NowNs() - sState->lastHookNs > kIdleNs) Stop("no step for 250 ms");
+        if (sState->active && NowNs() - sState->lastHookNs > kIdleNs && !OldestPredicted())
+            Stop("no step for 250 ms");
     }
 }
 
@@ -1240,6 +1724,14 @@ struct Install
     Install()
     {
         const char* path = std::getenv("RECHARGED_ROLLBACK_TEST");
+        const char* network = std::getenv("RECHARGED_ROLLBACK");
+        const bool netplay = network && *network;
+        if (netplay && path && *path)
+        {
+            std::fprintf(stderr, "RECHARGED_ROLLBACK: not with RECHARGED_ROLLBACK_TEST\n");
+            return;
+        }
+        if (netplay) path = network;
         if (!path || !*path) return;
         if (const char* synctest = std::getenv("RECHARGED_SYNCTEST"); synctest && *synctest)
         {
@@ -1262,6 +1754,9 @@ struct Install
         state->interval = EnvInt("RECHARGED_ROLLBACK_TEST_INTERVAL", 1, 1, 1 << 20);
         state->compareEvery = EnvInt("RECHARGED_ROLLBACK_TEST_COMPARE", 0, 0, 1 << 20);
         state->merge = EnvInt("RECHARGED_ROLLBACK_TEST_MERGE", 1, 0, 1) != 0;
+        state->netplay = netplay;
+        state->inputDelay = EnvInt("RECHARGED_ROLLBACK_DELAY", 1, 0, 8);
+        if (netplay) state->compareEvery = 0;
         if (state->compareEvery)
         {
             Dl_info info{};
@@ -1269,8 +1764,12 @@ struct Install
                 state->moduleBase = reinterpret_cast<std::uintptr_t>(info.dli_fbase);
             state->places = static_cast<Place*>(std::calloc(kMaxPlaces, sizeof(Place)));
         }
-        std::fprintf(state->out, "rollback test: up to %d steps back every %d steps; summary in %s\n",
-                     state->maxDepth, state->interval, state->summaryPath);
+        if (netplay)
+            std::fprintf(state->out, "rollback: network matches predict, input delay %d steps; summary in %s\n",
+                         state->inputDelay, state->summaryPath);
+        else
+            std::fprintf(state->out, "rollback test: up to %d steps back every %d steps; summary in %s\n",
+                         state->maxDepth, state->interval, state->summaryPath);
         std::fflush(state->out);
         sState = state;
         pthread_t watchdog;
@@ -1352,6 +1851,7 @@ extern "C" void mscharged_rollback_between_steps(int (*replay)(const MschargedRo
                                                  unsigned (*checksum)(void), void* task, unsigned long taskBytes)
 {
     if (!sState || !sState->out) return;
+    if (sState->netplay && !mscharged_rollback_predicting()) return; // offline: nothing to predict
     std::lock_guard lock(sMutex);
     State& s = *sState;
     s.lastHookNs = NowNs();
@@ -1364,6 +1864,12 @@ extern "C" void mscharged_rollback_between_steps(int (*replay)(const MschargedRo
         {
             std::fclose(s.out);
             s.out = nullptr;
+        }
+        else if (s.netplay)
+        {
+            s.replay = replay;
+            s.checksum = checksum;
+            UpdateConfirmed();
         }
         return;
     }
@@ -1386,7 +1892,13 @@ extern "C" void mscharged_rollback_between_steps(int (*replay)(const MschargedRo
     s.receivedOverflowed = false;
     step.hostFrame = s.hostFrame;
     step.checksum = checksum();
+    step.seed = GetNetworkRandomSeed();
     RecordFrame(step);
+    // A step that predicted must leave the match's phase alone: undone at the
+    // frame start, it runs again when its inputs have all arrived.
+    if (s.netplay && AnyPredicted(InputsFor(frame)) && !s.undoFrom
+        && !(step.phases == s.steps[(frame - 1) % kRing].phases))
+        s.undoFrom = frame;
     s.haveInputs = false;
     s.latest = frame;
     ++s.stored;
@@ -1399,6 +1911,12 @@ extern "C" void mscharged_rollback_between_steps(int (*replay)(const MschargedRo
     s.replay = replay;
     s.checksum = checksum;
     s.pendingDepth = 0;
+    if (s.netplay)
+    {
+        UpdateConfirmed();
+        if (s.stepCount % kSummaryEvery == 0) WriteSummary();
+        return;
+    }
     if (s.stepCount % s.interval == 0)
     {
         const int depth = s.nextDepth % s.maxDepth + 1;
@@ -1425,15 +1943,146 @@ extern "C" void mscharged_rollback_frame_start(void)
     const auto* fixed = static_cast<const FixedUpdateTask*>(s.tasks[fixedIndexOf()]);
     Frame(s.hostFrame).accumulated = fixed->mAccumulatedDeltaT;
     Frame(s.hostFrame).interpolation = fixed->mInterpolationDeltaT;
-    if (s.pendingDepth)
+    if (s.netplay)
+        NetplayFrameStart();
+    else if (s.pendingDepth)
     {
         const int depth = s.pendingDepth;
         s.pendingDepth = 0;
-        RollBack(depth, s.replay, s.checksum);
+        RollBack(s.latest - static_cast<unsigned>(depth), s.latest, s.replay, s.checksum);
     }
     ++s.hostFrame;
     BeginFrameRecord();
 }
+extern "C" bool mscharged_rollback_predicting(void)
+{
+    if (!sState || !sState->out || !sState->netplay || !g_pNetworkSessionBase || !gNetworkInputRouter) return false;
+    return g_pNetworkSessionBase->GetSessionMode() != NET_MODE_LOCAL && !gNetworkInputRecording->mPlaybackReady;
+}
+
+extern "C" int mscharged_rollback_network_reset(void)
+{
+    std::lock_guard lock(sMutex);
+    State& s = *sState;
+    if (s.active) Stop("a new match");
+    for (StepInputs& inputs : s.inputs) inputs.frame = ~0u;
+    s.lastInputFrame = 0;
+    std::fill(std::begin(s.firstPredicted), std::end(s.firstPredicted), 0u);
+    s.haveLastReal = false;
+    s.waitThrough = s.undoFrom = 0;
+    s.captured = s.haveConfirmed = false;
+    s.remoteCount = 0;
+    std::fprintf(s.out, "network match: input delay %d steps\n", s.inputDelay);
+    std::fflush(s.out);
+    return s.inputDelay;
+}
+
+extern "C" bool mscharged_rollback_has_input(void)
+{
+    std::lock_guard lock(sMutex);
+    State& s = *sState;
+    NetworkInputRouter* router = Router();
+    if (router->mQueueCursor < router->mQueueLimit) return true; // the input delay's first steps
+    const unsigned frame = CurrentStep() + 1;
+    if (!CanPredict(frame))
+    {
+        // As the original router: every machine's inputs for the step, and
+        // none still predicted before it.
+        bool ready = !OldestPredicted();
+        for (int machine = 0; ready && machine < MachineCount(); ++machine)
+        {
+            const StepInputs& kept = InputsFor(frame);
+            ready = (kept.frame == frame && !kept.predicted[machine]) || router->m_InputQueue[machine].GetCount() > 0;
+        }
+        if (!ready) ++s.lockstepWaits;
+        return ready;
+    }
+    if (const unsigned oldest = OldestPredicted(); oldest && frame - oldest + 1 >= static_cast<unsigned>(kMaxDepth))
+    {
+        ++s.windowWaits;
+        return false;
+    }
+    return true;
+}
+
+extern "C" void mscharged_rollback_input_ready(void)
+{
+    std::lock_guard lock(sMutex);
+    State& s = *sState;
+    NetworkInputRouter* router = Router();
+    const int machines = MachineCount();
+    if (!s.haveLastReal)
+    {
+        for (int machine = 0; machine < machines; ++machine) s.lastReal[machine] = FromRouter(machine);
+        s.haveLastReal = true;
+    }
+    const unsigned frame = CurrentStep() + 1;
+    StepInputs& kept = InputsFor(frame);
+    // A step undone and run again: the inputs that arrived for it then.
+    const bool again = kept.frame == frame;
+    StepInputs step{};
+    step.frame = frame;
+    step.machineCount = machines;
+    if (router->mQueueCursor < router->mQueueLimit)
+    {
+        ++router->mQueueCursor;
+        for (int machine = 0; machine < machines; ++machine) step.machines[machine] = Predicted(machine);
+    }
+    else
+        for (int machine = 0; machine < machines; ++machine)
+        {
+            NetworkInputMessageQueue& queue = router->m_InputQueue[machine];
+            if (again && !kept.predicted[machine])
+            {
+                step.machines[machine] = kept.machines[machine];
+                s.lastReal[machine] = kept.machines[machine];
+                Mirror(machine, kept.machines[machine]);
+            }
+            else if (!s.firstPredicted[machine] && queue.GetCount() > 0)
+                step.machines[machine] = Arrived(machine, queue.Pop());
+            else
+            {
+                step.machines[machine] = Predicted(machine);
+                step.predicted[machine] = true;
+                if (!s.firstPredicted[machine]) s.firstPredicted[machine] = frame;
+            }
+        }
+    kept = step;
+    if (AnyPredicted(step))
+    {
+        ++s.predictedSteps;
+        ++s.predictedDepth[std::min<unsigned>(frame - OldestPredicted() + 1, kMaxDepth)];
+    }
+    Compose(step, s.pending);
+    ApplyRollbackInputs(&s.pending);
+    s.haveInputs = true;
+    s.lastInputFrame = frame;
+}
+
+extern "C" bool mscharged_rollback_can_capture(void)
+{
+    std::lock_guard lock(sMutex);
+    State& s = *sState;
+    const unsigned frame = CurrentStep();
+    if (s.captured && frame <= s.capturedFrame) return false;
+    s.captured = true;
+    s.capturedFrame = frame;
+    return true;
+}
+
+extern "C" bool mscharged_rollback_sync_data(unsigned* checksum, unsigned* frame, unsigned* seed)
+{
+    std::lock_guard lock(sMutex);
+    const State& s = *sState;
+    if (!s.haveConfirmed) return false;
+    const SyncPoint& point = s.history[s.confirmed % kConfirmedRing];
+    if (point.frame != s.confirmed) return false;
+    *checksum = point.checksum;
+    *frame = point.frame;
+    *seed = point.seed;
+    return true;
+}
+
 // Calls to __cxa_throw from the game module bind to this one (hidden), which
 // logs the throw and goes on to the C++ runtime's.
 extern "C" __attribute__((visibility("hidden"), noreturn)) void __cxa_throw(void* thrown, std::type_info* type,

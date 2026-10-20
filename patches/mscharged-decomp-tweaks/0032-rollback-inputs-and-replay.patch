@@ -45,8 +45,21 @@ rollback with the pads, which PlatPadUpdateTask drives every frame.
 
 The rollback leaves the frame memory alone: it is used afresh every frame,
 with its cursors in glxMemory's statics. mscharged_rollback_frame_memory
-returns pointers to its blocks. Without RECHARGED_ROLLBACK_TEST nothing
-changes.
+returns pointers to its blocks.
+
+Network matches with rollback (RECHARGED_ROLLBACK): the network router lets
+the port decide whether a step can run (HasInput) and apply its inputs
+(OnInputReady), so that a step whose inputs have not arrived from another
+machine runs with that machine's last inputs, and goes back when they
+arrive and differ. The router's input delay is the port's, fixed for the
+match on every machine; each step's inputs leave as soon as they are
+captured (one tick per packet); a step undone and run again does not capture
+and send its inputs a second time (NetworkInputManager::CaptureInputs); and
+the sync data an input message carries is the checksum of the last step
+whose inputs had all arrived, which the port compares with the other
+machines' (the state now may rest on predicted inputs).
+
+Without RECHARGED_ROLLBACK_TEST or RECHARGED_ROLLBACK nothing changes.
 
 diff --git a/include/Game/InputRouter.h b/include/Game/InputRouter.h
 index 1b67126..8b3abd2 100644
@@ -65,16 +78,18 @@ index 1b67126..8b3abd2 100644
  #endif // GAME_NETWORK_INPUT_ROUTER_H
 diff --git a/include/mscharged_rollback.h b/include/mscharged_rollback.h
 new file mode 100644
-index 0000000..2971b65
+index 0000000..a05b04f
 --- /dev/null
 +++ b/include/mscharged_rollback.h
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,95 @@
 +#if defined(MSCHARGED_TWEAKS)
 +#ifndef MSCHARGED_ROLLBACK_H
 +#define MSCHARGED_ROLLBACK_H
 +
 +// Rollback of the native port (src/platform/rollback_test.cpp in the game
-+// module). It does nothing unless RECHARGED_ROLLBACK_TEST is set.
++// module). It does nothing unless RECHARGED_ROLLBACK_TEST (a test that rolls
++// matches back with the inputs they had) or RECHARGED_ROLLBACK (network
++// matches that predict the inputs still on their way) is set.
 +
 +#define MSCHARGED_ROLLBACK_MAX_EVENTS 16
 +
@@ -122,6 +137,23 @@ index 0000000..2971b65
 +// At the start of a frame, before any task sets up its cameras and views:
 +// where the rollback goes back and replays, through the end of the last frame.
 +void mscharged_rollback_frame_start(void);
++// Network matches with rollback: the network router lets the port decide
++// whether a step can run and apply its inputs, predicting those of machines
++// whose inputs have not arrived (a later frame goes back when they differ).
++bool mscharged_rollback_predicting(void);
++// At the router's reset for a match: the steps of input delay every machine
++// uses (the router's queue limit, fixed while the match lasts).
++int mscharged_rollback_network_reset(void);
++// Whether the next step can run, in place of the router's queues.
++bool mscharged_rollback_has_input(void);
++// Applies the next step's inputs, in place of the router.
++void mscharged_rollback_input_ready(void);
++// Whether the local inputs are still to be captured and sent for this step:
++// a step undone and run again sent them the first time.
++bool mscharged_rollback_can_capture(void);
++// The sync data an outgoing input message carries: the last step whose
++// inputs all arrived, with its checksum and random seed; false when none.
++bool mscharged_rollback_sync_data(unsigned* checksum, unsigned* frame, unsigned* seed);
 +// The game's: pointers into the frame memory blocks, at most capacity;
 +// returns how many.
 +int mscharged_rollback_frame_memory(const void** pointers, int capacity);
@@ -212,8 +244,35 @@ index 7bbc0ca..7772f60 100644
 +    }
 +}
 +#endif
+diff --git a/src/Game/InputManager.cpp b/src/Game/InputManager.cpp
+index 64ada3b..07b9f4b 100644
+--- a/src/Game/InputManager.cpp
++++ b/src/Game/InputManager.cpp
+@@ -7,6 +7,9 @@
+ #include "Game/NetworkSession.h"
+ #include "NL/nlMemory.h"
+ #include "NL/nlTicker.h"
++#if defined(MSCHARGED_TWEAKS)
++#include "mscharged_rollback.h"
++#endif
+ 
+ NetworkInputManager* gInputManager;
+ 
+@@ -93,6 +96,12 @@ void NetworkInputManager::CaptureInputs()
+         {
+             return;
+         }
++#if defined(MSCHARGED_TWEAKS)
++        if (mscharged_rollback_predicting() && !mscharged_rollback_can_capture())
++        {
++            return;
++        }
++#endif
+ 
+         NetworkPeer* peer
+             = g_pNetworkSessionBase->GetLocalPeer();
 diff --git a/src/Game/InputRouter.cpp b/src/Game/InputRouter.cpp
-index 14e2acd..5ba9b4b 100644
+index 14e2acd..ce35461 100644
 --- a/src/Game/InputRouter.cpp
 +++ b/src/Game/InputRouter.cpp
 @@ -19,6 +19,11 @@
@@ -401,7 +460,54 @@ index 14e2acd..5ba9b4b 100644
  
      if (gNetworkInputRecording->mRecording)
      {
-@@ -449,6 +585,13 @@ void NetworkInputRouter::OnInputCaptured()
+@@ -367,6 +503,15 @@ void NetworkInputRouter::Reset(int resetQueues)
+     }
+     mQueueCursor = 0;
+     mQueueLimit = 4;
++#if defined(MSCHARGED_TWEAKS)
++    // A network match with rollback: a fixed input delay (the same on every
++    // machine), and each step's inputs sent as soon as they are captured.
++    if (mscharged_rollback_predicting())
++    {
++        mQueueLimit = mscharged_rollback_network_reset();
++        g_nTicksPerPacket = 1;
++    }
++#endif
+ }
+ 
+ void NetworkInputRouter::CheckCongestion()
+@@ -395,6 +540,12 @@ void NetworkInputRouter::CheckCongestion()
+ 
+ bool NetworkInputRouter::HasInput()
+ {
++#if defined(MSCHARGED_TWEAKS)
++    if (mscharged_rollback_predicting())
++    {
++        return mscharged_rollback_has_input();
++    }
++#endif
+     if (mQueueLimit > GetQueueCursor())
+     {
+         return true;
+@@ -444,11 +595,31 @@ void NetworkInputRouter::OnInputCaptured()
+         mCurrentMessage.SetNetworkInputMessageSyncData(
+             mCurrentCRC, frame, GetNetworkRandomSeed());
+     }
++#if defined(MSCHARGED_TWEAKS)
++    // With rollback the state now may rest on predicted inputs: the checksum
++    // sent is that of the last step whose inputs all arrived.
++    if (mscharged_rollback_predicting())
++    {
++        u32 confirmedChecksum, confirmedFrame, confirmedSeed;
++        mCurrentMessage.mFlags &= ~4;
++        if (mscharged_rollback_sync_data(&confirmedChecksum, &confirmedFrame, &confirmedSeed))
++        {
++            mCurrentMessage.SetNetworkInputMessageSyncData(confirmedChecksum, confirmedFrame, confirmedSeed);
++        }
++    }
++#endif
+ 
+     while (m_OutgoingCustomDetermDataQ.GetCount() > 0)
      {
          DetermDataEvent* event = m_OutgoingCustomDetermDataQ.Pop();
          mCurrentMessage.AddNetworkInputMessageEvent(event);
@@ -415,11 +521,16 @@ index 14e2acd..5ba9b4b 100644
          delete event;
      }
  
-@@ -512,6 +655,12 @@ inline void NetworkInputRouter::RecordEmptyInputHeader(s8 machine, int frame)
+@@ -512,6 +683,17 @@ inline void NetworkInputRouter::RecordEmptyInputHeader(s8 machine, int frame)
  void NetworkInputRouter::OnInputReady()
  {
      bool congested = false;
 +#if defined(MSCHARGED_TWEAKS)
++    if (mscharged_rollback_predicting())
++    {
++        mscharged_rollback_input_ready();
++        return;
++    }
 +    if (mscharged_rollback_active())
 +    {
 +        BeginRollbackInputs();
@@ -428,7 +539,7 @@ index 14e2acd..5ba9b4b 100644
  
      if (mQueueLimit > GetQueueCursor())
      {
-@@ -542,6 +691,12 @@ void NetworkInputRouter::OnInputReady()
+@@ -542,6 +724,12 @@ void NetworkInputRouter::OnInputReady()
                          mInputStates[playerId]);
                  }
              }
@@ -441,7 +552,7 @@ index 14e2acd..5ba9b4b 100644
          }
      }
      else
-@@ -593,6 +748,12 @@ void NetworkInputRouter::OnInputReady()
+@@ -593,6 +781,12 @@ void NetworkInputRouter::OnInputReady()
  
                  Function<DetermDataEvent*> disposer(FreeDetermDataEvent);
                  sDetermDataEventQueue.Queue(event, disposer);
@@ -454,7 +565,7 @@ index 14e2acd..5ba9b4b 100644
              }
  
              if (gNetworkInputRecording->mRecording)
-@@ -622,6 +783,12 @@ void NetworkInputRouter::OnInputReady()
+@@ -622,6 +816,12 @@ void NetworkInputRouter::OnInputReady()
                          mInputStates[playerId]);
                  }
              }
@@ -467,7 +578,7 @@ index 14e2acd..5ba9b4b 100644
          }
  
          if (congested)
-@@ -654,6 +821,12 @@ void NetworkInputRouter::OnInputReady()
+@@ -654,6 +854,12 @@ void NetworkInputRouter::OnInputReady()
      {
          gNetworkInputRecording->Flush();
      }
