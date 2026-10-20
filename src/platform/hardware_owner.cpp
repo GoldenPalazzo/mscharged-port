@@ -1,4 +1,5 @@
 #include "platform/hardware_owner.h"
+#include "platform/test_driver.h"
 #if defined(MSCHARGED_HOST_SCREENSHOTS)
 #include "platform/screenshot_hotkey.h"
 #endif
@@ -226,6 +227,15 @@ void InitializeNativeHardwareInput(SDL_Window* window, WpadSDLSettings settings,
         if (state.close_retained && (state.thread != std::this_thread::get_id() ||
                 state.close_window != window || SDL_GetWindowFromID(state.window) != window))
             throw std::logic_error("Native input cannot replace its retained close window lifetime");
+    }
+    if (TestDriverActive()) {
+        // A test script plays player 1 on the keyboard, with no controller.
+        players.remotes.clear();
+        for (auto& channel : players.gamepads) channel = -1;
+        players.keyboard = 0;
+        settings.physical_wii_remotes = false;
+        desktop.keyboard = true;
+        desktop.mouse = true;
     }
     ConfigureWpadSDL(settings);
     // Real Wii Remotes that are already on take their players before the

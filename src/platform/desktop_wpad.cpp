@@ -1,4 +1,5 @@
 #include "platform/desktop_wpad.h"
+#include "platform/test_driver.h"
 #include "platform/desktop_dpd.h"
 #include "platform/desktop_nunchuk.h"
 #include "platform/gyro_pointer.h"
@@ -604,6 +605,7 @@ void InitializeDesktopWpad(SDL_Window* window, DesktopWpadSettings settings) {
 }
 void ServiceDesktopWpad() {
     RequireOwner();
+    mscharged::platform::ServiceTestDriver();
     auto& state = Get();
     SDL_UpdateGamepads();
     for (auto& pad : state.pads) if (pad && !SDL_GamepadConnected(pad->input)) Retire(pad);
@@ -659,8 +661,10 @@ void ServiceDesktopWpad() {
         std::lock_guard lock(state.mutex);
         if (state.event_memory_failed)
             throw std::runtime_error("Desktop input instance metadata allocation failed");
-        focused = state.focused;
+        // A test script plays as if its keys were typed into the focused window.
+        focused = state.focused || mscharged::platform::TestDriverActive();
         keys = state.keys;
+        mscharged::platform::ApplyTestDriverKeys(keys.data(), keys.size());
         shake_requests = state.shake_requests;
         state.shake_requests = {};
         mouse_known = state.mouse_known;
@@ -680,11 +684,16 @@ void ServiceDesktopWpad() {
                           !std::isfinite(projection.top) || !std::isfinite(projection.width) ||
                           !std::isfinite(projection.height) || projection.width <= 0 || projection.height <= 0))
             throw std::invalid_argument("Native mouse projection has no valid presented content domain");
-        const bool visible = available && focused && mouse_known && mouse_inside &&
+        bool visible = available && focused && mouse_known && mouse_inside &&
             mouse_x >= projection.left && mouse_x <= projection.left + projection.width &&
             mouse_y >= projection.top && mouse_y <= projection.top + projection.height;
-        const float x = visible ? (mouse_x - projection.left) / projection.width : 0;
-        const float y = visible ? (mouse_y - projection.top) / projection.height : 0;
+        float x = visible ? (mouse_x - projection.left) / projection.width : 0;
+        float y = visible ? (mouse_y - projection.top) / projection.height : 0;
+        if (float aim_x, aim_y; mscharged::platform::TestDriverPointer(aim_x, aim_y)) {
+            visible = true;
+            x = aim_x;
+            y = aim_y;
+        }
         observation = MakeDesktopDpdObservation(x, y, WPADGetSensorBarPosition(), visible,
                                                 state.settings.kpad_sensor_height);
         if (state.settings.share_mouse_with_remotes) SetNativeWpadSharedPointer(&observation);
