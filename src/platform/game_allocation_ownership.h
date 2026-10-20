@@ -294,7 +294,15 @@ void SetGameAllocationObserver(GameAllocationObserver observer) noexcept;
 // records to it too and closes the checkpoint. Records at addresses `keep`
 // accepts (memory that was not restored) stay as they are. It returns how many
 // frees could not be undone exactly (records that owned native data). End
-// closes the checkpoint and keeps the records as they are.
+// closes the checkpoint and keeps the records as they are. A mark is a point
+// inside the open checkpoint (one per snapshot): RollbackTo returns the records
+// to it, as Rollback does to Begin, and keeps the checkpoint open; the marks
+// after it are gone.
+struct GameAllocationMark
+{
+    std::size_t position;
+    std::uint64_t incarnation;
+};
 // Asynchronous producers of original bytes (disc reads and the like): how many
 // are still writing, and how many ever started. A rollback cannot cross one.
 struct GameByteProducers
@@ -305,5 +313,7 @@ struct GameByteProducers
 GameByteProducers CurrentGameByteProducers();
 void BeginGameAllocationCheckpoint();
 std::size_t RollbackGameAllocationCheckpoint(bool (*keep)(std::uintptr_t address));
+GameAllocationMark MarkGameAllocationCheckpoint();
+std::size_t RollbackGameAllocationCheckpointTo(const GameAllocationMark& mark, bool (*keep)(std::uintptr_t address));
 void EndGameAllocationCheckpoint();
 }
