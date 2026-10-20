@@ -157,6 +157,7 @@ constexpr int kMachineEvents = 4;        // deterministic data events in one inp
 constexpr int kInputRing = 32;           // RECHARGED_ROLLBACK: steps whose inputs are kept
 constexpr int kConfirmedRing = 64;       // RECHARGED_ROLLBACK: checksums of steps whose inputs all arrived
 constexpr int kRemoteChecks = 32;        // RECHARGED_ROLLBACK: other machines' checksums waiting for ours
+constexpr unsigned kSettleSteps = 25;    // RECHARGED_ROLLBACK: steps after tracking starts that predict nothing
 
 // What a replayed frame does with each task: run it as it ran, leave it out
 // (pads, sound, network, disc, movies, saving), or its replay part.
@@ -332,6 +333,7 @@ struct State
     std::uint64_t taskNs[kMaxTasks], stepNs, saveNs;
     std::uint64_t replayFaults, replaySavedPages, replayHotPages; // of the replayed steps and their saves
     std::uint64_t markNs; // of the replayed saves, the allocation registry's part
+    std::uint64_t savesSkipped;
 
     // RECHARGED_ROLLBACK: network matches that predict.
     bool netplay;
@@ -344,6 +346,9 @@ struct State
     unsigned waitThrough;             // steps through this one wait for all their inputs (they were undone)
     unsigned undoFrom;                // a predicted step changed the match's phase: undone at the frame start
     unsigned replayEnd;               // the last step a replay runs
+    unsigned saveFrom;                // the first replayed step a later rollback may go back to (0: any)
+    mscharged::platform::GameAllocationMark replayMark; // the last kept during a replay
+    unsigned trackingFrom;            // the step tracking started after
     bool captured;
     unsigned capturedFrame;           // the local inputs were captured through this frame
     bool haveConfirmed;
@@ -622,6 +627,8 @@ void WriteSummary()
                            "%llu; waits for inputs: as the original router %llu, prediction window full %llu\n",
                      static_cast<unsigned long long>(s.undone), static_cast<unsigned long long>(s.truncated),
                      static_cast<unsigned long long>(s.lockstepWaits), static_cast<unsigned long long>(s.windowWaits));
+        std::fprintf(file, "replayed steps not saved (no rollback could go back to them) %llu\n",
+                     static_cast<unsigned long long>(s.savesSkipped));
         std::fprintf(file, "time sync: ahead of the others by %.2f steps now, %.2f on average, %.2f at most; "
                            "slowed by %.2f s in all\n",
                      s.lead, s.leadSamples ? s.leadSum / static_cast<double>(s.leadSamples) : 0.0, s.maxLead,
@@ -816,6 +823,7 @@ bool Start(FixedUpdateTask* task, unsigned long taskBytes, unsigned (*checksum)(
     step.hostFrame = 0;
     RecordFrame(step);
     s.latest = frame;
+    s.trackingFrom = frame;
     s.stored = 1;
     s.haveInputs = false;
     s.receivedCount = 0;
@@ -1235,10 +1243,22 @@ void ReplayFrames(std::uint64_t first, std::uint64_t last, int firstTask, unsign
                 }
                 const std::uint64_t pagesBefore = snapshots.savedPages;
                 s.replayHotPages += snapshots.hotPages;
-                step.snapshot = mscharged::platform::SaveRollbackSnapshot();
-                const std::uint64_t markStart = NowNs();
-                step.mark = mscharged::platform::MarkGameAllocationCheckpoint();
-                s.markNs += NowNs() - markStart;
+                if (next < s.saveFrom)
+                {
+                    // Its inputs and those before it have all arrived: no
+                    // rollback goes back to it, and the next save holds its changes.
+                    step.snapshot = 0;
+                    step.mark = s.replayMark;
+                    ++s.savesSkipped;
+                }
+                else
+                {
+                    step.snapshot = mscharged::platform::SaveRollbackSnapshot();
+                    const std::uint64_t markStart = NowNs();
+                    step.mark = mscharged::platform::MarkGameAllocationCheckpoint();
+                    s.markNs += NowNs() - markStart;
+                    s.replayMark = step.mark;
+                }
                 s.saveNs += NowNs() - saveStart;
                 s.replayFaults += snapshots.faults - faultsBefore;
                 s.replaySavedPages += snapshots.savedPages - pagesBefore;
@@ -1345,6 +1365,7 @@ bool RollBack(unsigned target, unsigned replayEnd, int (*replay)(const Mscharged
         return false;
     }
     s.lossyFrees += mscharged::platform::RollbackGameAllocationCheckpointTo(from.mark, Excluded);
+    s.replayMark = from.mark;
     Record(NowNs() - start, s.restoreNs, s.maxRestoreNs);
 
     // The frames from the target step's on, the first from the task after the
@@ -1385,6 +1406,7 @@ bool RollBack(unsigned target, unsigned replayEnd, int (*replay)(const Mscharged
     RollbackRedeliverMegaStrikeMeter(s.received, s.receivedCount);
     s.meterRedelivered += s.receivedCount;
     s.resimulating = false;
+    s.saveFrom = 0;
     if (next != s.replayEnd + 1) std::fprintf(s.out, "REPLAY MISSED STEPS %u to %u\n", next, s.replayEnd);
     if (s.netplay && s.replayEnd < ran)
     {
@@ -1583,6 +1605,9 @@ bool CanPredict(unsigned frame)
 {
     State& s = *sState;
     if (!s.active || s.latest + 1 != frame || frame <= s.waitThrough) return false;
+    // Tracking starts as play does, after a goal, a NIS or a pause: the disc
+    // reads the game starts then (a rollback cannot cross them) are let pass.
+    if (frame <= s.trackingFrom + kSettleSteps) return false;
     const Phases phases = CurrentPhases();
     if (!PredictablePhases(phases) || !(phases == s.steps[s.latest % kRing].phases)) return false;
     const unsigned oldest = OldestPredicted();
@@ -1674,6 +1699,10 @@ void Resolve()
     }
     if (!earliest || earliest > s.latest) return;
     for (unsigned f = earliest; f <= s.latest; ++f) Compose(InputsFor(f), s.steps[f % kRing].inputs);
+    // A later rollback goes back at most to the last step whose inputs, and
+    // those of every step before, have all arrived.
+    const unsigned oldest = OldestPredicted();
+    s.saveFrom = oldest ? oldest - 1 : s.lastInputFrame;
     ++s.correctionRollbacks;
     RollBack(earliest - 1, s.latest, s.replay, s.checksum);
 }
