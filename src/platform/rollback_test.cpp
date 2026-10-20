@@ -281,6 +281,9 @@ struct State
     std::uint64_t mismatches, nisInReplay, lossyFrees, failedRestores, untracked;
     unsigned firstMismatchFrame;
     std::uint64_t rollbackNs, maxRollbackNs, restoreNs, maxRestoreNs;
+    // Where the replays' time goes: each task's, and in the fixed update's the
+    // steps' and the saves'.
+    std::uint64_t taskNs[kMaxTasks], stepNs, saveNs;
 };
 State* sState;
 std::mutex sMutex; // the hooks (main thread) and the watchdog
@@ -549,6 +552,21 @@ void WriteSummary()
                      s.maxRestoreNs / 1e3);
         std::fprintf(file, "rollback (restore, replay, saves): %.2f ms avg / %.2f ms max\n",
                      s.rollbackNs / 1e6 / s.rollbacks, s.maxRollbackNs / 1e6);
+    }
+    if (s.framesReplayed)
+    {
+        const double frames = static_cast<double>(s.framesReplayed);
+        std::fprintf(file, "replay, us per frame replayed:");
+        for (int i = 0; i < s.taskCount; ++i)
+            if (s.taskNs[i])
+            {
+                const char* name = s.tasks[i]->GetName();
+                std::fprintf(file, " %s %.0f", name ? name : "?", s.taskNs[i] / 1e3 / frames);
+            }
+        if (s.replayed)
+            std::fprintf(file, "; us per step replayed: step %.0f, save %.0f", s.stepNs / 1e3 / s.replayed,
+                         s.saveNs / 1e3 / s.replayed);
+        std::fprintf(file, "\n");
     }
     const auto registry = mscharged::platform::CurrentGameAllocationCheckpointStats();
     std::fprintf(file, "registry: %llu copies of an allocation's facts, %zu journal entries held; changes it does "
@@ -996,6 +1014,7 @@ void ReplayFrame(std::uint64_t frame, int firstTask, unsigned& next, int (*repla
         if (record.dt[i] < 0 || s.replays[i] == kSkip) continue;
         manager->mCurrentTimeDelta = record.dt[i];
         manager->mRealTimeDelta = record.real[i];
+        const std::uint64_t taskStart = NowNs();
         switch (s.replays[i])
         {
         case kRun:
@@ -1010,10 +1029,13 @@ void ReplayFrame(std::uint64_t frame, int firstTask, unsigned& next, int (*repla
             for (; next <= s.latest && s.steps[next % kRing].hostFrame == frame; ++next)
             {
                 Step& step = s.steps[next % kRing];
+                const std::uint64_t stepStart = NowNs();
                 RollbackRedeliverMegaStrikeMeter(step.meter, step.meterCount);
                 s.meterRedelivered += step.meterCount;
                 if (replay(&step.inputs) < 0) ++s.nisInReplay;
                 const unsigned now = checksum();
+                const std::uint64_t saveStart = NowNs();
+                s.stepNs += saveStart - stepStart;
                 if (now != step.checksum)
                 {
                     if (!s.mismatches) s.firstMismatchFrame = next;
@@ -1023,6 +1045,7 @@ void ReplayFrame(std::uint64_t frame, int firstTask, unsigned& next, int (*repla
                 }
                 step.snapshot = mscharged::platform::SaveRollbackSnapshot();
                 step.mark = mscharged::platform::MarkGameAllocationCheckpoint();
+                s.saveNs += NowNs() - saveStart;
                 ++s.replayed;
             }
             auto* fixed = static_cast<FixedUpdateTask*>(s.tasks[i]);
@@ -1033,6 +1056,7 @@ void ReplayFrame(std::uint64_t frame, int firstTask, unsigned& next, int (*repla
         case kSkip:
             break;
         }
+        s.taskNs[i] += NowNs() - taskStart;
     }
     ++s.framesReplayed;
 }
