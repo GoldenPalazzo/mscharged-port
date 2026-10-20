@@ -12,8 +12,10 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <random>
 #include <sstream>
 #include <string>
+#include <vector>
 
 namespace mscharged::platform
 {
@@ -23,12 +25,13 @@ using Clock = std::chrono::steady_clock;
 
 struct Command
 {
-    enum Kind { Key, Wait, Snap, Point } kind;
+    enum Kind { Key, Wait, Snap, Point, Mash } kind;
     float x = 0, y = 0;
     bool aim = false;
     SDL_Scancode key = SDL_SCANCODE_UNKNOWN;
     int ms = 0;
     std::string name;
+    std::vector<SDL_Scancode> keys; // Mash
 };
 
 struct Driver
@@ -41,6 +44,10 @@ struct Driver
     SDL_Scancode held = SDL_SCANCODE_UNKNOWN;
     bool aiming = false;
     float x = 0, y = 0;
+    // A mash under way: until when, from which keys.
+    Clock::time_point mashUntil{};
+    std::vector<SDL_Scancode> mashKeys;
+    std::mt19937 random{1};
     int scripts = 0;
     std::mutex mutex;
 };
@@ -96,6 +103,19 @@ void Load(Driver& driver)
                 words >> command.y;
             }
         }
+        else if (verb == "mash")
+        {
+            command.kind = Command::Mash;
+            words >> command.ms;
+            for (std::string key; words >> key;)
+            {
+                const SDL_Scancode code = SDL_GetScancodeFromName(key.c_str());
+                if (code == SDL_SCANCODE_UNKNOWN)
+                    std::fprintf(stderr, "Test driver: unknown key %s\n", key.c_str());
+                else
+                    command.keys.push_back(code);
+            }
+        }
         else if (verb == "snap")
         {
             command.kind = Command::Snap;
@@ -140,6 +160,16 @@ void ServiceTestDriver()
     }
     if (now < driver->until) return;
     driver->held = SDL_SCANCODE_UNKNOWN;
+    if (now < driver->mashUntil && !driver->mashKeys.empty())
+    {
+        // A random key (or none, one time in four) for 30 to 400 ms.
+        std::uniform_int_distribution<std::size_t> pick(0, driver->mashKeys.size() * 4 / 3);
+        const std::size_t index = pick(driver->random);
+        if (index < driver->mashKeys.size()) driver->held = driver->mashKeys[index];
+        const auto hold = std::chrono::milliseconds(std::uniform_int_distribution<int>(30, 400)(driver->random));
+        driver->until = std::min(driver->mashUntil, now + hold);
+        return;
+    }
     while (!driver->queue.empty())
     {
         const Command command = driver->queue.front();
@@ -152,6 +182,11 @@ void ServiceTestDriver()
             return;
         case Command::Wait:
             driver->until = now + std::chrono::milliseconds(command.ms);
+            return;
+        case Command::Mash:
+            driver->mashUntil = now + std::chrono::milliseconds(command.ms);
+            driver->mashKeys = command.keys;
+            driver->until = now;
             return;
         case Command::Point:
             driver->aiming = command.aim;

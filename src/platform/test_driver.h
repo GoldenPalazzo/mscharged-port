@@ -15,6 +15,8 @@
 //   snap <name>                    screenshot to <dir>/<name>.png
 //   point <x> <y>                  aim the pointer there, as fractions of the
 //                                  picture (0 0 top left); "point off" hides it
+//   mash <ms> <key> [<key> ...]    for that long, hold random keys of these
+//                                  (or none) for 30 to 400 ms each
 // '#' starts a comment.
 namespace mscharged::platform
 {
