@@ -694,8 +694,8 @@ void WriteSummary()
                 std::fprintf(file, " %s %.0f", name ? name : "?", s.taskNs[i] / 1e3 / frames);
             }
         if (s.replayed)
-            std::fprintf(file, "; us per step replayed: step %.0f, save %.0f (registry %.0f); per step replayed: faults %.0f, "
-                               "pages saved %.0f of %.0f hot",
+            std::fprintf(file, "; us per step replayed: step %.0f, save %.0f (registry %.0f); "
+                               "per step replayed: faults %.0f, pages saved %.0f of %.0f hot",
                          s.stepNs / 1e3 / s.replayed, s.saveNs / 1e3 / s.replayed,
                          s.markNs / 1e3 / s.replayed,
                          static_cast<double>(s.replayFaults) / s.replayed,
