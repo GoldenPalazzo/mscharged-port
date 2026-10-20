@@ -29,15 +29,16 @@
 // with the native pool records the game points at (their own heap) and the
 // registry of the game's memory (its rollback checkpoint).
 //
-// A replayed step reads no pads, captures and sends nothing, and queues no
-// deterministic data (it went out the first time). Around the steps the replay
-// runs again the frames they were played in, as many as there were (none
-// between two steps of one frame, several at a frame rate above the steps'):
-// what their other tasks do to the match and its presentation (cameras, NIS,
-// meters, indicators, darkening, particles, HUD, scenes, stadium, events),
-// without drawing, each task with the time step it had. The mega strike
-// meter's presses, which come from the shooter's machine outside the inputs,
-// go again to the steps that received them.
+// A replay runs whole frames again, as the task manager ran them, each task
+// with the time step it had and the frame rate option's state each frame
+// started with: the drawing recomputes its own state with the match's (with
+// nowhere to draw, GLView drops it), and the frame's end empties the views
+// and the frame memory without sending anything. The pads, sound, network,
+// disc and movies stay out, and the fixed update runs the recorded steps: no
+// pads, no capture, nothing sent, no deterministic data queued (it went out
+// the first time). The mega strike meter's presses, which come from the
+// shooter's machine outside the inputs, go again to the steps that received
+// them.
 //
 // The game makes no sounds at all while the test runs, menus included: audio
 // is not part of the rollback yet, and the audio code's slot pools keep their
@@ -70,6 +71,7 @@ extern "C" void mscharged_rollback_frame_start(void) {}
 #include "Game/InputRouter.h"
 #include "Game/NetworkSession.h"
 #include "Game/NetworkSync.h"
+#include "Game/Effects/EffectsTemplate.h"
 #include "Game/Task/DispatchEventsTask.h"
 #include "Game/Task/FixedUpdateTask.h"
 #include "NL/MemAlloc.h"
@@ -82,6 +84,7 @@ extern "C" void mscharged_rollback_frame_start(void) {}
 #include "platform/game_allocation_ownership.h"
 #include "platform/game_resource_records.h"
 #include "platform/rollback_snapshot.h"
+#include "platform/tweak_frame_state.h"
 
 #include <algorithm>
 #include <chrono>
@@ -133,28 +136,33 @@ constexpr int kMaxWatched = 256;         // ranges the comparison watches althou
 constexpr int kMaxPlaces = 4096;         // places the comparison tells apart
 constexpr int kDetailedCompares = 3;     // comparisons listed in full in the log
 constexpr int kListedPlaces = 60;        // places per detailed comparison, and in the summary
-constexpr int kMaxFrames = 8;            // frames ended between two steps (a 240 Hz display has 4 or 5)
+constexpr int kMaxTasks = 32;            // tasks the task manager runs
+constexpr int kFrameRing = 64;           // frames kept: those of the deepest rollback, at any frame rate
 
-// The tasks whose frames a replay runs again around the steps, found by name.
-enum ReplayedTask
+// What a replayed frame does with each task: run it as it ran, leave it out
+// (pads, sound, network, disc, movies, saving), or its replay part.
+enum TaskReplay
 {
-    kBeginFrame,
-    kGameRender,
-    kParticles,
-    kFrontEnd,
-    kDispatch,
-    kReplayedTasks
+    kSkip,
+    kRun,
+    kFixed, // its steps, after its work before them (RollbackReplayFixedFrame)
+    kEnd    // the frame's end without sending it (RollbackReplayEndFrame)
 };
-constexpr const char* kReplayedTaskNames[kReplayedTasks] = {"Begin Frame", "Game Render", "Particle Update",
-                                                            "Front End", "Dispatch Events"};
-// The time step each of them had in one frame, < 0 when it did not run: the
-// task manager measures each task's own, and only some are slowed down with
-// the match.
-struct FrameTimes
+constexpr const char* kRunTasks[] = {"Begin Frame",          "World",     "Game Render",    "Particle Update",
+                                     "NIS Transition Wiper", "Front End", "Dispatch Events"};
+
+// One frame as the task manager ran it: each task's time step and real time,
+// < 0 for a task that did not run, and the frame rate option's state at its
+// start.
+struct FrameRecord
 {
-    float task[kReplayedTasks];
+    float dt[kMaxTasks];
+    float real[kMaxTasks];
+    MschargedTweakFrameState tweak;
+    // The fixed update's time left over after the frame's steps, which the
+    // drawing interpolates with (left out of the rollback, as the clocks).
+    float accumulated, interpolation;
 };
-constexpr FrameTimes kNoFrame = {{-1.0f, -1.0f, -1.0f, -1.0f, -1.0f}};
 
 struct Range
 {
@@ -178,12 +186,7 @@ struct Step
     Phases phases;                  // after it
     bool reading;                   // a disc read in flight after it
     std::uint64_t readsStarted;     // disc reads started until then
-    // The frames that ended since the step before, from the end of that one's,
-    // and BeginFrameTask's time step in its own (< 0 when it shares the frame).
-    FrameTimes frames[kMaxFrames];
-    int frameCount;
-    bool framesOverflowed;
-    float beginFrame;
+    std::uint64_t hostFrame;        // the frame it ran in
     // The mega strike meter's presses received from the shooter's machine
     // before it, outside the router's inputs.
     bool meter[kMaxMeter];
@@ -237,11 +240,17 @@ struct State
     bool received[kMaxMeter];        // meter presses received since the last step
     int receivedCount;
     bool receivedOverflowed;
-    const void* replayedTasks[kReplayedTasks];
-    FrameTimes frame;               // the frame under way
-    FrameTimes ended[kMaxFrames];   // frames ended since the last step
-    int endedCount;
-    bool endedOverflowed;
+    nlTask* tasks[kMaxTasks];       // in the task manager's order
+    TaskReplay replays[kMaxTasks];
+    int taskCount;
+    FrameRecord frames[kFrameRing];
+    std::uint64_t hostFrame;        // frames since tracking started, the one under way
+    // The random seeds the game's presentation draws from, as they were before
+    // a task a replay leaves out (the audio's sounds and the transitions also
+    // draw from the default one): put back after it, so that the first run
+    // draws what the replay does.
+    bool seedsSaved;
+    unsigned int defaultSeed, effectsSeed;
     Step steps[kRing];
     unsigned latest;  // frame of the last step saved
     int stored;       // consecutive steps saved since tracking started
@@ -485,7 +494,7 @@ Phases CurrentPhases()
     return phases;
 }
 
-// What a rollback past this step must check, and the time its frame's tasks ran with.
+// What a rollback past this step must check.
 void RecordFrame(Step& step)
 {
     step.phases = CurrentPhases();
@@ -582,30 +591,75 @@ void WriteSummary()
     std::fclose(file);
 }
 
-bool FindReplayedTasks()
+// The tasks in the task manager's order, and what a replay does with each.
+bool FindTasks(FixedUpdateTask* fixed)
 {
     State& s = *sState;
-    std::fill(std::begin(s.replayedTasks), std::end(s.replayedTasks), nullptr);
+    s.taskCount = 0;
     nlTaskManager* manager = nlTaskManager::m_pInstance;
     if (!manager || !manager->mTaskList) return false;
     nlTask* first = manager->mTaskList;
     nlTask* t = first;
+    std::fprintf(s.out, "tasks:");
     do
     {
+        if (s.taskCount == kMaxTasks) return false;
         const char* name = t->GetName();
-        for (int i = 0; name && i < kReplayedTasks; ++i)
-            if (!s.replayedTasks[i] && std::strcmp(name, kReplayedTaskNames[i]) == 0) s.replayedTasks[i] = t;
+        TaskReplay replay = kSkip;
+        if (t == fixed)
+            replay = kFixed;
+        else if (name && !std::strcmp(name, "End Frame"))
+            replay = kEnd;
+        else
+            for (const char* run : kRunTasks)
+                if (name && !std::strcmp(name, run)) replay = kRun;
+        std::fprintf(s.out, " %s (%s)", name ? name : "?",
+                     replay == kSkip ? "left out" : replay == kRun ? "run" : "its replay part");
+        s.tasks[s.taskCount] = t;
+        s.replays[s.taskCount++] = replay;
         t = t->m_next;
     } while (t && t != first);
-    return std::find(std::begin(s.replayedTasks), std::end(s.replayedTasks), nullptr) == std::end(s.replayedTasks);
+    std::fprintf(s.out, "\n");
+    return true;
+}
+
+void RestoreSeeds()
+{
+    State& s = *sState;
+    if (!s.seedsSaved) return;
+    s.seedsSaved = false;
+    nlDefaultSeed = s.defaultSeed;
+    gEffectsRandomSeed = s.effectsSeed;
+}
+
+int fixedIndexOf()
+{
+    const State& s = *sState;
+    int index = 0;
+    while (index < s.taskCount - 1 && s.replays[index] != kFixed) ++index;
+    return index;
+}
+
+FrameRecord& Frame(std::uint64_t frame)
+{
+    return sState->frames[frame % kFrameRing];
+}
+
+void BeginFrameRecord()
+{
+    State& s = *sState;
+    FrameRecord& record = Frame(s.hostFrame);
+    std::fill(std::begin(record.dt), std::end(record.dt), -1.0f);
+    std::fill(std::begin(record.real), std::end(record.real), -1.0f);
+    mscharged_tweak_save_frame_state(&record.tweak);
 }
 
 bool Start(FixedUpdateTask* task, unsigned long taskBytes, unsigned (*checksum)(void))
 {
     State& s = *sState;
-    if (!FindReplayedTasks())
+    if (!FindTasks(task))
     {
-        std::fprintf(s.out, "rollback test: a task it replays is missing; stopped\n");
+        std::fprintf(s.out, "rollback test: cannot list the tasks; stopped\n");
         std::fflush(s.out);
         return false;
     }
@@ -626,15 +680,16 @@ bool Start(FixedUpdateTask* task, unsigned long taskBytes, unsigned (*checksum)(
     step.snapshot = mscharged::platform::BeginRollbackSnapshots();
     step.mark = mscharged::platform::MarkGameAllocationCheckpoint();
     step.checksum = checksum();
+    step.hostFrame = 0;
     RecordFrame(step);
     s.latest = frame;
     s.stored = 1;
     s.haveInputs = false;
     s.receivedCount = 0;
     s.receivedOverflowed = false;
-    s.frame = kNoFrame;
-    s.endedCount = 0;
-    s.endedOverflowed = false;
+    s.hostFrame = 0;
+    s.seedsSaved = false;
+    BeginFrameRecord();
     s.active = true;
     ++s.starts;
     std::fprintf(s.out, "tracking from frame %u\n", frame);
@@ -928,27 +983,58 @@ void CompareAfterReplay(unsigned frame, int depth)
     std::fflush(s.out);
 }
 
-// What a frame's tasks after its steps did: the drawing's updates, the
-// particles, the front end, the events.
-void ReplayFrameEnd(const FrameTimes& frame)
+// Replays a frame's tasks from `firstTask`, as the task manager ran them, with
+// the steps in it from `next` (the steps with their inputs, a save after each).
+void ReplayFrame(std::uint64_t frame, int firstTask, unsigned& next, int (*replay)(const MschargedRollbackInputs*),
+                 unsigned (*checksum)(void), int depth)
 {
-    if (frame.task[kGameRender] >= 0) RollbackReplayGameRender(frame.task[kGameRender]);
-    if (frame.task[kParticles] >= 0) RollbackReplayParticles(frame.task[kParticles]);
-    if (frame.task[kFrontEnd] >= 0) RollbackReplayFrontEnd(frame.task[kFrontEnd]);
-    if (frame.task[kDispatch] >= 0) gDispatchEventsTask->Run(frame.task[kDispatch]);
-}
-
-// The frames that ended between two steps: the rest of each, and the start of
-// the next, up to the second step (`beginFrame`, < 0 when there is none).
-void ReplayFrames(const FrameTimes* frames, int count, float beginFrame)
-{
-    for (int i = 0; i < count; ++i)
+    State& s = *sState;
+    const FrameRecord& record = Frame(frame);
+    nlTaskManager* manager = nlTaskManager::m_pInstance;
+    for (int i = firstTask; i < s.taskCount; ++i)
     {
-        ReplayFrameEnd(frames[i]);
-        const float begin = i + 1 < count ? frames[i + 1].task[kBeginFrame] : beginFrame;
-        if (begin >= 0) RollbackReplayBeginFrame(begin);
+        if (record.dt[i] < 0 || s.replays[i] == kSkip) continue;
+        manager->mCurrentTimeDelta = record.dt[i];
+        manager->mRealTimeDelta = record.real[i];
+        switch (s.replays[i])
+        {
+        case kRun:
+            s.tasks[i]->Run(record.dt[i]);
+            break;
+        case kEnd:
+            RollbackReplayEndFrame();
+            break;
+        case kFixed:
+        {
+            if (firstTask == 0) RollbackReplayFixedFrame(record.dt[i]); // done before the first frame's target step
+            for (; next <= s.latest && s.steps[next % kRing].hostFrame == frame; ++next)
+            {
+                Step& step = s.steps[next % kRing];
+                RollbackRedeliverMegaStrikeMeter(step.meter, step.meterCount);
+                s.meterRedelivered += step.meterCount;
+                if (replay(&step.inputs) < 0) ++s.nisInReplay;
+                const unsigned now = checksum();
+                if (now != step.checksum)
+                {
+                    if (!s.mismatches) s.firstMismatchFrame = next;
+                    if (s.mismatches++ < kListedMismatches)
+                        std::fprintf(s.out, "REPLAYED FRAME %u (%d back from %u): checksum %08x, first run %08x\n",
+                                     next, depth, s.latest, now, step.checksum);
+                }
+                step.snapshot = mscharged::platform::SaveRollbackSnapshot();
+                step.mark = mscharged::platform::MarkGameAllocationCheckpoint();
+                ++s.replayed;
+            }
+            auto* fixed = static_cast<FixedUpdateTask*>(s.tasks[i]);
+            fixed->mAccumulatedDeltaT = record.accumulated;
+            fixed->mInterpolationDeltaT = record.interpolation;
+            break;
+        }
+        case kSkip:
+            break;
+        }
     }
-    sState->framesReplayed += count;
+    ++s.framesReplayed;
 }
 
 // Back `depth` steps and forward again with the same inputs.
@@ -975,7 +1061,8 @@ void RollBack(int depth, int (*replay)(const MschargedRollbackInputs*), unsigned
         ++s.skippedPhases;
         return;
     }
-    if (s.receivedOverflowed || s.endedOverflowed)
+    const std::uint64_t firstFrame = s.steps[target % kRing].hostFrame;
+    if (s.receivedOverflowed || s.hostFrame - firstFrame >= kFrameRing)
     {
         ++s.skippedEvents;
         return;
@@ -999,7 +1086,7 @@ void RollBack(int depth, int (*replay)(const MschargedRollbackInputs*), unsigned
             ++s.skippedPhases;
             return;
         }
-        if (f > target && (step.inputs.overflowed || step.meterOverflowed || step.framesOverflowed))
+        if (f > target && (step.inputs.overflowed || step.meterOverflowed))
         {
             ++s.skippedEvents;
             return;
@@ -1018,35 +1105,32 @@ void RollBack(int depth, int (*replay)(const MschargedRollbackInputs*), unsigned
     s.lossyFrees += mscharged::platform::RollbackGameAllocationCheckpointTo(from.mark, Excluded);
     Record(NowNs() - start, s.restoreNs, s.maxRestoreNs);
 
+    // The frames from the target step's on, the first from the task after the
+    // fixed update (its later steps included), through the end of the frame
+    // that just ended. The frame rate option's state is put back for each
+    // frame's start, and after the target's start for the first.
+    MschargedTweakFrameState now{};
+    mscharged_tweak_save_frame_state(&now);
+    auto* fixed = static_cast<FixedUpdateTask*>(s.tasks[fixedIndexOf()]);
+    const float accumulated = fixed->mAccumulatedDeltaT, interpolation = fixed->mInterpolationDeltaT;
     s.resimulating = true;
-    for (unsigned f = target + 1; f <= s.latest; ++f)
+    unsigned next = target + 1;
+    const int fixedIndex = fixedIndexOf();
+    for (std::uint64_t frame = firstFrame; frame <= s.hostFrame; ++frame)
     {
-        Step& step = s.steps[f % kRing];
-        ReplayFrames(step.frames, step.frameCount, step.beginFrame);
-        RollbackRedeliverMegaStrikeMeter(step.meter, step.meterCount);
-        s.meterRedelivered += step.meterCount;
-        if (replay(&step.inputs) < 0) ++s.nisInReplay;
-        const unsigned now = checksum();
-        if (now != step.checksum)
-        {
-            if (!s.mismatches) s.firstMismatchFrame = f;
-            if (s.mismatches++ < kListedMismatches)
-                std::fprintf(s.out, "REPLAYED FRAME %u (%d back from %u): checksum %08x, first run %08x\n", f, depth,
-                             s.latest, now, step.checksum);
-        }
-        step.snapshot = mscharged::platform::SaveRollbackSnapshot();
-        step.mark = mscharged::platform::MarkGameAllocationCheckpoint();
-        ++s.replayed;
+        const bool first = frame == firstFrame;
+        const std::uint64_t tweakFrame = first ? frame + 1 : frame;
+        mscharged_tweak_load_frame_state(tweakFrame <= s.hostFrame ? &Frame(tweakFrame).tweak : &now);
+        ReplayFrame(frame, first ? fixedIndex : 0, next, replay, checksum, depth);
     }
-    // What the last step's frame did after it.
-    ReplayFrames(s.ended, s.endedCount, -1.0f);
-    // And what the network gave it after the last step.
+    mscharged_tweak_load_frame_state(&now);
+    fixed->mAccumulatedDeltaT = accumulated;
+    fixed->mInterpolationDeltaT = interpolation;
+    // And what the network gave the match after the last step.
     RollbackRedeliverMegaStrikeMeter(s.received, s.receivedCount);
     s.meterRedelivered += s.receivedCount;
     s.resimulating = false;
-    // The views went back to a frame whose packet sorters were in frame memory,
-    // reused since: empty them, as the end of every frame does.
-    gl_ViewReset();
+    if (next != s.latest + 1) std::fprintf(s.out, "REPLAY MISSED STEPS %u to %u\n", next, s.latest);
     ++s.rollbacks;
     ++s.byDepth[depth];
     Record(NowNs() - start, s.rollbackNs, s.maxRollbackNs);
@@ -1169,8 +1253,21 @@ extern "C" void mscharged_rollback_task_time(const void* task, float dt)
     std::lock_guard lock(sMutex);
     State& s = *sState;
     if (!s.active) return;
-    for (int i = 0; i < kReplayedTasks; ++i)
-        if (task == s.replayedTasks[i]) s.frame.task[i] = dt;
+    RestoreSeeds();
+    FrameRecord& record = Frame(s.hostFrame);
+    for (int i = 0; i < s.taskCount; ++i)
+        if (task == s.tasks[i])
+        {
+            record.dt[i] = dt;
+            record.real[i] = nlTaskManager::m_pInstance->mRealTimeDelta;
+            if (s.replays[i] == kSkip)
+            {
+                s.seedsSaved = true;
+                s.defaultSeed = nlDefaultSeed;
+                s.effectsSeed = gEffectsRandomSeed;
+            }
+            return;
+        }
 }
 
 extern "C" void mscharged_rollback_meter_received(const bool* values, int count)
@@ -1226,12 +1323,7 @@ extern "C" void mscharged_rollback_between_steps(int (*replay)(const MschargedRo
     step.meterOverflowed = s.receivedOverflowed;
     s.receivedCount = 0;
     s.receivedOverflowed = false;
-    std::copy_n(s.ended, s.endedCount, step.frames);
-    step.frameCount = s.endedCount;
-    step.framesOverflowed = s.endedOverflowed;
-    step.beginFrame = s.frame.task[kBeginFrame];
-    s.endedCount = 0;
-    s.endedOverflowed = false;
+    step.hostFrame = s.hostFrame;
     step.checksum = checksum();
     RecordFrame(step);
     s.haveInputs = false;
@@ -1266,16 +1358,20 @@ extern "C" void mscharged_rollback_frame_start(void)
     std::lock_guard lock(sMutex);
     State& s = *sState;
     if (!s.active) return;
-    // The frame that just ended.
-    if (s.endedCount < kMaxFrames)
-        s.ended[s.endedCount++] = s.frame;
-    else
-        s.endedOverflowed = true;
-    s.frame = kNoFrame;
-    if (!s.pendingDepth) return;
-    const int depth = s.pendingDepth;
-    s.pendingDepth = 0;
-    RollBack(depth, s.replay, s.checksum);
+    RestoreSeeds(); // after the frame's last task
+    // The frame that ended, then the rollback it asked for, then the frame
+    // that starts now.
+    const auto* fixed = static_cast<const FixedUpdateTask*>(s.tasks[fixedIndexOf()]);
+    Frame(s.hostFrame).accumulated = fixed->mAccumulatedDeltaT;
+    Frame(s.hostFrame).interpolation = fixed->mInterpolationDeltaT;
+    if (s.pendingDepth)
+    {
+        const int depth = s.pendingDepth;
+        s.pendingDepth = 0;
+        RollBack(depth, s.replay, s.checksum);
+    }
+    ++s.hostFrame;
+    BeginFrameRecord();
 }
 // Calls to __cxa_throw from the game module bind to this one (hidden), which
 // logs the throw and goes on to the C++ runtime's.
