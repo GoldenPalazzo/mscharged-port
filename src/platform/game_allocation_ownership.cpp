@@ -234,8 +234,10 @@ struct Registry
     std::uint64_t checkpoint_incarnation = 0;
     std::uint64_t byte_writes_started = 0;
     // Byte write reservations alive: producers (disc reads) under way, counted
-    // so that asking needs no walk through every record.
+    // so that asking needs no walk through every record. Those into memory
+    // the rollback leaves alone (IgnoreGameByteProducersIn) are not counted.
     std::uint64_t live_reservations = 0;
+    std::uintptr_t ignored_start = 0, ignored_end = 0;
 };
 Registry& State()
 {
@@ -486,6 +488,7 @@ struct PendingBytes
     std::uint64_t graphics_incarnation = 0;
     std::uintptr_t memory_base = 0;
     std::uint64_t memory_incarnation = 0;
+    bool counted = false; // among the producers CurrentGameByteProducers reports
     PendingBytes(Records::iterator owner, std::uintptr_t address,
                  std::size_t logical, std::size_t physical, std::uint64_t write)
         : allocation(owner->first), incarnation(owner->second.incarnation), tag(write),
@@ -918,12 +921,13 @@ GameByteWriteReservation::GameByteWriteReservation(void* destination, std::size_
         auto split = ReservedByteNode();
         auto inserted = owner->second.pending_writes.insert(std::move(token->active));
         if (!inserted.inserted) throw std::logic_error("Byte reservation address conflict");
-        ++state.byte_writes_started;
+        token->counted = address < state.ignored_start || address >= state.ignored_end;
+        if (token->counted) ++state.byte_writes_started;
         RetireCompletedByteRange(owner->second, address, physicalBytes, split);
         RetireNativeBackings(owner->second,address,physicalBytes);
         ++owner->second.next_write;
         pending_ = token;
-        ++state.live_reservations;
+        if (token->counted) ++state.live_reservations;
     }
     catch (...)
     {
@@ -966,7 +970,7 @@ void GameByteWriteReservation::Reset() noexcept
     if (!pending_) return;
     auto& token = *static_cast<PendingBytes*>(pending_);
     auto& state = State(); std::lock_guard lock(state.mutex);
-    --state.live_reservations;
+    if (token.counted) --state.live_reservations;
     if (!token.completed.empty())
     {
         auto owner = state.records.find(token.allocation);
@@ -1867,6 +1871,13 @@ std::size_t RollbackGameAllocationCheckpointTo(const GameAllocationMark& mark, b
     const std::size_t lossy = UndoJournal(state, mark.position, keep);
     state.next_incarnation = mark.incarnation;
     return lossy;
+}
+void IgnoreGameByteProducersIn(const void* start, std::size_t bytes)
+{
+    auto& state = State();
+    std::lock_guard lock(state.mutex);
+    state.ignored_start = reinterpret_cast<std::uintptr_t>(start);
+    state.ignored_end = state.ignored_start + bytes;
 }
 GameByteProducers CurrentGameByteProducers()
 {

@@ -316,6 +316,9 @@ struct GameByteProducers
     std::uint64_t started;
 };
 GameByteProducers CurrentGameByteProducers();
+// Producers writing into [start, start + bytes) are left out of the counts:
+// memory the rollback leaves alone (the audio's own heap).
+void IgnoreGameByteProducersIn(const void* start, std::size_t bytes);
 // Since Begin: copies of an allocation's facts journaled, journal entries held
 // now; changes the journal does not follow (native data, MEM headers, device
 // leases, allocator discards); copies that failed for lack of host memory in a

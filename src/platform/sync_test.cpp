@@ -1920,7 +1920,7 @@ extern "C" void mscharged_synctest_fixed_step(int running)
 // included, and uses the deterministic AI clocks.
 extern "C" bool mscharged_synctest_silences_sounds(void)
 {
-    return (sState && sState->out && !sState->audit && sInFixedStep) || mscharged_rollback_active();
+    return (sState && sState->out && !sState->audit && sInFixedStep) || mscharged_rollback_resimulating();
 }
 
 extern "C" bool mscharged_synctest_active(void)
