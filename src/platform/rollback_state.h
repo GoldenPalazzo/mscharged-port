@@ -14,6 +14,8 @@
 #error The rollback belongs to the isolated original game module
 #endif
 #include "mscharged_rollback.h"
+#include "mscharged_rollback_audio.h"
+#include "mscharged_rollback_netplay.h"
 
 #include "Game/Audio/AudioBackend.h"
 #include "Game/Game.h"

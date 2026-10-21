@@ -1,6 +1,6 @@
 // The audio plays on through rollbacks, outside them: everything it makes
 // lives in a heap of its own carved from MEM2 (the game enters the audio
-// through MSCHARGED_AUDIO_SCOPE, tweak patch 0032), which no rollback
+// through MSCHARGED_AUDIO_SCOPE, tweak patch 0034), which no rollback
 // restores, with its globals and the disc reads' manager (its streams read
 // while rollbacks happen); a replayed frame starts, stops, pauses and resumes
 // no sound. RECHARGED_ROLLBACK_AUDIO_AUDIT=1 lists the call stacks of the

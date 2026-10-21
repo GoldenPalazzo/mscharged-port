@@ -29,3 +29,5 @@
 0030-sync-test-deterministic-ai.patch
 0031-sync-test-silent-audio-effects.patch
 0032-rollback-inputs-and-replay.patch
+0033-rollback-network-prediction.patch
+0034-rollback-audio-heap.patch

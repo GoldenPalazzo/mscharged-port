@@ -2,7 +2,8 @@
 //
 // RECHARGED_ROLLBACK=<file> plays network matches with rollback: a step
 // whose inputs have not arrived from another machine runs with predicted ones,
-// and goes back when they arrive and differ (rollback_netplay.cpp).
+// and goes back when they arrive and differ (rollback_netplay.cpp, tweak
+// patch 0033).
 //
 // RECHARGED_ROLLBACK_TEST=<file> rolls matches back while they are played,
 // offline and in network matches, to test the rollback before it predicts

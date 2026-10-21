@@ -194,7 +194,7 @@ function(mscharged_add_original_frontend_diagnostic target version suffix)
     # incremental snapshots a rollback will use.
     target_sources(${target} PRIVATE src/platform/sync_test.cpp src/platform/rollback_snapshot.cpp)
     # The rollback: RECHARGED_ROLLBACK (network matches predict) and RECHARGED_ROLLBACK_TEST
-    # (roll matches back while they are played), tweak patch 0032.
+    # (roll matches back while they are played), tweak patches 0032-0034.
     target_sources(${target} PRIVATE src/platform/rollback_engine.cpp src/platform/rollback_memory.cpp
         src/platform/rollback_netplay.cpp src/platform/rollback_compare.cpp src/platform/rollback_audio.cpp
         src/platform/rollback_summary.cpp src/platform/rollback_platform.cpp)
