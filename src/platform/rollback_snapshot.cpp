@@ -403,6 +403,12 @@ bool ConfigureRollbackSnapshots(const RollbackRegion* regions, int count, int de
                 const std::uintptr_t from = std::max(base, pageStart),
                                      to = std::min(base + t->regions[r].bytes, pageEnd);
                 if (from >= to) continue;
+                if (t->segmentCount[page] == UINT8_MAX)
+                {
+                    // More regions in one page than its count holds.
+                    FreeTracker(t);
+                    return false;
+                }
                 t->segments[segmentCount++] = {static_cast<std::uint32_t>(from - pageStart),
                                                static_cast<std::uint32_t>(to - from)};
                 ++t->segmentCount[page];

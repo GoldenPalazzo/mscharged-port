@@ -217,12 +217,25 @@ void ForeignThread()
 }
 }
 
+// A page holds at most 255 regions: one more is refused, not miscounted.
+void RegionsInOnePage()
+{
+    static std::uint8_t block[1 << 16];
+    const std::size_t page = PageSize();
+    auto* start = reinterpret_cast<std::uint8_t*>((reinterpret_cast<std::uintptr_t>(block) + page - 1) & ~(page - 1));
+    std::vector<RollbackRegion> regions;
+    for (int i = 0; i < 256; ++i) regions.push_back({start + 2 * i, 1});
+    Check(ConfigureRollbackSnapshots(regions.data(), 255, 2, 16), "255 regions in a page");
+    Check(!ConfigureRollbackSnapshots(regions.data(), 256, 2, 16), "256 regions in a page are refused");
+}
+
 int main()
 {
     RandomHistory(1024, 8, 400, 1);  // room for everything
     RandomHistory(1024, 3, 400, 2);  // short history: the oldest saves drop
     RandomHistory(24, 8, 400, 3);    // little room: saves drop for room, some overflow
     ForeignThread();
+    RegionsInOnePage();
     if (failures) std::cerr << failures << " failures\n";
     return failures ? 1 : 0;
 }
