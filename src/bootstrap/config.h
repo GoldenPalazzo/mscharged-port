@@ -201,6 +201,15 @@ struct Settings
     // recommended ones.
     std::array<bool, kGameTweaks.size()> tweaks = DefaultGameTweaks();
     std::string online_server;
+    // [online] rollback (experimental): network matches predict the inputs
+    // still on their way and roll back when they differ, instead of waiting
+    // for them. Every machine in the match must have it on with the same
+    // rollback_delay (input delay in steps, 0 to 8); rollback_log names a log
+    // file (its counts go to <file>.summary). Read only: saving never writes
+    // them. The environment's RECHARGED_ROLLBACK, when set, wins.
+    bool rollback = false;
+    int rollback_delay = 1;
+    std::string rollback_log;
     // gameplay.super_team_side: the team the Super Team tweak dresses as
     // robots: away, home or both.
     std::string super_team_side = "away";

@@ -45,6 +45,7 @@
 #if !defined(_WIN32)
 #include <dlfcn.h>
 #endif
+#include <cstdarg>
 #include <iterator>
 #include <typeinfo>
 
@@ -52,6 +53,20 @@ namespace mscharged::rollback
 {
 State* sState;
 std::mutex sMutex;
+
+void Log(const char* format, ...)
+{
+    if (!sState->out) return;
+    va_list arguments;
+    va_start(arguments, format);
+    std::vfprintf(sState->out, format, arguments);
+    va_end(arguments);
+}
+
+void FlushLog()
+{
+    if (sState->out) std::fflush(sState->out);
+}
 
 Phases CurrentPhases()
 {
@@ -96,7 +111,7 @@ bool FindTasks(FixedUpdateTask* fixed)
     if (!manager || !manager->mTaskList) return false;
     nlTask* first = manager->mTaskList;
     nlTask* t = first;
-    std::fprintf(s.out, "tasks:");
+    Log("tasks:");
     do
     {
         if (s.tasks.count == kMaxTasks) return false;
@@ -109,13 +124,13 @@ bool FindTasks(FixedUpdateTask* fixed)
         else
             for (const char* run : kRunTasks)
                 if (name && !std::strcmp(name, run)) replay = kRun;
-        std::fprintf(s.out, " %s (%s)", name ? name : "?",
+        Log(" %s (%s)", name ? name : "?",
                      replay == kSkip ? "left out" : replay == kRun ? "run" : "its replay part");
         s.tasks.list[s.tasks.count] = t;
         s.tasks.replays[s.tasks.count++] = replay;
         t = t->m_next;
     } while (t && t != first);
-    std::fprintf(s.out, "\n");
+    Log("\n");
     return true;
 }
 
@@ -158,8 +173,8 @@ bool Start(FixedUpdateTask* task, unsigned long taskBytes, unsigned (*checksum)(
     State& s = *sState;
     if (!FindTasks(task))
     {
-        std::fprintf(s.out, "rollback test: cannot list the tasks; stopped\n");
-        std::fflush(s.out);
+        Log("rollback test: cannot list the tasks; stopped\n");
+        FlushLog();
         return false;
     }
     FindRanges(task, taskBytes);
@@ -167,8 +182,8 @@ bool Start(FixedUpdateTask* task, unsigned long taskBytes, unsigned (*checksum)(
         || !mscharged::platform::ConfigureRollbackSnapshots(s.memory.regions, s.memory.regionCount, kMaxDepth + 1,
                                                             static_cast<std::size_t>(kMaxDepth + 1) * 512 + 2048))
     {
-        std::fprintf(s.out, "rollback test: cannot track the match; stopped\n");
-        std::fflush(s.out);
+        Log("rollback test: cannot track the match; stopped\n");
+        FlushLog();
         return false;
     }
     if (s.options.compareEvery) BuildWatched();
@@ -193,8 +208,8 @@ bool Start(FixedUpdateTask* task, unsigned long taskBytes, unsigned (*checksum)(
     BeginFrameRecord();
     s.active = true;
     ++s.stats.starts;
-    std::fprintf(s.out, "tracking from frame %u\n", frame);
-    std::fflush(s.out);
+    Log("tracking from frame %u\n", frame);
+    FlushLog();
     return true;
 }
 } // namespace
@@ -211,11 +226,11 @@ void Stop(const char* why)
     if (OldestPredicted())
     {
         // Nothing can go back before them any more.
-        std::fprintf(s.out, "STOPPED WITH INPUTS STILL PREDICTED: a misprediction now desyncs\n");
+        Log("STOPPED WITH INPUTS STILL PREDICTED: a misprediction now desyncs\n");
         for (unsigned& first : s.net.firstPredicted) first = 0;
     }
-    std::fprintf(s.out, "tracking stopped after frame %u: %s\n", s.latest, why);
-    std::fflush(s.out);
+    Log("tracking stopped after frame %u: %s\n", s.latest, why);
+    FlushLog();
     WriteSummary();
 }
 
@@ -290,7 +305,7 @@ void ReplayFrames(std::uint64_t first, std::uint64_t last, int firstTask, unsign
                 {
                     if (!s.stats.mismatches) s.stats.firstMismatchFrame = next;
                     if (s.stats.mismatches++ < kListedMismatches)
-                        std::fprintf(s.out, "REPLAYED FRAME %u (%d back from %u): checksum %08x, first run %08x\n",
+                        Log("REPLAYED FRAME %u (%d back from %u): checksum %08x, first run %08x\n",
                                      next, depth, s.latest, now, step.checksum);
                 }
                 const std::uint64_t pagesBefore = snapshots.savedPages;
@@ -402,7 +417,7 @@ bool RollBack(unsigned target, unsigned replayEnd, int (*replay)(const Mscharged
         if (s.options.netplay)
         {
             ++s.net.impossible;
-            std::fprintf(s.out, "ROLLBACK IMPOSSIBLE to frame %u from %u: %s\n", target, s.latest, why);
+            Log("ROLLBACK IMPOSSIBLE to frame %u from %u: %s\n", target, s.latest, why);
         }
         return false;
     }
@@ -460,7 +475,7 @@ bool RollBack(unsigned target, unsigned replayEnd, int (*replay)(const Mscharged
     s.stats.meterRedelivered += s.receivedCount;
     s.resimulating = false;
     s.saveFrom = 0;
-    if (next != s.replayEnd + 1) std::fprintf(s.out, "REPLAY MISSED STEPS %u to %u\n", next, s.replayEnd);
+    if (next != s.replayEnd + 1) Log("REPLAY MISSED STEPS %u to %u\n", next, s.replayEnd);
     if (s.options.netplay && s.replayEnd < ran)
     {
         // Steps undone: they run again when their inputs have all arrived (the
@@ -488,7 +503,7 @@ void Watchdog()
     {
         mscharged::platform::RollbackSleepMs(50);
         std::lock_guard lock(sMutex);
-        if (!sState->out) return;
+        if (sState->stopped) return;
         if (sState->active && NowNs() - sState->lastHookNs > kIdleNs && !OldestPredicted())
             Stop("no step for 250 ms");
     }
@@ -507,14 +522,14 @@ void LogThrow(const std::type_info* type)
     void* frames[24];
     const int depth = mscharged::platform::RollbackCallStack(frames, 24);
     const std::uintptr_t self = mscharged::platform::RollbackModuleBase(reinterpret_cast<void*>(&LogThrow));
-    std::fprintf(s.out, "THROW %s at frame %u, call stack in the game module:", type ? type->name() : "?",
+    Log("THROW %s at frame %u, call stack in the game module:", type ? type->name() : "?",
                  s.latest);
     for (int i = 2; i < depth; ++i)
         if (mscharged::platform::RollbackModuleBase(frames[i]) == self)
-            std::fprintf(s.out, " +0x%lx",
+            Log(" +0x%lx",
                          static_cast<unsigned long>(reinterpret_cast<std::uintptr_t>(frames[i]) - self - 1));
-    std::fprintf(s.out, "\n");
-    std::fflush(s.out);
+    Log("\n");
+    FlushLog();
 }
 #endif
 
@@ -522,6 +537,7 @@ struct Install
 {
     Install()
     {
+        // <file>, or 1: on without a log (recharged.ini's [online] rollback).
         const char* path = std::getenv("RECHARGED_ROLLBACK_TEST");
         const char* network = std::getenv("RECHARGED_ROLLBACK");
         const bool netplay = network && *network;
@@ -539,16 +555,19 @@ struct Install
         }
         auto* state = static_cast<State*>(std::calloc(1, sizeof(State)));
         if (!state) return;
-        const std::size_t length = std::strlen(path);
-        state->summaryPath = static_cast<char*>(std::malloc(length + sizeof(".summary")));
-        state->out = std::fopen(path, "w");
-        if (!state->summaryPath || !state->out)
+        if (std::strcmp(path, "1") != 0)
         {
-            std::fprintf(stderr, "RECHARGED_ROLLBACK_TEST: cannot prepare %s\n", path);
-            return;
+            const std::size_t length = std::strlen(path);
+            state->summaryPath = static_cast<char*>(std::malloc(length + sizeof(".summary")));
+            state->out = std::fopen(path, "w");
+            if (!state->summaryPath || !state->out)
+            {
+                std::fprintf(stderr, "RECHARGED_ROLLBACK_TEST: cannot prepare %s\n", path);
+                return;
+            }
+            std::memcpy(state->summaryPath, path, length);
+            std::memcpy(state->summaryPath + length, ".summary", sizeof(".summary"));
         }
-        std::memcpy(state->summaryPath, path, length);
-        std::memcpy(state->summaryPath + length, ".summary", sizeof(".summary"));
         state->options.maxDepth = EnvInt("RECHARGED_ROLLBACK_TEST_FRAMES", kMaxDepth, 1, kMaxDepth);
         state->options.interval = EnvInt("RECHARGED_ROLLBACK_TEST_INTERVAL", 1, 1, 1 << 20);
         state->options.compareEvery = EnvInt("RECHARGED_ROLLBACK_TEST_COMPARE", 0, 0, 1 << 20);
@@ -564,24 +583,30 @@ struct Install
                 mscharged::platform::RollbackModuleBase(reinterpret_cast<void*>(&mscharged_rollback_active));
             state->compare.places = static_cast<Place*>(std::calloc(kMaxPlaces, sizeof(Place)));
         }
-        if (netplay)
-            std::fprintf(state->out, "rollback: network matches predict, input delay %d steps; summary in %s\n",
-                         state->options.inputDelay, state->summaryPath);
-        else
-            std::fprintf(state->out, "rollback test: up to %d steps back every %d steps; summary in %s\n",
-                         state->options.maxDepth, state->options.interval, state->summaryPath);
-        std::fflush(state->out);
         sState = state;
+        if (netplay)
+            Log("rollback: network matches predict, input delay %d steps; summary in %s\n",
+                state->options.inputDelay, state->summaryPath);
+        else
+            Log("rollback test: up to %d steps back every %d steps; summary in %s\n", state->options.maxDepth,
+                state->options.interval, state->summaryPath);
+        FlushLog();
+        std::fprintf(stderr, "rollback: on (%s), input delay %d steps, %s\n",
+                     netplay ? "network matches predict" : "test", state->options.inputDelay,
+                     state->out ? path : "no log");
         mscharged::platform::RollbackStartThread(Watchdog);
     }
     ~Install()
     {
         if (!sState) return;
         std::lock_guard lock(sMutex);
-        if (!sState->out) return;
-        Stop("exit");
-        WriteSummary();
-        std::fclose(sState->out);
+        if (!sState->stopped)
+        {
+            Stop("exit");
+            WriteSummary();
+            sState->stopped = true;
+        }
+        if (sState->out) std::fclose(sState->out);
         sState->out = nullptr;
     }
 } sInstall;
@@ -590,9 +615,11 @@ struct Install
 
 using namespace mscharged::rollback;
 
+// On from startup to the end, even once the rollback has stopped: what the
+// hooks do with it (deterministic data outside the arenas) must not change.
 extern "C" bool mscharged_rollback_active(void)
 {
-    return sState && sState->out;
+    return sState;
 }
 
 extern "C" bool mscharged_rollback_resimulating(void)
@@ -602,7 +629,7 @@ extern "C" bool mscharged_rollback_resimulating(void)
 
 extern "C" void mscharged_rollback_inputs_applied(const MschargedRollbackInputs* inputs)
 {
-    if (!sState || !sState->out || sState->resimulating) return;
+    if (!Running() || sState->resimulating) return;
     std::lock_guard lock(sMutex);
     sState->pending = *inputs;
     sState->haveInputs = true;
@@ -610,7 +637,7 @@ extern "C" void mscharged_rollback_inputs_applied(const MschargedRollbackInputs*
 
 extern "C" void mscharged_rollback_task_time(const void* task, float dt)
 {
-    if (!sState || !sState->out || sState->resimulating) return;
+    if (!Running() || sState->resimulating) return;
     std::lock_guard lock(sMutex);
     State& s = *sState;
     if (!s.active) return;
@@ -633,7 +660,7 @@ extern "C" void mscharged_rollback_task_time(const void* task, float dt)
 
 extern "C" void mscharged_rollback_meter_received(const bool* values, int count)
 {
-    if (!sState || !sState->out) return;
+    if (!Running()) return;
     std::lock_guard lock(sMutex);
     State& s = *sState;
     s.stats.meterReceived += count;
@@ -651,7 +678,7 @@ extern "C" void mscharged_rollback_meter_received(const bool* values, int count)
 extern "C" void mscharged_rollback_between_steps(int (*replay)(const MschargedRollbackInputs* inputs),
                                                  unsigned (*checksum)(void), void* task, unsigned long taskBytes)
 {
-    if (!sState || !sState->out) return;
+    if (!Running()) return;
     if (sState->options.netplay && !mscharged_rollback_predicting()) return; // offline: nothing to predict
     std::lock_guard lock(sMutex);
     State& s = *sState;
@@ -662,10 +689,7 @@ extern "C" void mscharged_rollback_between_steps(int (*replay)(const MschargedRo
     if (!s.active)
     {
         if (!Start(fixed, taskBytes, checksum))
-        {
-            std::fclose(s.out);
-            s.out = nullptr;
-        }
+            s.stopped = true;
         else if (s.options.netplay)
         {
             s.replay = replay;
@@ -734,7 +758,7 @@ extern "C" void mscharged_rollback_between_steps(int (*replay)(const MschargedRo
 
 extern "C" void mscharged_rollback_frame_start(void)
 {
-    if (!sState || !sState->out) return;
+    if (!Running()) return;
     std::lock_guard lock(sMutex);
     State& s = *sState;
     if (!s.active) return;
@@ -762,7 +786,7 @@ extern "C" void mscharged_rollback_frame_start(void)
 extern "C" __attribute__((visibility("hidden"), noreturn)) void __cxa_throw(void* thrown, std::type_info* type,
                                                                            void (*destroy)(void*))
 {
-    if (sState && sState->out && sState->active && sThrows++ < kListedThrows) LogThrow(type);
+    if (Running() && sState->active && sThrows++ < kListedThrows) LogThrow(type);
     using Throw = void (*)(void*, std::type_info*, void (*)(void*));
     static const Throw next = reinterpret_cast<Throw>(dlsym(RTLD_DEFAULT, "__cxa_throw"));
     next(thrown, type, destroy);

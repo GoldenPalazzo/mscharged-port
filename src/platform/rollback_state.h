@@ -315,10 +315,13 @@ struct Netplay
     std::uint64_t leadSamples;
 };
 
+// Exists from startup when the rollback is on, and never goes away: the
+// game's hooks keep one behaviour all session (mscharged_rollback_active).
 struct State
 {
-    FILE* out; // the log; null once the rollback gave up or the game exits
-    char* summaryPath;
+    FILE* out;         // the log, null without one (RECHARGED_ROLLBACK=1)
+    char* summaryPath; // null without a log
+    bool stopped;      // given up (tracking could not start) or the game exits: no saves, no rollbacks
     Options options;
     Memory memory;
     Tasks tasks;
@@ -363,6 +366,12 @@ struct State
 extern State* sState;
 extern std::mutex sMutex; // the hooks (main thread) and the watchdog
 
+// Whether the rollback saves and rolls back now.
+inline bool Running()
+{
+    return sState && !sState->stopped;
+}
+
 inline std::uint64_t NowNs()
 {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -378,6 +387,8 @@ inline int EnvInt(const char* name, int fallback, int low, int high)
 }
 
 // rollback_engine.cpp
+void Log(const char* format, ...) __attribute__((format(printf, 1, 2)));
+void FlushLog();
 Phases CurrentPhases();
 FrameRecord& Frame(std::uint64_t frame);
 int fixedIndexOf();

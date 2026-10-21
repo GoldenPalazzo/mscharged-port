@@ -301,3 +301,13 @@ rich_presence = true
 # For testing only: the Discord application to show it under instead of this
 # build's own (its ID from the Discord Developer Portal; public, not a secret).
 # application_id =
+
+[online]
+# Experimental: network matches with rollback. A step whose inputs have not
+# arrived from the other machine runs with predicted ones and goes back when
+# they arrive and differ, instead of waiting for them. Every machine in the
+# match needs it on, with the same rollback_delay (input delay in steps, 0 to
+# 8). rollback_log names a log file; its counts go to <file>.summary.
+# rollback = false
+# rollback_delay = 1
+# rollback_log =

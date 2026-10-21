@@ -263,17 +263,17 @@ void CompareAfterReplay(unsigned frame, int depth)
     }
     const bool differs = s.compare.compareDiffBytes != bytesBefore;
     if (differs) ++s.compare.comparesDiffering;
-    if (!differs || s.compare.comparesDiffering > kDetailedCompares) return;
-    std::fprintf(s.out, "COMPARED rollback of %d steps from frame %u: %llu bytes differ; places first seen now:\n",
+    if (!differs || s.compare.comparesDiffering > kDetailedCompares || !s.out) return;
+    Log("COMPARED rollback of %d steps from frame %u: %llu bytes differ; places first seen now:\n",
                  depth, frame, static_cast<unsigned long long>(s.compare.compareDiffBytes - bytesBefore));
     for (int i = placesBefore; i < s.compare.placeCount && i < placesBefore + kListedPlaces; ++i)
     {
-        std::fprintf(s.out, "  ");
+        Log("  ");
         PrintPlace(s.out, s.compare.places[i]);
-        std::fprintf(s.out, "\n");
+        Log("\n");
         PrintBytes(s.out, "before:", s.compare.places[i].before);
         PrintBytes(s.out, "after: ", s.compare.places[i].after);
     }
-    std::fflush(s.out);
+    FlushLog();
 }
 } // namespace mscharged::rollback

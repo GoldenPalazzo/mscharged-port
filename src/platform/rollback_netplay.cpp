@@ -56,7 +56,7 @@ void StopReplayAt(unsigned frame)
     if (!mscharged::platform::RestoreRollbackSnapshot(before.snapshot))
     {
         ++s.stats.failedRestores;
-        std::fprintf(s.out, "ROLLBACK IMPOSSIBLE: the save after frame %u was gone\n", frame - 1);
+        Log("ROLLBACK IMPOSSIBLE: the save after frame %u was gone\n", frame - 1);
         s.replayEnd = frame;
         return;
     }
@@ -301,9 +301,9 @@ void UpdateConfirmed()
                 s.net.seedDesync = ours.checksum == remote.checksum;
             }
             if (s.net.desyncs++ < kListedMismatches)
-                std::fprintf(s.out, "DESYNC at frame %u: checksum %08x seed %08x here, %08x %08x on machine %d\n",
+                Log("DESYNC at frame %u: checksum %08x seed %08x here, %08x %08x on machine %d\n",
                              remote.frame, ours.checksum, ours.seed, remote.checksum, remote.seed, remote.machine);
-            std::fflush(s.out);
+            FlushLog();
         }
     }
     s.net.remoteCount = kept;
@@ -479,7 +479,7 @@ using namespace mscharged::rollback;
 
 extern "C" bool mscharged_rollback_predicting(void)
 {
-    if (!sState || !sState->out || !sState->options.netplay || !g_pNetworkSessionBase || !gNetworkInputRouter) return false;
+    if (!Running() || !sState->options.netplay || !g_pNetworkSessionBase || !gNetworkInputRouter) return false;
     return g_pNetworkSessionBase->GetSessionMode() != NET_MODE_LOCAL && !gNetworkInputRecording->mPlaybackReady;
 }
 
@@ -506,8 +506,8 @@ extern "C" int mscharged_rollback_network_reset(void)
     s.net.delayChangedAt = 0;
     s.net.lead = 0;
     s.net.slowing = false;
-    std::fprintf(s.out, "network match: input delay %d steps\n", s.options.inputDelay);
-    std::fflush(s.out);
+    Log("network match: input delay %d steps\n", s.options.inputDelay);
+    FlushLog();
     return s.options.inputDelay;
 }
 
@@ -608,7 +608,7 @@ extern "C" bool mscharged_rollback_can_capture(void)
         --s.net.delay;
         s.net.delayChangedAt = frame;
         ++s.net.delayShorter;
-        std::fprintf(s.out, "input delay %d steps from frame %u\n", s.net.delay, frame);
+        Log("input delay %d steps from frame %u\n", s.net.delay, frame);
         return false;
     }
     return true;
@@ -624,7 +624,7 @@ extern "C" int mscharged_rollback_extra_captures(void)
     ++s.net.delay;
     s.net.delayChangedAt = CurrentStep();
     ++s.net.delayLonger;
-    std::fprintf(s.out, "input delay %d steps from frame %u\n", s.net.delay, s.net.delayChangedAt);
+    Log("input delay %d steps from frame %u\n", s.net.delay, s.net.delayChangedAt);
     return 1;
 }
 

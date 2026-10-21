@@ -28,7 +28,7 @@ void Exclude(const void* base, std::size_t bytes, const char* name)
     if (!base || !bytes) return;
     if (s.memory.excludedCount == kMaxExcluded)
     {
-        std::fprintf(s.out, "rollback test: too many exclusions, %s not excluded\n", name);
+        Log("rollback test: too many exclusions, %s not excluded\n", name);
         return;
     }
     const auto start = reinterpret_cast<std::uintptr_t>(base);

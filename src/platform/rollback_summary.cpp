@@ -9,6 +9,7 @@ namespace mscharged::rollback
 void WriteSummary()
 {
     const State& s = *sState;
+    if (!s.summaryPath) return; // no log
     WriteAudit(s.summaryPath);
     FILE* file = std::fopen(s.summaryPath, "w");
     if (!file) return;
