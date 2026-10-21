@@ -94,13 +94,23 @@ def main(command):
     if result.returncode:
         return result.returncode
     source = output = None
-    for index, argument in enumerate(command[:-1]):
-        if argument == "-c":
-            source = command[index + 1]
-        elif argument == "-o":
-            output = command[index + 1]
-    names = target_names(source) if source and output else None
+    for index, argument in enumerate(command):
+        following = command[index + 1] if index + 1 < len(command) else None
+        if argument == "-c" and following:
+            source = following
+        elif argument == "-o" and following:
+            output = following
+        elif argument.startswith("-o") and len(argument) > 2:
+            output = argument[2:]
+        elif argument.endswith((".c", ".cc", ".cpp", ".cxx")) and not argument.startswith("-"):
+            source = source or argument
+    names = target_names(source) if source else None
     if names:
+        # A game file whose object is not found would keep its globals out of
+        # the rollback without a word.
+        if not output or not os.path.isfile(output):
+            print(f"rollback_sections.py: no object for {source} in the compile command", file=sys.stderr)
+            return 1
         rename_sections(output, *names)
     return 0
 
