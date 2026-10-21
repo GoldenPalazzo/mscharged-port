@@ -42,8 +42,10 @@ void ExcludeAllocation(const void* pointer, std::size_t bytes, const char* name)
     mscharged::platform::GameAllocationSpan span{};
     if (mscharged::platform::FindGameAllocationSpan(pointer, 1, span))
         Exclude(span.base, span.bytes, name);
-    else
+    else if (bytes)
         Exclude(pointer, bytes, name);
+    else if (!sState->stats.starts) // once, not at every start of the tracking
+        Log("rollback: %s at %p is no allocation the registry knows; not excluded\n", name, pointer);
 }
 
 void Keep(const void* base, std::size_t bytes)
