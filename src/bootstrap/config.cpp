@@ -339,7 +339,6 @@ Settings Decode(const Values& values)
     if (const auto it = values.find("online.server"); it != values.end()) s.online_server = it->second;
     boolean("online.rollback", s.rollback);
     boolean("online.rollback_test", s.rollback_test);
-    number("online.rollback_delay", s.rollback_delay, 0, 8);
     if (const auto it = values.find("online.rollback_log"); it != values.end()) s.rollback_log = it->second;
     if (s.rollback_log.find_first_of("\r\n") != std::string::npos || s.rollback_log.find('\0') != std::string::npos)
         throw std::runtime_error("Invalid configuration: online.rollback_log contains a line break or NUL");

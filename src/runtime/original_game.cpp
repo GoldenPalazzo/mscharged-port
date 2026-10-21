@@ -330,13 +330,10 @@ int mscharged::RunOriginalGame(int argc, char** argv,
             && !std::getenv("RECHARGED_ROLLBACK") && !std::getenv("RECHARGED_ROLLBACK_TEST")) {
             const char* name=launch.settings.rollback_test ? "RECHARGED_ROLLBACK_TEST" : "RECHARGED_ROLLBACK";
             const std::string log=launch.settings.rollback_log.empty() ? "1" : launch.settings.rollback_log;
-            const std::string delay=std::to_string(launch.settings.rollback_delay);
 #if defined(_WIN32)
             _putenv_s(name,log.c_str());
-            _putenv_s("RECHARGED_ROLLBACK_DELAY",delay.c_str());
 #else
             setenv(name,log.c_str(),1);
-            setenv("RECHARGED_ROLLBACK_DELAY",delay.c_str(),1);
 #endif
         }
         std::printf("%s\n",mscharged::DescribeLaunch(launch).c_str());

@@ -206,11 +206,18 @@ struct Place
     std::uint8_t before[16], after[16];
 };
 
+// The input delay a network match starts with, in steps, and its shortest:
+// the same on every machine, since each fills that many first steps with
+// the router's starting inputs (mscharged_rollback_network_reset) and a
+// machine that filled another number would apply every message at another
+// step. Not a setting for that reason.
+constexpr int kStartingDelay = 1;
+
 // What the environment asked for, read once at startup.
 struct Options
 {
     bool netplay;            // RECHARGED_ROLLBACK: network matches predict
-    int inputDelay;          // RECHARGED_ROLLBACK_DELAY: the starting and shortest input delay
+    int inputDelay;          // kStartingDelay: the starting and shortest input delay
     unsigned fakeDesyncFrom; // RECHARGED_ROLLBACK_TEST_DESYNC
     int maxDepth;            // RECHARGED_ROLLBACK_TEST_FRAMES
     int interval;            // RECHARGED_ROLLBACK_TEST_INTERVAL

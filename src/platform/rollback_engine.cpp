@@ -569,7 +569,7 @@ struct Install
         state->options.merge = EnvInt("RECHARGED_ROLLBACK_TEST_MERGE", 1, 0, 1) != 0;
         state->options.netplay = netplay;
         if (EnvInt("RECHARGED_ROLLBACK_AUDIO_AUDIT", 0, 0, 1)) StartAudioAudit();
-        state->options.inputDelay = EnvInt("RECHARGED_ROLLBACK_DELAY", 1, 0, 8);
+        state->options.inputDelay = kStartingDelay;
         state->options.fakeDesyncFrom = static_cast<unsigned>(EnvInt("RECHARGED_ROLLBACK_TEST_DESYNC", 0, 0, 1 << 30));
         if (netplay) state->options.compareEvery = 0;
         if (state->options.compareEvery)

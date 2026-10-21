@@ -17,8 +17,8 @@ namespace
 {
 // The input delay (ChooseDelay), in steps of how far ahead of need the others
 // get this machine's inputs, as they report it.
-constexpr float kLengthenBelow = -1.5f;  // predicted for longer than a step and a half: a step more
-constexpr float kShortenAbove = 1.25f;   // early by more than a step and a quarter: a step less
+constexpr float kLengthenBelow = -2.5f;  // predicted for longer than two steps and a half: a step more
+constexpr float kShortenAbove = 0.25f;   // early by more than a quarter of a step: a step less
 constexpr unsigned kDelayEvery = 150;    // steps between changes of the input delay
 // The time sync (SyncTime), in steps.
 constexpr float kAheadSmoothing = 0.05f; // weight of each new measure of how far ahead inputs come
@@ -358,10 +358,12 @@ void Resolve()
 
 // The input delay: how far ahead of need the others get this machine's
 // inputs (as they report it) tells whether they predict them for long. More
-// than a step and a half: a step more of delay; more than a step and a quarter
-// early: a step less, down to the starting delay (a step's change moves the
-// measure by a step: it cannot cross back). A change at most every three
-// seconds, which the measures need to follow it.
+// than two steps and a half: a step more of delay; more than a quarter of a
+// step early: a step less, down to the starting delay (a step's change moves
+// the measure by a step: it cannot cross back). So the others predict this
+// machine's inputs for one or two steps, which a rollback replays within a
+// 60 FPS frame. A change at most every three seconds, which the measures need
+// to follow it.
 void ChooseDelay()
 {
     State& s = *sState;
