@@ -10,35 +10,21 @@ fixed steps of a match, so the simulation never owns audio state. Sounds
 made outside the steps (music, crowd, menus) still play. The fixed steps are
 reported to the port for that. Without RECHARGED_SYNCTEST nothing changes.
 
-diff --git a/include/mscharged_synctest.h b/include/mscharged_synctest.h
-index d3fe436..5316ea5 100644
---- a/include/mscharged_synctest.h
-+++ b/include/mscharged_synctest.h
-@@ -16,6 +16,11 @@ extern "C" {
- // `task` and `taskBytes` are the fixed update task, restored with the arenas.
- void mscharged_synctest_between_steps(int (*step)(void), unsigned (*checksum)(void), void* task,
-                                       unsigned long taskBytes);
-+// Around each fixed simulation step (1 at its start, 0 at its end).
-+void mscharged_synctest_fixed_step(int running);
-+// Whether a sound the game asks for now must not be made: during the steps of
-+// a match under the sync test, so the simulation never owns audio state.
-+bool mscharged_synctest_silences_sounds(void);
- 
- #ifdef __cplusplus
- }
 diff --git a/src/Game/Audio/audio.cpp b/src/Game/Audio/audio.cpp
-index d379bb7..4d2fdb6 100644
+index d379bb7..d2ff101 100644
 --- a/src/Game/Audio/audio.cpp
 +++ b/src/Game/Audio/audio.cpp
-@@ -27,6 +27,7 @@
+@@ -27,6 +27,9 @@
  #include "NL/nlTask.h"
  #include "Game/Audio/RegistryPools.h"
  #include "Game/SharedStaticStorage.h"
++#if defined(MSCHARGED_TWEAKS)
 +#include "mscharged_synctest.h"
++#endif
  
  #include "Game/Audio/AudioListener.inl"
  
-@@ -231,6 +232,14 @@ XSoundHandle* CreateSoundHandle(int slotId,
+@@ -231,6 +234,14 @@ XSoundHandle* CreateSoundHandle(int slotId,
      unsigned long cueId, XSoundOwner* owner,
      const void* debugName, void* context, bool findExisting)
  {
@@ -54,10 +40,10 @@ index d379bb7..4d2fdb6 100644
      {
          return 0;
 diff --git a/src/Game/Task/FixedUpdateTask.cpp b/src/Game/Task/FixedUpdateTask.cpp
-index b8abb03..b50ce23 100644
+index 7f31754..e05f477 100644
 --- a/src/Game/Task/FixedUpdateTask.cpp
 +++ b/src/Game/Task/FixedUpdateTask.cpp
-@@ -475,6 +475,9 @@ static void PostPhysicsAITask(float fDeltaT)
+@@ -494,6 +494,9 @@ static void PostPhysicsAITask(float fDeltaT)
  
  void FixedUpdateTask::CallFixedUpdateTasks()
  {
@@ -67,7 +53,7 @@ index b8abb03..b50ce23 100644
      ++lbl_806E2130;
      mFrame++;
      mSimulationTime += g_fSimulationTick;
-@@ -519,4 +522,7 @@ void FixedUpdateTask::CallFixedUpdateTasks()
+@@ -538,4 +541,7 @@ void FixedUpdateTask::CallFixedUpdateTasks()
      mEventDispatcher.Dispatch(true);
      UpdatePeachPhoto(&gPeachPhotoState, g_fSimulationTick, lbl_806E2130--);
      ReplayManager::Instance()->GrabSnapshot();

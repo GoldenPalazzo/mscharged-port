@@ -10,16 +10,20 @@ a match, as an effect missing from the configuration does. Without
 RECHARGED_SYNCTEST nothing changes.
 
 diff --git a/src/Game/Audio/AudioResourceRuntime.cpp b/src/Game/Audio/AudioResourceRuntime.cpp
-index 1614ef5..c7c9bae 100644
+index 1614ef5..2822c13 100644
 --- a/src/Game/Audio/AudioResourceRuntime.cpp
 +++ b/src/Game/Audio/AudioResourceRuntime.cpp
-@@ -1,4 +1,5 @@
+@@ -1,6 +1,9 @@
  #include "NL/nlDLListContainer.inl"
-+#include "mscharged_synctest.h"
  #include "NL/nlFunction.inl"
  #include "Game/Audio/AudioResourceRuntime.h"
++#if defined(MSCHARGED_TWEAKS)
++#include "mscharged_synctest.h"
++#endif
  #if defined(MSCHARGED_NATIVE)
-@@ -77,6 +78,14 @@ static inline bool FindBindingEffect(AudioEffectBinding* binding,
+ #include "platform/native_registry_word.h"
+ #endif
+@@ -77,6 +80,14 @@ static inline bool FindBindingEffect(AudioEffectBinding* binding,
  inline bool AudioEffectBinding::StartEffect(u32 definition,
      void* parameterData, bool invert, float blendTime)
  {
@@ -34,7 +38,7 @@ index 1614ef5..c7c9bae 100644
      u32 effectId = GetDefinitionValue(definition, AUDIO_EFFECT_KEY);
  
      AudioEffectBase* effect;
-@@ -99,6 +108,14 @@ inline bool AudioEffectBinding::StartEffect(u32 definition,
+@@ -99,6 +110,14 @@ inline bool AudioEffectBinding::StartEffect(u32 definition,
  inline bool AudioEffectBinding::StartEffect(u32 definition,
      void* parameterData, bool invert, void* owner)
  {

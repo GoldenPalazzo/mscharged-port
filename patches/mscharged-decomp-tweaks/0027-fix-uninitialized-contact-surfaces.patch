@@ -25,40 +25,36 @@ slightly differently from the original; no single native value could
 reproduce every Wii's leftovers.
 
 diff --git a/src/Game/Physics/PhysicsWorld.cpp b/src/Game/Physics/PhysicsWorld.cpp
-index ae9f3d7..73a8d9a 100644
+index ae9f3d7..b8b340c 100644
 --- a/src/Game/Physics/PhysicsWorld.cpp
 +++ b/src/Game/Physics/PhysicsWorld.cpp
-@@ -147,7 +147,16 @@ void PhysicsWorld::SpaceCollideCallback(void* data, dxGeom* geom1, dxGeom* geom2
-     }
+@@ -148,6 +148,14 @@ void PhysicsWorld::SpaceCollideCallback(void* data, dxGeom* geom1, dxGeom* geom2
  
      dContact* contact;
+     dContact contacts[20];
 +#if defined(MSCHARGED_TWEAKS)
 +    // Port fix, always on: dCollide fills only each contact's geometry, and no
 +    // Contact() ever assigns surface.mode (they only set or clear flags in it)
 +    // nor every surface parameter. The original used whatever the stack held,
 +    // so the contact flags ODE applies (bounce, second friction, slip, ...)
 +    // depended on earlier calls: the same on every Wii, not on every PC.
-+    dContact contacts[20] = {};
-+#else
-     dContact contacts[20];
++    memset(contacts, 0, sizeof(contacts));
 +#endif
      dBodyID body1;
  
      body1 = dGeomGetBody(geom1);
 diff --git a/src/Game/PhysicsAIBall.cpp b/src/Game/PhysicsAIBall.cpp
-index bcddb6f..c594e69 100644
+index bcddb6f..e96a258 100644
 --- a/src/Game/PhysicsAIBall.cpp
 +++ b/src/Game/PhysicsAIBall.cpp
-@@ -418,7 +418,13 @@ void PhysicsAIBall::CheckIfBallWentThroughGoalie()
-     {
+@@ -419,6 +419,11 @@ void PhysicsAIBall::CheckIfBallWentThroughGoalie()
          SetPosition(ballPosition, WORLD_COORDINATES);
  
+         dContact contactInfo;
 +#if defined(MSCHARGED_TWEAKS)
 +        // Port fix, always on: no stack leftovers in the goalie contact's
 +        // unset fields (see PhysicsWorld::SpaceCollideCallback).
-+        dContact contactInfo = {};
-+#else
-         dContact contactInfo;
++        contactInfo = dContact();
 +#endif
          SetContactInfo(&contactInfo, pGoalie->m_pPhysicsCharacter, true);
  

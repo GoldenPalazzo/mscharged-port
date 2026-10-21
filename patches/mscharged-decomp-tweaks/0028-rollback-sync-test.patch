@@ -8,20 +8,21 @@ after each step and the memory at the end. A step is exactly what
 FixedUpdateTask::Run does for one: pads, inputs, then the simulation.
 Without RECHARGED_SYNCTEST the hook returns at once and the game is unchanged.
 
-Add include/mscharged_synctest.h, the hook's interface to the port.
+Add include/mscharged_synctest.h, the sync test's interface to the port: this
+hook and the switches tweak patches 0029-0031 use.
 
 diff --git a/include/mscharged_synctest.h b/include/mscharged_synctest.h
 new file mode 100644
-index 0000000..d3fe436
+index 0000000..19ce4fe
 --- /dev/null
 +++ b/include/mscharged_synctest.h
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,35 @@
++#if defined(MSCHARGED_TWEAKS)
 +#ifndef MSCHARGED_SYNCTEST_H
 +#define MSCHARGED_SYNCTEST_H
 +
 +// Rollback sync test of the native port (src/platform/sync_test.cpp in the game
 +// module). It does nothing unless RECHARGED_SYNCTEST is set.
-+#if defined(MSCHARGED_TWEAKS)
 +
 +#ifdef __cplusplus
 +extern "C" {
@@ -34,27 +35,38 @@ index 0000000..d3fe436
 +// `task` and `taskBytes` are the fixed update task, restored with the arenas.
 +void mscharged_synctest_between_steps(int (*step)(void), unsigned (*checksum)(void), void* task,
 +                                      unsigned long taskBytes);
++// Around each fixed simulation step (1 at its start, 0 at its end; tweak
++// patch 0029).
++void mscharged_synctest_fixed_step(int running);
++// Whether a sound or audio effect the game asks for now must not be made:
++// during the steps of a match under the sync test, so the simulation never
++// owns audio state (tweak patches 0029 and 0031).
++bool mscharged_synctest_silences_sounds(void);
++// Whether the sync test runs: matches then use the deterministic AI clocks of
++// network games even offline (tweak patch 0030).
++bool mscharged_synctest_active(void);
 +
 +#ifdef __cplusplus
 +}
 +#endif
 +
-+#endif // MSCHARGED_TWEAKS
-+
 +#endif // MSCHARGED_SYNCTEST_H
++#endif // MSCHARGED_TWEAKS
 diff --git a/src/Game/Task/FixedUpdateTask.cpp b/src/Game/Task/FixedUpdateTask.cpp
-index 5ccf801..b8abb03 100644
+index f0fbe6d..7f31754 100644
 --- a/src/Game/Task/FixedUpdateTask.cpp
 +++ b/src/Game/Task/FixedUpdateTask.cpp
-@@ -41,6 +41,7 @@
+@@ -41,6 +41,9 @@
  #include "Game/InputRouter.h"
  #include "Game/NetworkInput.h"
  #include "Game/NetworkSync.h"
++#if defined(MSCHARGED_TWEAKS)
 +#include "mscharged_synctest.h"
++#endif
  
  #include <math.h>
  
-@@ -304,6 +305,42 @@ void FixedUpdateTask::DecrementFrameLock(float fDeltaT)
+@@ -304,6 +307,43 @@ void FixedUpdateTask::DecrementFrameLock(float fDeltaT)
      }
  }
  
@@ -88,7 +100,8 @@ index 5ccf801..b8abb03 100644
 +    return result;
 +}
 +
-+static unsigned SyncTestChecksum()
++// The game's own checksum of the match.
++static unsigned MatchChecksum()
 +{
 +    return fixedUpdateTask.CalculateChecksum();
 +}
@@ -97,7 +110,7 @@ index 5ccf801..b8abb03 100644
  void FixedUpdateTask::Run(float dt)
  {
      bool runFixedUpdate = true;
-@@ -384,6 +421,16 @@ void FixedUpdateTask::Run(float dt)
+@@ -384,6 +424,16 @@ void FixedUpdateTask::Run(float dt)
                  mInterpolationDeltaT = g_fFixedUpdateTick;
              }
  
@@ -106,7 +119,7 @@ index 5ccf801..b8abb03 100644
 +                && nlTaskManager::m_pInstance->mPendingState == TASK_GAMEPLAY
 +                && !g_pNetworkSession->GetPausedMachineMask())
 +            {
-+                mscharged_synctest_between_steps(SyncTestStep, SyncTestChecksum, &fixedUpdateTask,
++                mscharged_synctest_between_steps(SyncTestStep, MatchChecksum, &fixedUpdateTask,
 +                                                 sizeof(fixedUpdateTask));
 +            }
 +#endif

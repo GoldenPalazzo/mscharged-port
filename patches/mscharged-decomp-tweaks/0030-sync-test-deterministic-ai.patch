@@ -10,41 +10,32 @@ deterministic branch too, as a rollback session will. Nothing else that
 depends on IsNetworkOrRecordedGame changes. Without RECHARGED_SYNCTEST the
 game is unchanged.
 
-diff --git a/include/mscharged_synctest.h b/include/mscharged_synctest.h
-index 5316ea5..b836522 100644
---- a/include/mscharged_synctest.h
-+++ b/include/mscharged_synctest.h
-@@ -21,6 +21,9 @@ void mscharged_synctest_fixed_step(int running);
- // Whether a sound the game asks for now must not be made: during the steps of
- // a match under the sync test, so the simulation never owns audio state.
- bool mscharged_synctest_silences_sounds(void);
-+// Whether the sync test runs: matches then use the deterministic AI clocks of
-+// network games even offline.
-+bool mscharged_synctest_active(void);
- 
- #ifdef __cplusplus
- }
 diff --git a/src/Game/Game.cpp b/src/Game/Game.cpp
-index b8f7223..7bbc0ca 100644
+index 1a6cf4e..761ff5b 100644
 --- a/src/Game/Game.cpp
 +++ b/src/Game/Game.cpp
-@@ -1,4 +1,5 @@
+@@ -1,4 +1,7 @@
  #include "Game/NetworkMessageRegistry.h"
++#if defined(MSCHARGED_TWEAKS)
 +#include "mscharged_synctest.h"
++#endif
  #include "Game/DetInput.h"
  #include "Game/AI/TeamPlayMachine.h"
  #ifdef MSCHARGED_NATIVE
-@@ -873,7 +874,13 @@ void cGame::BeginGame(bool bRematch, bool bStraightToKickoff)
- 
-     --lbl_806E2130;
-     ReplayManager::Instance()->ResetSnapshots();
+@@ -885,6 +888,16 @@ void cGame::BeginGame(bool bRematch, bool bStraightToKickoff)
+         gAIProfilingClock = GetGameTickerMilliseconds;
+         gAIActivityClock = GetGameSimulationMilliseconds;
+     }
 +#if defined(MSCHARGED_TWEAKS)
 +    // The sync test runs offline matches with the deterministic AI clocks of
 +    // network and recorded games: no real-time script budget.
-+    if (IsNetworkOrRecordedGame() || mscharged_synctest_active())
-+#else
-     if (IsNetworkOrRecordedGame())
++    if (mscharged_synctest_active())
++    {
++        SetScriptTimeBudget(-1.0f);
++        gAIProfilingClock = GetGameSimulationMilliseconds;
++        gAIActivityClock = GetGameSimulationMilliseconds;
++    }
 +#endif
-     {
-         SetScriptTimeBudget(-1.0f);
-         gAIProfilingClock = GetGameSimulationMilliseconds;
+ }
+ void cGame::CheckForGoal()
+ {

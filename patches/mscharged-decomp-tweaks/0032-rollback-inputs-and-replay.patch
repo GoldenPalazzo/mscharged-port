@@ -75,6 +75,10 @@ sound: it did when it first ran. The audio's streams read the disc while
 rollbacks happen: mscharged_rollback_async_read_state returns the disc
 reads' manager, which the port leaves out of the rollback.
 
+Matches under the rollback use the deterministic AI clocks of network
+games, as the sync test's do (tweak patch 0030): a replayed step must make
+the AI choices its first run made, however long the frame took.
+
 Without RECHARGED_ROLLBACK_TEST or RECHARGED_ROLLBACK nothing changes.
 
 diff --git a/include/Game/InputRouter.h b/include/Game/InputRouter.h
@@ -408,7 +412,7 @@ index db51d10..e0f42e6 100644
      nlClose(file);
      loader->m_Data = data;
 diff --git a/src/Game/Audio/AudioResourceRuntime.cpp b/src/Game/Audio/AudioResourceRuntime.cpp
-index c7c9bae..ca361c4 100644
+index 2822c13..507eadd 100644
 --- a/src/Game/Audio/AudioResourceRuntime.cpp
 +++ b/src/Game/Audio/AudioResourceRuntime.cpp
 @@ -1,3 +1,6 @@
@@ -416,9 +420,9 @@ index c7c9bae..ca361c4 100644
 +#include "mscharged_rollback.h"
 +#endif
  #include "NL/nlDLListContainer.inl"
- #include "mscharged_synctest.h"
  #include "NL/nlFunction.inl"
-@@ -195,6 +198,9 @@ void NotifyAudioSoundStopped(AudioResourceRuntime* runtime, AudioInstanceKey ins
+ #include "Game/Audio/AudioResourceRuntime.h"
+@@ -197,6 +200,9 @@ void NotifyAudioSoundStopped(AudioResourceRuntime* runtime, AudioInstanceKey ins
   */
  void SetAudioEffectContext(unsigned long* hash, int index)
  {
@@ -428,7 +432,7 @@ index c7c9bae..ca361c4 100644
      g_pAudioResourceRuntime->m_Script->SetEffectContext(*hash, index);
  }
  
-@@ -216,6 +222,9 @@ bool StartAudioEffect(const unsigned long* bindingKey, const unsigned long* defi
+@@ -218,6 +224,9 @@ bool StartAudioEffect(const unsigned long* bindingKey, const unsigned long* defi
  #endif
      void* parameterData, bool invert, float blendTime)
  {
@@ -438,7 +442,7 @@ index c7c9bae..ca361c4 100644
      u32 key = *bindingKey;
      u32 definition = *definitionKey;
      return g_pAudioResourceRuntime->m_Script->StartEffect(
-@@ -315,6 +324,9 @@ inline void AudioResourceRuntime::ApplyEffectSet(u32 bindingKey,
+@@ -317,6 +326,9 @@ inline void AudioResourceRuntime::ApplyEffectSet(u32 bindingKey,
   */
  bool ApplyAudioTransition(const u32* transitionHash, bool invert, void* owner)
  {
@@ -668,7 +672,7 @@ index 21ea381..b2a9be0 100644
      if (player != 0)
      {
 diff --git a/src/Game/Audio/audio.cpp b/src/Game/Audio/audio.cpp
-index 4d2fdb6..cd96a76 100644
+index d2ff101..02d0a05 100644
 --- a/src/Game/Audio/audio.cpp
 +++ b/src/Game/Audio/audio.cpp
 @@ -1,3 +1,6 @@
@@ -678,7 +682,7 @@ index 4d2fdb6..cd96a76 100644
  #include "Game/Task/GameTaskState.h"
  #include "revolution/types.h"
  #include "NL/nlDLListContainer.inl"
-@@ -89,6 +92,9 @@ GameAudio::GameAudio()
+@@ -91,6 +94,9 @@ GameAudio::GameAudio()
  
  bool GameAudio::Initialize()
  {
@@ -688,7 +692,7 @@ index 4d2fdb6..cd96a76 100644
      AllocatorStack[AllocatorStackDepth++] = &VirtualAllocator;
      CurrentAllocator = &VirtualAllocator;
      gAudioMemorySize = 0x800000;
-@@ -129,6 +135,9 @@ void GameAudio::Shutdown()
+@@ -131,6 +137,9 @@ void GameAudio::Shutdown()
  
  void GameAudio::Update(float deltaTime)
  {
@@ -698,7 +702,7 @@ index 4d2fdb6..cd96a76 100644
      bool transformValid = false;
  
      if (nlTaskManager::m_pInstance->mCurrentState == TASK_GAMEPLAY
-@@ -159,6 +168,9 @@ void LoadSoundBank(GameAudio* audio, int slotId,
+@@ -161,6 +170,9 @@ void LoadSoundBank(GameAudio* audio, int slotId,
      // European revision 1 data: its sound bank table has no FE_GEN_Music
      // (0x1A), so every later bank sits one lower (tweak patch 0019).
      slotId = mscharged_tweak_rev1_sound_bank(slotId);
@@ -708,7 +712,7 @@ index 4d2fdb6..cd96a76 100644
  #endif
      if (!gAudioEnabled)
      {
-@@ -187,6 +199,9 @@ void LoadSoundBank(GameAudio* audio, int slotId,
+@@ -189,6 +201,9 @@ void LoadSoundBank(GameAudio* audio, int slotId,
  
  void UnloadSoundBanks(GameAudio* audio)
  {
@@ -718,7 +722,7 @@ index 4d2fdb6..cd96a76 100644
      if (gAudioEnabled
          && audio->GetBundleManager()->GetSoundMap() != 0)
      {
-@@ -197,6 +212,9 @@ void UnloadSoundBanks(GameAudio* audio)
+@@ -199,6 +214,9 @@ void UnloadSoundBanks(GameAudio* audio)
  bool PlaySound(int slotId, unsigned long cueId,
      const void* debugName, void* context)
  {
@@ -728,7 +732,7 @@ index 4d2fdb6..cd96a76 100644
      if (cueId == 0xFFFFFFFF)
      {
          return true;
-@@ -214,6 +232,9 @@ bool PlaySound(int slotId, unsigned long cueId,
+@@ -216,6 +234,9 @@ bool PlaySound(int slotId, unsigned long cueId,
  bool PlayOwnedSound(int slotId, unsigned long cueId,
      XSoundOwner* owner, const void* debugName, void* context)
  {
@@ -738,7 +742,7 @@ index 4d2fdb6..cd96a76 100644
      if (cueId == 0xFFFFFFFF)
      {
          return true;
-@@ -298,6 +319,9 @@ XSoundHandle* CreateSoundHandle(int slotId,
+@@ -300,6 +321,9 @@ XSoundHandle* CreateSoundHandle(int slotId,
  
  bool IsSoundTracked(unsigned long cueId, void* context)
  {
@@ -748,7 +752,7 @@ index 4d2fdb6..cd96a76 100644
      XSoundHandle** slot = 0;
      MSCHARGED_AUDIO_HANDLE_KEY key = MakeAudioHandleKey(cueId, context);
      return sAudioHandles.FindGet(key, &slot);
-@@ -306,6 +330,9 @@ bool IsSoundTracked(unsigned long cueId, void* context)
+@@ -308,6 +332,9 @@ bool IsSoundTracked(unsigned long cueId, void* context)
  XSoundHandle* FindSoundHandle(
      unsigned long cueId, void* context)
  {
@@ -758,7 +762,7 @@ index 4d2fdb6..cd96a76 100644
      if (!gAudioEnabled)
      {
          return 0;
-@@ -319,6 +346,9 @@ XSoundHandle* FindSoundHandle(
+@@ -321,6 +348,9 @@ XSoundHandle* FindSoundHandle(
  bool PlayTrackedSound(int slotId, unsigned long cueId,
      const void* debugName, void* context, bool resumable)
  {
@@ -768,7 +772,7 @@ index 4d2fdb6..cd96a76 100644
      if (PlaySound(slotId, cueId, debugName, context))
      {
          AudioHandleState state;
-@@ -334,6 +364,9 @@ bool PlayTrackedOwnedSound(int slotId, unsigned long cueId,
+@@ -336,6 +366,9 @@ bool PlayTrackedOwnedSound(int slotId, unsigned long cueId,
      XSoundOwner* owner, const void* debugName,
      void* context, bool resumable)
  {
@@ -778,7 +782,7 @@ index 4d2fdb6..cd96a76 100644
      if (PlayOwnedSound(slotId, cueId, owner, debugName, context))
      {
          AudioHandleState state;
-@@ -347,6 +380,9 @@ bool PlayTrackedOwnedSound(int slotId, unsigned long cueId,
+@@ -349,6 +382,9 @@ bool PlayTrackedOwnedSound(int slotId, unsigned long cueId,
  
  void StopSound(unsigned long cueId, void* context)
  {
@@ -788,7 +792,7 @@ index 4d2fdb6..cd96a76 100644
      if (gExclusiveAudioContext == 0 && gAudioEnabled
          && cueId != 0xFFFFFFFF)
      {
-@@ -383,6 +419,9 @@ void StopSound(unsigned long cueId, void* context)
+@@ -385,6 +421,9 @@ void StopSound(unsigned long cueId, void* context)
  
  void PauseSound(unsigned long cueId, void* context)
  {
@@ -798,7 +802,7 @@ index 4d2fdb6..cd96a76 100644
      if (cueId != 0xFFFFFFFF)
      {
          MSCHARGED_AUDIO_HANDLE_KEY key = MakeAudioHandleKey(cueId, context);
-@@ -419,6 +458,9 @@ void PauseSound(unsigned long cueId, void* context)
+@@ -421,6 +460,9 @@ void PauseSound(unsigned long cueId, void* context)
  
  void ResumeSound(unsigned long cueId, void* context)
  {
@@ -808,7 +812,7 @@ index 4d2fdb6..cd96a76 100644
      if (cueId == 0xFFFFFFFF)
      {
          return;
-@@ -457,6 +499,9 @@ void ResumeSound(unsigned long cueId, void* context)
+@@ -459,6 +501,9 @@ void ResumeSound(unsigned long cueId, void* context)
  
  void SetLastSoundParameter(unsigned long parameter, float value)
  {
@@ -818,7 +822,7 @@ index 4d2fdb6..cd96a76 100644
      if (g_pLastAudioHandle == 0)
      {
          return;
-@@ -468,6 +513,9 @@ void SetLastSoundParameter(unsigned long parameter, float value)
+@@ -470,6 +515,9 @@ void SetLastSoundParameter(unsigned long parameter, float value)
  int GetSoundState(
      unsigned long cueId, void* context)
  {
@@ -828,7 +832,7 @@ index 4d2fdb6..cd96a76 100644
      XSoundHandle* handle = FindSoundHandle(cueId, context);
      return handle != 0 ? handle->m_State : SOUND_HANDLE_STOPPED;
  }
-@@ -475,6 +523,9 @@ int GetSoundState(
+@@ -477,6 +525,9 @@ int GetSoundState(
  void SetSoundCallbackEnabled(unsigned long cueId, void* context,
      unsigned char enabled)
  {
@@ -838,7 +842,7 @@ index 4d2fdb6..cd96a76 100644
      XSoundHandle* handle = FindSoundHandle(cueId, context);
      if (handle != 0)
      {
-@@ -495,6 +546,9 @@ bool PrepareTrackedSound(int slotId, unsigned long cueId,
+@@ -497,6 +548,9 @@ bool PrepareTrackedSound(int slotId, unsigned long cueId,
      XSoundOwner* owner, const void* debugName,
      void* context, bool resumable)
  {
@@ -848,7 +852,7 @@ index 4d2fdb6..cd96a76 100644
      XSoundHandle* handle = CreateSoundHandle(
          slotId, cueId, owner, debugName, context, false);
      if (handle != 0)
-@@ -510,6 +564,9 @@ bool PrepareTrackedSound(int slotId, unsigned long cueId,
+@@ -512,6 +566,9 @@ bool PrepareTrackedSound(int slotId, unsigned long cueId,
  
  bool StartTrackedSound(unsigned long cueId, void* context)
  {
@@ -858,7 +862,7 @@ index 4d2fdb6..cd96a76 100644
      XSoundHandle* handle = FindSoundHandle(cueId, context);
      if (handle == 0)
      {
-@@ -521,6 +578,9 @@ bool StartTrackedSound(unsigned long cueId, void* context)
+@@ -523,6 +580,9 @@ bool StartTrackedSound(unsigned long cueId, void* context)
  
  void PauseAllAudio()
  {
@@ -868,7 +872,7 @@ index 4d2fdb6..cd96a76 100644
      ++sAudioPauseDepth;
      sAudioHandles.Walk(
          g_pAudioSystem, &AudioSystem::PauseTrackedSound);
-@@ -562,6 +622,9 @@ void PauseAllAudio()
+@@ -564,6 +624,9 @@ void PauseAllAudio()
  
  void ResumeAllAudio()
  {
@@ -878,7 +882,7 @@ index 4d2fdb6..cd96a76 100644
      AudioSystem* audio = g_pAudioSystem;
      sAudioHandleStates.Walk(audio, &AudioSystem::ResumeTrackedSound);
      --sAudioPauseDepth;
-@@ -569,6 +632,9 @@ void ResumeAllAudio()
+@@ -571,6 +634,9 @@ void ResumeAllAudio()
  
  int GetAudioPauseDepth()
  {
@@ -889,10 +893,10 @@ index 4d2fdb6..cd96a76 100644
  }
  
 diff --git a/src/Game/Game.cpp b/src/Game/Game.cpp
-index 7bbc0ca..7772f60 100644
+index 761ff5b..aebe4df 100644
 --- a/src/Game/Game.cpp
 +++ b/src/Game/Game.cpp
-@@ -42,6 +42,9 @@
+@@ -44,6 +44,9 @@
  #include "Game/DB/GameProgress.inl"
  #include "Game/Goalie.h"
  #include "Game/Net.h"
@@ -902,7 +906,7 @@ index 7bbc0ca..7772f60 100644
  #include "Game/NetworkSession.h"
  #include "Game/Physics/PhysicsAIBall.h"
  #include "Game/Physics/PhysicsPatch.h"
-@@ -558,6 +561,13 @@ void cGame::SendMegaStrikeMeter(bool value)
+@@ -560,6 +563,13 @@ void cGame::SendMegaStrikeMeter(bool value)
      {
          message.mValues[i] = mPendingMegaStrikeMeter.Pop();
      }
@@ -916,7 +920,7 @@ index 7bbc0ca..7772f60 100644
  
      u8 buffer[50];
      s8 i;
-@@ -590,6 +600,13 @@ void cGame::SendRemainingMegaStrikeMeter()
+@@ -592,6 +602,13 @@ void cGame::SendRemainingMegaStrikeMeter()
              message.mValues[i]
                  = mPendingMegaStrikeMeter.Pop();
          }
@@ -930,7 +934,24 @@ index 7bbc0ca..7772f60 100644
  
          u8 buffer[50];
          s8 i;
-@@ -1376,6 +1393,9 @@ int cGame::ProcessMessage(NetworkMessage* message)
+@@ -898,6 +915,16 @@ void cGame::BeginGame(bool bRematch, bool bStraightToKickoff)
+         gAIActivityClock = GetGameSimulationMilliseconds;
+     }
+ #endif
++#if defined(MSCHARGED_TWEAKS)
++    // So does the rollback: a replayed step must make the AI's choices of
++    // its first run, however long the frame took.
++    if (mscharged_rollback_active())
++    {
++        SetScriptTimeBudget(-1.0f);
++        gAIProfilingClock = GetGameSimulationMilliseconds;
++        gAIActivityClock = GetGameSimulationMilliseconds;
++    }
++#endif
+ }
+ void cGame::CheckForGoal()
+ {
+@@ -1382,6 +1409,9 @@ int cGame::ProcessMessage(NetworkMessage* message)
          {
              mReceivedMegaStrikeMeter.Push(pMessage->mValues[i]);
          }
@@ -940,7 +961,7 @@ index 7bbc0ca..7772f60 100644
          break;
      }
      }
-@@ -2761,3 +2781,14 @@ void cGame::QueueCharacterElectrocuted(CollisionPlayerWallData* data)
+@@ -2783,3 +2813,14 @@ void cGame::QueueCharacterElectrocuted(CollisionPlayerWallData* data)
  #include "Game/EventBase.inl"
  
  #include "NL/nlDLListContainer.inl"
@@ -1432,20 +1453,20 @@ index f4eabdb..4542cff 100644
 +}
 +#endif
 diff --git a/src/Game/Task/FixedUpdateTask.cpp b/src/Game/Task/FixedUpdateTask.cpp
-index b50ce23..26cf174 100644
+index e05f477..2520cb0 100644
 --- a/src/Game/Task/FixedUpdateTask.cpp
 +++ b/src/Game/Task/FixedUpdateTask.cpp
-@@ -42,6 +42,9 @@
- #include "Game/NetworkInput.h"
- #include "Game/NetworkSync.h"
- #include "mscharged_synctest.h"
+@@ -38,6 +38,9 @@
+ #include "NL/nlString.h"
+ #include "types.h"
+ #include "Game/DetInput.h"
 +#if defined(MSCHARGED_TWEAKS)
 +#include "mscharged_rollback.h"
 +#endif
- 
- #include <math.h>
- 
-@@ -339,6 +342,41 @@ static unsigned SyncTestChecksum()
+ #include "Game/InputRouter.h"
+ #include "Game/NetworkInput.h"
+ #include "Game/NetworkSync.h"
+@@ -342,6 +345,41 @@ static unsigned MatchChecksum()
  {
      return fixedUpdateTask.CalculateChecksum();
  }
@@ -1487,12 +1508,12 @@ index b50ce23..26cf174 100644
  #endif
  
  void FixedUpdateTask::Run(float dt)
-@@ -428,6 +466,10 @@ void FixedUpdateTask::Run(float dt)
+@@ -431,6 +469,10 @@ void FixedUpdateTask::Run(float dt)
              {
-                 mscharged_synctest_between_steps(SyncTestStep, SyncTestChecksum, &fixedUpdateTask,
+                 mscharged_synctest_between_steps(SyncTestStep, MatchChecksum, &fixedUpdateTask,
                                                   sizeof(fixedUpdateTask));
 +#if defined(MSCHARGED_TWEAKS)
-+                mscharged_rollback_between_steps(RollbackReplayStep, SyncTestChecksum, &fixedUpdateTask,
++                mscharged_rollback_between_steps(RollbackReplayStep, MatchChecksum, &fixedUpdateTask,
 +                                                 sizeof(fixedUpdateTask));
 +#endif
              }
