@@ -3,14 +3,14 @@
 // RECHARGED_ROLLBACK=<file> plays network matches with rollback: a step
 // whose inputs have not arrived from another machine runs with predicted ones,
 // and goes back when they arrive and differ (rollback_netplay.cpp, tweak
-// patch 0033).
+// patch 0029).
 //
 // RECHARGED_ROLLBACK_TEST=<file> rolls matches back while they are played,
 // offline and in network matches, to test the rollback before it predicts
 // anything: after every fixed step it saves the match (platform/rollback_snapshot.h),
 // and every RECHARGED_ROLLBACK_TEST_INTERVAL steps (default 1) it goes back 1
 // to RECHARGED_ROLLBACK_TEST_FRAMES steps (default 8, in turn) and runs them
-// again with the inputs they first had (tweak patch 0032). It goes back at
+// again with the inputs they first had (tweak patch 0028). It goes back at
 // the start of the next frame, before any task sets up its cameras and views,
 // and replays through the end of the last step's frame, frames without steps
 // as one with the next (RECHARGED_ROLLBACK_TEST_MERGE=0: one by one). The
@@ -548,11 +548,6 @@ struct Install
         }
         if (netplay) path = network;
         if (!path || !*path) return;
-        if (const char* synctest = std::getenv("RECHARGED_SYNCTEST"); synctest && *synctest)
-        {
-            std::fprintf(stderr, "RECHARGED_ROLLBACK_TEST: not with RECHARGED_SYNCTEST\n");
-            return;
-        }
         auto* state = static_cast<State*>(std::calloc(1, sizeof(State)));
         if (!state) return;
         if (std::strcmp(path, "1") != 0)

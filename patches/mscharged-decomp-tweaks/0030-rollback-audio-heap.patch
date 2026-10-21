@@ -1,7 +1,7 @@
 Subject: Diagnostic: the audio plays on through rollbacks, in a heap of its own
 Upstream-base: 9046e67aa2077a7eb4ed6e28c9df3c1d3b368f84
 
-Rollback study, after tweak patch 0032. The audio plays on through
+Rollback study, after tweak patch 0028. The audio plays on through
 rollbacks: its state lives in a heap of its own, which no rollback restores.
 The functions the game calls into the audio (the 45 the rest of the module
 uses, the audio system's creation in main, and the callbacks the audio hands
@@ -250,7 +250,7 @@ index db51d10..db8335c 100644
      nlClose(file);
      loader->m_Data = data;
 diff --git a/src/Game/Audio/AudioResourceRuntime.cpp b/src/Game/Audio/AudioResourceRuntime.cpp
-index 2822c13..a34c05a 100644
+index 1614ef5..5ac3a02 100644
 --- a/src/Game/Audio/AudioResourceRuntime.cpp
 +++ b/src/Game/Audio/AudioResourceRuntime.cpp
 @@ -1,3 +1,6 @@
@@ -260,7 +260,7 @@ index 2822c13..a34c05a 100644
  #include "NL/nlDLListContainer.inl"
  #include "NL/nlFunction.inl"
  #include "Game/Audio/AudioResourceRuntime.h"
-@@ -197,6 +200,9 @@ void NotifyAudioSoundStopped(AudioResourceRuntime* runtime, AudioInstanceKey ins
+@@ -178,6 +181,9 @@ void NotifyAudioSoundStopped(AudioResourceRuntime* runtime, AudioInstanceKey ins
   */
  void SetAudioEffectContext(unsigned long* hash, int index)
  {
@@ -270,7 +270,7 @@ index 2822c13..a34c05a 100644
      g_pAudioResourceRuntime->m_Script->SetEffectContext(*hash, index);
  }
  
-@@ -218,6 +224,9 @@ bool StartAudioEffect(const unsigned long* bindingKey, const unsigned long* defi
+@@ -199,6 +205,9 @@ bool StartAudioEffect(const unsigned long* bindingKey, const unsigned long* defi
  #endif
      void* parameterData, bool invert, float blendTime)
  {
@@ -280,7 +280,7 @@ index 2822c13..a34c05a 100644
      u32 key = *bindingKey;
      u32 definition = *definitionKey;
      return g_pAudioResourceRuntime->m_Script->StartEffect(
-@@ -317,6 +326,9 @@ inline void AudioResourceRuntime::ApplyEffectSet(u32 bindingKey,
+@@ -298,6 +307,9 @@ inline void AudioResourceRuntime::ApplyEffectSet(u32 bindingKey,
   */
  bool ApplyAudioTransition(const u32* transitionHash, bool invert, void* owner)
  {
@@ -510,7 +510,7 @@ index 21ea381..b42be78 100644
      if (player != 0)
      {
 diff --git a/src/Game/Audio/audio.cpp b/src/Game/Audio/audio.cpp
-index d2ff101..f911d9d 100644
+index d379bb7..6bc5648 100644
 --- a/src/Game/Audio/audio.cpp
 +++ b/src/Game/Audio/audio.cpp
 @@ -1,3 +1,6 @@
@@ -520,7 +520,7 @@ index d2ff101..f911d9d 100644
  #include "Game/Task/GameTaskState.h"
  #include "revolution/types.h"
  #include "NL/nlDLListContainer.inl"
-@@ -91,6 +94,9 @@ GameAudio::GameAudio()
+@@ -88,6 +91,9 @@ GameAudio::GameAudio()
  
  bool GameAudio::Initialize()
  {
@@ -530,7 +530,7 @@ index d2ff101..f911d9d 100644
      AllocatorStack[AllocatorStackDepth++] = &VirtualAllocator;
      CurrentAllocator = &VirtualAllocator;
      gAudioMemorySize = 0x800000;
-@@ -131,6 +137,9 @@ void GameAudio::Shutdown()
+@@ -128,6 +134,9 @@ void GameAudio::Shutdown()
  
  void GameAudio::Update(float deltaTime)
  {
@@ -540,7 +540,7 @@ index d2ff101..f911d9d 100644
      bool transformValid = false;
  
      if (nlTaskManager::m_pInstance->mCurrentState == TASK_GAMEPLAY
-@@ -161,6 +170,9 @@ void LoadSoundBank(GameAudio* audio, int slotId,
+@@ -158,6 +167,9 @@ void LoadSoundBank(GameAudio* audio, int slotId,
      // European revision 1 data: its sound bank table has no FE_GEN_Music
      // (0x1A), so every later bank sits one lower (tweak patch 0019).
      slotId = mscharged_tweak_rev1_sound_bank(slotId);
@@ -550,7 +550,7 @@ index d2ff101..f911d9d 100644
  #endif
      if (!gAudioEnabled)
      {
-@@ -189,6 +201,9 @@ void LoadSoundBank(GameAudio* audio, int slotId,
+@@ -186,6 +198,9 @@ void LoadSoundBank(GameAudio* audio, int slotId,
  
  void UnloadSoundBanks(GameAudio* audio)
  {
@@ -560,7 +560,7 @@ index d2ff101..f911d9d 100644
      if (gAudioEnabled
          && audio->GetBundleManager()->GetSoundMap() != 0)
      {
-@@ -199,6 +214,9 @@ void UnloadSoundBanks(GameAudio* audio)
+@@ -196,6 +211,9 @@ void UnloadSoundBanks(GameAudio* audio)
  bool PlaySound(int slotId, unsigned long cueId,
      const void* debugName, void* context)
  {
@@ -570,7 +570,7 @@ index d2ff101..f911d9d 100644
      if (cueId == 0xFFFFFFFF)
      {
          return true;
-@@ -216,6 +234,9 @@ bool PlaySound(int slotId, unsigned long cueId,
+@@ -213,6 +231,9 @@ bool PlaySound(int slotId, unsigned long cueId,
  bool PlayOwnedSound(int slotId, unsigned long cueId,
      XSoundOwner* owner, const void* debugName, void* context)
  {
@@ -580,7 +580,7 @@ index d2ff101..f911d9d 100644
      if (cueId == 0xFFFFFFFF)
      {
          return true;
-@@ -300,6 +321,9 @@ XSoundHandle* CreateSoundHandle(int slotId,
+@@ -289,6 +310,9 @@ XSoundHandle* CreateSoundHandle(int slotId,
  
  bool IsSoundTracked(unsigned long cueId, void* context)
  {
@@ -590,7 +590,7 @@ index d2ff101..f911d9d 100644
      XSoundHandle** slot = 0;
      MSCHARGED_AUDIO_HANDLE_KEY key = MakeAudioHandleKey(cueId, context);
      return sAudioHandles.FindGet(key, &slot);
-@@ -308,6 +332,9 @@ bool IsSoundTracked(unsigned long cueId, void* context)
+@@ -297,6 +321,9 @@ bool IsSoundTracked(unsigned long cueId, void* context)
  XSoundHandle* FindSoundHandle(
      unsigned long cueId, void* context)
  {
@@ -600,7 +600,7 @@ index d2ff101..f911d9d 100644
      if (!gAudioEnabled)
      {
          return 0;
-@@ -321,6 +348,9 @@ XSoundHandle* FindSoundHandle(
+@@ -310,6 +337,9 @@ XSoundHandle* FindSoundHandle(
  bool PlayTrackedSound(int slotId, unsigned long cueId,
      const void* debugName, void* context, bool resumable)
  {
@@ -610,7 +610,7 @@ index d2ff101..f911d9d 100644
      if (PlaySound(slotId, cueId, debugName, context))
      {
          AudioHandleState state;
-@@ -336,6 +366,9 @@ bool PlayTrackedOwnedSound(int slotId, unsigned long cueId,
+@@ -325,6 +355,9 @@ bool PlayTrackedOwnedSound(int slotId, unsigned long cueId,
      XSoundOwner* owner, const void* debugName,
      void* context, bool resumable)
  {
@@ -620,7 +620,7 @@ index d2ff101..f911d9d 100644
      if (PlayOwnedSound(slotId, cueId, owner, debugName, context))
      {
          AudioHandleState state;
-@@ -349,6 +382,9 @@ bool PlayTrackedOwnedSound(int slotId, unsigned long cueId,
+@@ -338,6 +371,9 @@ bool PlayTrackedOwnedSound(int slotId, unsigned long cueId,
  
  void StopSound(unsigned long cueId, void* context)
  {
@@ -630,7 +630,7 @@ index d2ff101..f911d9d 100644
      if (gExclusiveAudioContext == 0 && gAudioEnabled
          && cueId != 0xFFFFFFFF)
      {
-@@ -385,6 +421,9 @@ void StopSound(unsigned long cueId, void* context)
+@@ -374,6 +410,9 @@ void StopSound(unsigned long cueId, void* context)
  
  void PauseSound(unsigned long cueId, void* context)
  {
@@ -640,7 +640,7 @@ index d2ff101..f911d9d 100644
      if (cueId != 0xFFFFFFFF)
      {
          MSCHARGED_AUDIO_HANDLE_KEY key = MakeAudioHandleKey(cueId, context);
-@@ -421,6 +460,9 @@ void PauseSound(unsigned long cueId, void* context)
+@@ -410,6 +449,9 @@ void PauseSound(unsigned long cueId, void* context)
  
  void ResumeSound(unsigned long cueId, void* context)
  {
@@ -650,7 +650,7 @@ index d2ff101..f911d9d 100644
      if (cueId == 0xFFFFFFFF)
      {
          return;
-@@ -459,6 +501,9 @@ void ResumeSound(unsigned long cueId, void* context)
+@@ -448,6 +490,9 @@ void ResumeSound(unsigned long cueId, void* context)
  
  void SetLastSoundParameter(unsigned long parameter, float value)
  {
@@ -660,7 +660,7 @@ index d2ff101..f911d9d 100644
      if (g_pLastAudioHandle == 0)
      {
          return;
-@@ -470,6 +515,9 @@ void SetLastSoundParameter(unsigned long parameter, float value)
+@@ -459,6 +504,9 @@ void SetLastSoundParameter(unsigned long parameter, float value)
  int GetSoundState(
      unsigned long cueId, void* context)
  {
@@ -670,7 +670,7 @@ index d2ff101..f911d9d 100644
      XSoundHandle* handle = FindSoundHandle(cueId, context);
      return handle != 0 ? handle->m_State : SOUND_HANDLE_STOPPED;
  }
-@@ -477,6 +525,9 @@ int GetSoundState(
+@@ -466,6 +514,9 @@ int GetSoundState(
  void SetSoundCallbackEnabled(unsigned long cueId, void* context,
      unsigned char enabled)
  {
@@ -680,7 +680,7 @@ index d2ff101..f911d9d 100644
      XSoundHandle* handle = FindSoundHandle(cueId, context);
      if (handle != 0)
      {
-@@ -497,6 +548,9 @@ bool PrepareTrackedSound(int slotId, unsigned long cueId,
+@@ -486,6 +537,9 @@ bool PrepareTrackedSound(int slotId, unsigned long cueId,
      XSoundOwner* owner, const void* debugName,
      void* context, bool resumable)
  {
@@ -690,7 +690,7 @@ index d2ff101..f911d9d 100644
      XSoundHandle* handle = CreateSoundHandle(
          slotId, cueId, owner, debugName, context, false);
      if (handle != 0)
-@@ -512,6 +566,9 @@ bool PrepareTrackedSound(int slotId, unsigned long cueId,
+@@ -501,6 +555,9 @@ bool PrepareTrackedSound(int slotId, unsigned long cueId,
  
  bool StartTrackedSound(unsigned long cueId, void* context)
  {
@@ -700,7 +700,7 @@ index d2ff101..f911d9d 100644
      XSoundHandle* handle = FindSoundHandle(cueId, context);
      if (handle == 0)
      {
-@@ -523,6 +580,9 @@ bool StartTrackedSound(unsigned long cueId, void* context)
+@@ -512,6 +569,9 @@ bool StartTrackedSound(unsigned long cueId, void* context)
  
  void PauseAllAudio()
  {
@@ -710,7 +710,7 @@ index d2ff101..f911d9d 100644
      ++sAudioPauseDepth;
      sAudioHandles.Walk(
          g_pAudioSystem, &AudioSystem::PauseTrackedSound);
-@@ -564,6 +624,9 @@ void PauseAllAudio()
+@@ -553,6 +613,9 @@ void PauseAllAudio()
  
  void ResumeAllAudio()
  {
@@ -720,7 +720,7 @@ index d2ff101..f911d9d 100644
      AudioSystem* audio = g_pAudioSystem;
      sAudioHandleStates.Walk(audio, &AudioSystem::ResumeTrackedSound);
      --sAudioPauseDepth;
-@@ -571,6 +634,9 @@ void ResumeAllAudio()
+@@ -560,6 +623,9 @@ void ResumeAllAudio()
  
  int GetAudioPauseDepth()
  {

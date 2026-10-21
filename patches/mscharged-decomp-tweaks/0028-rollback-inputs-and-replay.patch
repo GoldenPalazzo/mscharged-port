@@ -48,11 +48,14 @@ with its cursors in glxMemory's statics. mscharged_rollback_frame_memory
 returns pointers to its blocks.
 
 Matches under the rollback use the deterministic AI clocks of network
-games, as the sync test's do (tweak patch 0030): a replayed step must make
-the AI choices its first run made, however long the frame took.
+games: offline, cGame::BeginGame otherwise gives the AI a script time budget
+of one real millisecond and skips a script whose measured time nears it at
+random. A replayed step must make the AI choices its first run made, however
+long the frame took.
 
-Network matches' prediction (tweak patch 0033) and the audio's own heap
-(tweak patch 0034) build on this patch.
+The port compares the game's own checksum (FixedUpdateTask's) of a
+replayed step with its first run's. Network matches' prediction (tweak patch
+0029) and the audio's own heap (tweak patch 0030) build on this patch.
 
 Add include/mscharged_rollback.h, the rollback's interface to the port.
 
@@ -160,10 +163,10 @@ index 0000000..d9dfa8e
 +#endif // MSCHARGED_ROLLBACK_H
 +#endif // MSCHARGED_TWEAKS
 diff --git a/src/Game/Game.cpp b/src/Game/Game.cpp
-index 761ff5b..aebe4df 100644
+index 1a6cf4e..6ba0363 100644
 --- a/src/Game/Game.cpp
 +++ b/src/Game/Game.cpp
-@@ -44,6 +44,9 @@
+@@ -41,6 +41,9 @@
  #include "Game/DB/GameProgress.inl"
  #include "Game/Goalie.h"
  #include "Game/Net.h"
@@ -173,7 +176,7 @@ index 761ff5b..aebe4df 100644
  #include "Game/NetworkSession.h"
  #include "Game/Physics/PhysicsAIBall.h"
  #include "Game/Physics/PhysicsPatch.h"
-@@ -560,6 +563,13 @@ void cGame::SendMegaStrikeMeter(bool value)
+@@ -557,6 +560,13 @@ void cGame::SendMegaStrikeMeter(bool value)
      {
          message.mValues[i] = mPendingMegaStrikeMeter.Pop();
      }
@@ -187,7 +190,7 @@ index 761ff5b..aebe4df 100644
  
      u8 buffer[50];
      s8 i;
-@@ -592,6 +602,13 @@ void cGame::SendRemainingMegaStrikeMeter()
+@@ -589,6 +599,13 @@ void cGame::SendRemainingMegaStrikeMeter()
              message.mValues[i]
                  = mPendingMegaStrikeMeter.Pop();
          }
@@ -201,13 +204,14 @@ index 761ff5b..aebe4df 100644
  
          u8 buffer[50];
          s8 i;
-@@ -898,6 +915,16 @@ void cGame::BeginGame(bool bRematch, bool bStraightToKickoff)
+@@ -885,6 +902,17 @@ void cGame::BeginGame(bool bRematch, bool bStraightToKickoff)
+         gAIProfilingClock = GetGameTickerMilliseconds;
          gAIActivityClock = GetGameSimulationMilliseconds;
      }
- #endif
 +#if defined(MSCHARGED_TWEAKS)
-+    // So does the rollback: a replayed step must make the AI's choices of
-+    // its first run, however long the frame took.
++    // Under the rollback offline matches use the deterministic AI clocks of
++    // network and recorded games too: a replayed step must make the AI's
++    // choices of its first run, however long the frame took.
 +    if (mscharged_rollback_active())
 +    {
 +        SetScriptTimeBudget(-1.0f);
@@ -218,7 +222,7 @@ index 761ff5b..aebe4df 100644
  }
  void cGame::CheckForGoal()
  {
-@@ -1382,6 +1409,9 @@ int cGame::ProcessMessage(NetworkMessage* message)
+@@ -1369,6 +1397,9 @@ int cGame::ProcessMessage(NetworkMessage* message)
          {
              mReceivedMegaStrikeMeter.Push(pMessage->mValues[i]);
          }
@@ -228,7 +232,7 @@ index 761ff5b..aebe4df 100644
          break;
      }
      }
-@@ -2783,3 +2813,14 @@ void cGame::QueueCharacterElectrocuted(CollisionPlayerWallData* data)
+@@ -2770,3 +2801,14 @@ void cGame::QueueCharacterElectrocuted(CollisionPlayerWallData* data)
  #include "Game/EventBase.inl"
  
  #include "NL/nlDLListContainer.inl"
@@ -616,7 +620,7 @@ index f4eabdb..4542cff 100644
 +}
 +#endif
 diff --git a/src/Game/Task/FixedUpdateTask.cpp b/src/Game/Task/FixedUpdateTask.cpp
-index e05f477..2520cb0 100644
+index f0fbe6d..ff3be53 100644
 --- a/src/Game/Task/FixedUpdateTask.cpp
 +++ b/src/Game/Task/FixedUpdateTask.cpp
 @@ -38,6 +38,9 @@
@@ -629,12 +633,17 @@ index e05f477..2520cb0 100644
  #include "Game/InputRouter.h"
  #include "Game/NetworkInput.h"
  #include "Game/NetworkSync.h"
-@@ -342,6 +345,41 @@ static unsigned MatchChecksum()
- {
-     return fixedUpdateTask.CalculateChecksum();
+@@ -304,6 +307,47 @@ void FixedUpdateTask::DecrementFrameLock(float fDeltaT)
+     }
  }
-+
+ 
 +#if defined(MSCHARGED_TWEAKS)
++// The game's own checksum of the match.
++static unsigned MatchChecksum()
++{
++    return fixedUpdateTask.CalculateChecksum();
++}
++
 +// One fixed step again for the rollback, with the inputs the router applied
 +// when it first ran: no pads, no capture, nothing sent. The port replays the
 +// other tasks of the frames around it.
@@ -668,20 +677,27 @@ index e05f477..2520cb0 100644
 +    }
 +}
 +#endif
- #endif
- 
++
  void FixedUpdateTask::Run(float dt)
-@@ -431,6 +469,10 @@ void FixedUpdateTask::Run(float dt)
-             {
-                 mscharged_synctest_between_steps(SyncTestStep, MatchChecksum, &fixedUpdateTask,
-                                                  sizeof(fixedUpdateTask));
+ {
+     bool runFixedUpdate = true;
+@@ -384,6 +428,16 @@ void FixedUpdateTask::Run(float dt)
+                 mInterpolationDeltaT = g_fFixedUpdateTick;
+             }
+ 
 +#if defined(MSCHARGED_TWEAKS)
++            if (updated && !IsNisLoadedOnAllMachines(GetPresentation())
++                && nlTaskManager::m_pInstance->mPendingState == TASK_GAMEPLAY
++                && !g_pNetworkSession->GetPausedMachineMask())
++            {
 +                mscharged_rollback_between_steps(RollbackReplayStep, MatchChecksum, &fixedUpdateTask,
 +                                                 sizeof(fixedUpdateTask));
++            }
 +#endif
-             }
- #endif
- 
++
+             if (IsNisLoadedOnAllMachines(GetPresentation()))
+             {
+                 break;
 diff --git a/src/Game/Task/FrontEndTask.cpp b/src/Game/Task/FrontEndTask.cpp
 index e4f3dd8..2c4bf6f 100644
 --- a/src/Game/Task/FrontEndTask.cpp

@@ -24,10 +24,6 @@
 0025-tweak-robot-goalies.patch
 0026-tweak-super-team.patch
 0027-fix-uninitialized-contact-surfaces.patch
-0028-rollback-sync-test.patch
-0029-sync-test-silent-simulation.patch
-0030-sync-test-deterministic-ai.patch
-0031-sync-test-silent-audio-effects.patch
-0032-rollback-inputs-and-replay.patch
-0033-rollback-network-prediction.patch
-0034-rollback-audio-heap.patch
+0028-rollback-inputs-and-replay.patch
+0029-rollback-network-prediction.patch
+0030-rollback-audio-heap.patch

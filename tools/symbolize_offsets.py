@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Annotate <module>+0x<offset> references in a diagnostic report with symbols.
 
-The rollback sync test (RECHARGED_SYNCTEST) prints addresses inside the game
-module as offsets. This adds the symbol containing each one, read with nm
+The rollback's comparisons (RECHARGED_ROLLBACK_TEST_COMPARE) print addresses
+inside the game module as offsets. This adds the symbol containing each one, read with nm
 from the module's own symbol table (Release modules keep it; RelWithDebInfo also gives lines with
 addr2line). Usage:
 
     python3 tools/symbolize_offsets.py build/relwithdebinfo/recharged_game_us.so report.txt
 
-With --group (for a sync test summary, <file>.summary), the entries of each
+With --group (for a comparison summary, <file>.summary), the entries of each
 section are merged by symbol: the tests of one global at several offsets add
 up to one line, most frequent first.
 """
