@@ -309,6 +309,7 @@ struct Netplay
     int delayChange;              // +1 or -1 for the next capture
     unsigned delayChangedAt;
     std::uint64_t delayLonger, delayShorter;
+    unsigned shownDepth; // the most steps predicted at once since the overlay last read it
     float lead;       // steps this machine runs ahead of the furthest behind
     bool slowing;
     double slowedSeconds, leadSum, maxLead;
@@ -408,6 +409,7 @@ unsigned OldestPredicted();
 void StopReplayAt(unsigned frame);
 void UpdateConfirmed();
 void NetplayFrameStart();
+bool OverlayNumbers(int& delay, int& predicted);
 
 // rollback_compare.cpp
 void BuildWatched();

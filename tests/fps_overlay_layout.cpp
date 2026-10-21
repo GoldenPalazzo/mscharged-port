@@ -37,31 +37,36 @@ int main()
         for (const auto& size : sizes)
             for (const auto corner : corners) {
                 const float font = FpsOverlayFontSize(size[0], size[1]), scale = font / 15.0f;
-                std::array<FpsOverlayText, 4> text = {{{25 * scale, 17 * scale, 26 * scale},
-                    {28 * scale, 25 * scale, 36 * scale}, {28 * scale, 17 * scale, 36 * scale},
-                    {25 * scale, 26 * scale, 26 * scale}}};
-                const auto layout = LayoutFpsOverlay(size[0], size[1], corner, font, text);
-                const float margin = std::max(8.0f, std::round(std::min(size[0], size[1]) * 0.015f));
-                const bool right = corner == OverlayCorner::TopRight || corner == OverlayCorner::BottomRight;
-                const bool bottom = corner == OverlayCorner::BottomLeft || corner == OverlayCorner::BottomRight;
-                Check(right ? layout.right == size[0] - margin : layout.left == margin, "Horizontal corner margin");
-                Check(bottom ? layout.bottom == size[1] - margin : layout.top == margin, "Vertical corner margin");
-                Check(layout.left >= 0 && layout.top >= 0 && layout.right <= size[0] && layout.bottom <= size[1],
-                      "All four metrics stay in the window");
-                for (std::size_t n = 0; n < text.size(); ++n) {
-                    Check(layout.label_x[n] == std::round(layout.label_x[n])
-                        && layout.value_x[n] == std::round(layout.value_x[n])
-                        && layout.text_y == std::round(layout.text_y), "Whole pixel glyph positions");
-                    Check(layout.value_x[n] >= layout.label_x[n] + text[n].label_width, "Labels precede their values");
-                    if (n < layout.separator_x.size())
-                        Check(layout.separator_x[n] > layout.value_x[n] + text[n].value_width
-                            && layout.separator_x[n] < layout.label_x[n + 1], "Dividers separate metric groups");
+                // FPS, GPU, CPU; LAT in a network session; DLY and RB with rollback.
+                for (const std::size_t count : {std::size_t{3}, std::size_t{4}, kMaxPerformanceMetrics}) {
+                    std::array<FpsOverlayText, kMaxPerformanceMetrics> text = {{{25 * scale, 17 * scale, 26 * scale},
+                        {28 * scale, 25 * scale, 36 * scale}, {28 * scale, 17 * scale, 36 * scale},
+                        {25 * scale, 26 * scale, 26 * scale}, {27 * scale, 17 * scale, 26 * scale},
+                        {20 * scale, 8 * scale, 26 * scale}}};
+                    const auto layout = LayoutFpsOverlay(size[0], size[1], corner, font, text.data(), count);
+                    Check(layout.count == count, "Every metric shown is laid out");
+                    const float margin = std::max(8.0f, std::round(std::min(size[0], size[1]) * 0.015f));
+                    const bool right = corner == OverlayCorner::TopRight || corner == OverlayCorner::BottomRight;
+                    const bool bottom = corner == OverlayCorner::BottomLeft || corner == OverlayCorner::BottomRight;
+                    Check(right ? layout.right == size[0] - margin : layout.left == margin, "Horizontal corner margin");
+                    Check(bottom ? layout.bottom == size[1] - margin : layout.top == margin, "Vertical corner margin");
+                    Check(layout.left >= 0 && layout.top >= 0 && layout.right <= size[0] && layout.bottom <= size[1],
+                          "All metrics stay in the window");
+                    for (std::size_t n = 0; n < count; ++n) {
+                        Check(layout.label_x[n] == std::round(layout.label_x[n])
+                            && layout.value_x[n] == std::round(layout.value_x[n])
+                            && layout.text_y == std::round(layout.text_y), "Whole pixel glyph positions");
+                        Check(layout.value_x[n] >= layout.label_x[n] + text[n].label_width, "Labels precede their values");
+                        if (n + 1 < count)
+                            Check(layout.separator_x[n] > layout.value_x[n] + text[n].value_width
+                                && layout.separator_x[n] < layout.label_x[n + 1], "Dividers separate metric groups");
+                    }
+                    for (auto& metric : text) metric.value_width = metric.value_slot;
+                    const auto widest = LayoutFpsOverlay(size[0], size[1], corner, font, text.data(), count);
+                    Check(layout.left == widest.left && layout.right == widest.right
+                        && layout.label_x == widest.label_x && layout.separator_x == widest.separator_x,
+                        "Changing digit counts or N/A never shifts columns");
                 }
-                for (auto& metric : text) metric.value_width = metric.value_slot;
-                const auto widest = LayoutFpsOverlay(size[0], size[1], corner, font, text);
-                Check(layout.left == widest.left && layout.right == widest.right
-                    && layout.label_x == widest.label_x && layout.separator_x == widest.separator_x,
-                    "Changing digit counts or N/A never shifts columns");
             }
         std::cout << checks << " performance overlay checks passed\n";
         return 0;

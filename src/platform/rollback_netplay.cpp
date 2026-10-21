@@ -473,6 +473,21 @@ void NetplayFrameStart()
             gNetworkSyncState->OnChecksumMismatch(static_cast<int>(s.net.matchDesyncFrame));
     }
 }
+
+// The performance overlay (netplay_snapshot.cpp): this machine's input delay,
+// in steps, and the most steps predicted at once since the last call. False
+// outside a network match with rollback.
+bool OverlayNumbers(int& delay, int& predicted)
+{
+    if (!mscharged_rollback_predicting() || !g_pGame) return false;
+    std::lock_guard lock(sMutex);
+    State& s = *sState;
+    delay = s.net.delay;
+    predicted = static_cast<int>(s.net.shownDepth);
+    s.net.shownDepth = 0;
+    return true;
+}
+
 } // namespace mscharged::rollback
 
 using namespace mscharged::rollback;
@@ -502,6 +517,7 @@ extern "C" int mscharged_rollback_network_reset(void)
     std::fill(std::begin(s.net.queuedAhead), std::end(s.net.queuedAhead), 0.0f);
     std::fill(std::begin(s.net.haveReported), std::end(s.net.haveReported), false);
     s.net.delay = s.options.inputDelay;
+    s.net.shownDepth = 0;
     s.net.delayChange = 0;
     s.net.delayChangedAt = 0;
     s.net.lead = 0;
@@ -584,8 +600,10 @@ extern "C" void mscharged_rollback_input_ready(void)
     kept = step;
     if (AnyPredicted(step))
     {
+        const unsigned depth = frame - OldestPredicted() + 1;
         ++s.net.predictedSteps;
-        ++s.net.predictedDepth[std::min<unsigned>(frame - OldestPredicted() + 1, kMaxDepth)];
+        ++s.net.predictedDepth[std::min<unsigned>(depth, kMaxDepth)];
+        s.net.shownDepth = std::max(s.net.shownDepth, depth);
     }
     Compose(step, s.pending);
     ApplyRollbackInputs(&s.pending);
