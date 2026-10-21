@@ -3,7 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 
-// What the rollback (rollback_test.cpp) needs from the system, on Linux,
+// What the rollback (rollback_engine.cpp and its files) needs from the system, on Linux,
 // macOS and Windows. Nothing here allocates with the game's operator new.
 namespace mscharged::platform
 {

@@ -193,8 +193,11 @@ function(mscharged_add_original_frontend_diagnostic target version suffix)
     # compare (rollback study, tweak patches 0028-0031), with full copies or the
     # incremental snapshots a rollback will use.
     target_sources(${target} PRIVATE src/platform/sync_test.cpp src/platform/rollback_snapshot.cpp)
-    # RECHARGED_ROLLBACK_TEST: roll matches back while they are played (tweak patch 0032).
-    target_sources(${target} PRIVATE src/platform/rollback_test.cpp src/platform/rollback_platform.cpp)
+    # The rollback: RECHARGED_ROLLBACK (network matches predict) and RECHARGED_ROLLBACK_TEST
+    # (roll matches back while they are played), tweak patch 0032.
+    target_sources(${target} PRIVATE src/platform/rollback_engine.cpp src/platform/rollback_memory.cpp
+        src/platform/rollback_netplay.cpp src/platform/rollback_compare.cpp src/platform/rollback_audio.cpp
+        src/platform/rollback_summary.cpp src/platform/rollback_platform.cpp)
     # Robot goalies: the disc's unused robot goalie texture on Charged's goalie (tweak patch 0025).
     target_sources(${target} PRIVATE src/platform/robot_goalie.cpp src/platform/robot_goalie_hook.cpp)
     # Super Team: robot captains and sidekicks from the GameCube robot (tweak patch 0026).
