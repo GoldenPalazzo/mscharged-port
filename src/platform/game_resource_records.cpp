@@ -8,6 +8,7 @@
 #if defined(_WIN32)
 #include <malloc.h>
 #endif
+#include <algorithm>
 #include <mutex>
 #include <new>
 #include <stdexcept>
@@ -33,6 +34,8 @@ struct Store
     Record* records;
 };
 std::mutex recordMutex;
+// The most the heap held, outside it (a rollback takes the heap back, not this).
+std::size_t peakUsed;
 Store& TheStore()
 {
     static Store* store = [] {
@@ -70,7 +73,9 @@ public:
         const auto incarnation=PoolIncarnation(pool);
         {
             std::lock_guard lock(recordMutex);
-            record_=static_cast<Record*>(TheStore().heap.Allocate(sizeof(Record)+native+31,32,false));
+            Store& store=TheStore();
+            record_=static_cast<Record*>(store.heap.Allocate(sizeof(Record)+native+31,32,false));
+            peakUsed=std::max<std::size_t>(peakUsed,kStoreBytes-store.heap.TotalFreeMemory());
         }
         new (record_) Record{};
         record_->pool=pool;
@@ -172,5 +177,13 @@ void GameResourceRecordStorage(const void** base, std::size_t* bytes)
 {
     *base=&TheStore();
     *bytes=kStoreBytes;
+}
+
+void GameResourceRecordUsage(std::size_t* used, std::size_t* peak, std::size_t* capacity)
+{
+    std::lock_guard lock(recordMutex);
+    *used=kStoreBytes-TheStore().heap.TotalFreeMemory();
+    *peak=peakUsed;
+    *capacity=kStoreBytes;
 }
 }

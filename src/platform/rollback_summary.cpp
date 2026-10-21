@@ -132,6 +132,10 @@ void WriteSummary()
             std::fprintf(file, "\n");
         }
     }
+    std::size_t recordsUsed = 0, recordsPeak = 0, recordsBytes = 0;
+    mscharged::platform::GameResourceRecordUsage(&recordsUsed, &recordsPeak, &recordsBytes);
+    std::fprintf(file, "pool records' heap: %zu of %zu bytes used, %zu at most\n", recordsUsed, recordsBytes,
+                 recordsPeak);
     if (sAudioHeap)
         std::fprintf(file, "audio heap: %u of %zu bytes free, largest %u\n", sAudioAllocator.TotalFreeMemory(),
                      kAudioHeapBytes, sAudioAllocator.LargestFreeBlock());
