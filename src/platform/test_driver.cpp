@@ -59,6 +59,13 @@ Driver* Get()
         if (!path || !*path) return static_cast<Driver*>(nullptr);
         auto* created = new Driver;
         created->directory = path;
+        // mash's keys: another sequence in each instance (two on one computer
+        // must not press the same keys), or RECHARGED_TEST_DRIVER_SEED's again.
+        unsigned seed = std::random_device{}();
+        if (const char* text = std::getenv("RECHARGED_TEST_DRIVER_SEED"); text && *text)
+            seed = static_cast<unsigned>(std::strtoul(text, nullptr, 10));
+        created->random.seed(seed);
+        std::fprintf(stderr, "Test driver: %s, seed %u\n", path, seed);
         std::error_code error;
         std::filesystem::create_directories(created->directory, error);
         return created;

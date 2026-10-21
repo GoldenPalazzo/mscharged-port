@@ -16,7 +16,9 @@
 //   point <x> <y>                  aim the pointer there, as fractions of the
 //                                  picture (0 0 top left); "point off" hides it
 //   mash <ms> <key> [<key> ...]    for that long, hold random keys of these
-//                                  (or none) for 30 to 400 ms each
+//                                  (or none) for 30 to 400 ms each; another
+//                                  sequence in each run, logged with its seed
+//                                  (RECHARGED_TEST_DRIVER_SEED=<n> repeats one)
 // '#' starts a comment.
 namespace mscharged::platform
 {
