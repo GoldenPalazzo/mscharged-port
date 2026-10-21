@@ -5,7 +5,8 @@
 // thread that runs the game's tasks.
 struct ChargedNetplaySnapshot
 {
-    // A network session (LAN or online, lobby or match): 1; 0 otherwise.
+    // Connected to another machine (LAN or online, lobby or match): 1; 0
+    // otherwise, logging in and searching too.
     int network;
     // The slowest connection's round trip in ms, as the game's own transport
     // measures it (a ping every 2 s, the other end's wait taken out); -1

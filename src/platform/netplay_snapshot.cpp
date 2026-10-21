@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iterator>
 
 extern "C" __attribute__((visibility("default"))) bool charged_netplay_snapshot(ChargedNetplaySnapshot* snapshot,
                                                                                 unsigned size)
@@ -19,17 +20,22 @@ extern "C" __attribute__((visibility("default"))) bool charged_netplay_snapshot(
     if (!snapshot || size != sizeof(ChargedNetplaySnapshot)) return false;
     ChargedNetplaySnapshot s{};
     s.round_trip_ms = -1;
-    NetworkSessionBase* session = g_pNetworkSessionBase;
-    if (session && session->GetSessionMode() != NET_MODE_LOCAL)
-    {
-        s.network = 1;
-        // The game's reliable transport pings each connection (LAN and
-        // online alike): the slowest is what the match waits for.
-        if (NetworkSocket* socket = session->GetDirectSocket())
-            for (const TransportConnection* connection : socket->mReliableSocket.mConnections)
-                if (connection && !const_cast<TransportConnection*>(connection)->IsClosed())
+    // A network session is one with a connection to another machine: the
+    // game's reliable transport pings each (LAN and online alike), and the
+    // slowest is what a match waits for. Only its first mConnectionCount
+    // slots hold connections; the game never clears the others.
+    if (NetworkSessionBase* session = g_pNetworkSessionBase)
+        if (NetworkSocket* socket = session->GetDirectSocket(); socket && socket->mReliableSocket.mInitialized)
+        {
+            ReliableSocket& transport = socket->mReliableSocket;
+            const int count = std::clamp(transport.mConnectionCount, 0, static_cast<int>(std::size(transport.mConnections)));
+            for (int n = 0; n < count; ++n)
+                if (TransportConnection* connection = transport.mConnections[n]; connection && !connection->IsClosed())
+                {
+                    s.network = 1;
                     s.round_trip_ms = std::max(s.round_trip_ms, connection->mRoundTripTimeMS);
-    }
+                }
+        }
     int delay = 0, predicted = 0;
     if (mscharged::rollback::OverlayNumbers(delay, predicted))
     {
