@@ -179,6 +179,8 @@ void RandomHistory(std::size_t historyPages, int depth, int steps, unsigned seed
               << stats.restores << ", faults " << stats.faults << ", promoted " << stats.promoted << ", demoted "
               << stats.demoted << ", evicted " << stats.evicted << '\n';
     Check(stats.demoted > 0, "idle hot pages turn cold");
+    // Saves past the depth go as planned; only a full history drops them early.
+    Check((stats.evicted == 0) == (historyPages >= 1024), "saves dropped early only for room");
 }
 
 // Another thread writes bytes the regions do not own on pages they share,

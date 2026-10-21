@@ -255,7 +255,6 @@ bool DropOldest(Tracker& t, std::uint64_t current)
     if (t.oldest + 1 >= current) return false;
     ++t.oldest;
     t.tail = t.saves[(t.oldest + 1) % (t.depth + 1)].first; // current's own record is open but has its first
-    ++t.stats.evicted;
     return true;
 }
 
@@ -264,11 +263,14 @@ void PushUndo(Tracker& t, std::size_t page, std::uint64_t current)
 {
     if (t.overflow) return;
     while (t.head - t.tail >= t.historyPages)
+    {
         if (!DropOldest(t, current))
         {
             t.overflow = true; // this save alone needs more room: no save before it stays restorable
             return;
         }
+        ++t.stats.evicted; // before its time: the history was full (a save past the depth goes as planned)
+    }
     const std::size_t slot = t.head++ % t.historyPages;
     t.historyPage[slot] = static_cast<std::uint32_t>(page);
     CopySegments(t, page, t.history + slot * t.pageSize, t.shadow + page * t.pageSize);
