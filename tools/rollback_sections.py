@@ -12,29 +12,37 @@ locals' guard variables among them) to .rbkd$m and .rbkb$m.
 src/platform/rollback_platform.cpp puts the bounds, __rbk_data_start and the
 others, in the "$a" and "$z" sections around them.
 
-The files are the script's: keep both lists the same.
+The files are the linker script's: the launcher reads them from it.
 
 Usage: rollback_sections.py <compile command...>
 """
 
 import fnmatch
 import os
+import re
 import struct
 import subprocess
 import sys
 
-GAME_EXCLUDED = [
-    "*src/Game/Audio/*", "*src/Game/Network[!IR]*", "*src/Game/FriendManager*", "*src/Game/LANLobby*",
-    "*src/Game/Net.cpp*", "*src/Game/NetTournManager*", "*src/Game/NetMessage*",
-    "*src/Game/Pad/FlickDetection*", "*src/Game/FE/feInput*", "*src/Game/RumbleActions*",
-]
-NL_EXCLUDED = [
-    "*src/NL/gl/*", "*src/NL/glx/*", "*src/NL/gc/*", "*src/NL/nlFile*", "*src/NL/nlAsyncFileBuffer*",
-    "*src/NL/nlBundleFile*", "*src/NL/nlDebug*", "*src/NL/nlTicker*", "*src/NL/nlTime*", "*src/NL/nlPrint*",
-    "*src/NL/nlBufferedWriter*", "*src/NL/plat/nlFileCache*", "*src/NL/plat/nlFlash*",
-    "*src/NL/plat/PadBackend*", "*src/NL/plat/WiiFreestylePad*", "*src/NL/plat/*Socket*",
-    "*src/NL/plat/Transport*",
-]
+LINKER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cmake", "rollback_sections.ld")
+
+
+def gathered(script, section):
+    """The (files, excluded files) patterns a section of the linker script gathers."""
+    body = re.search(section + r"\s*(?:\(NOLOAD\))?\s*:\s*\{(.*?)\n    \}", script, re.S).group(1)
+    rules = []
+    for match in re.finditer(r"(?:EXCLUDE_FILE\(([^)]*)\)\s*)?(\*src/[^(\s]+)\(", body):
+        rules.append((match.group(2), tuple((match.group(1) or "").split())))
+    return rules
+
+
+def load_rules():
+    with open(LINKER_SCRIPT) as file:
+        script = file.read()
+    data, bss = gathered(script, "rbk_data"), gathered(script, "rbk_bss")
+    if not data or data != bss:
+        raise SystemExit(f"rollback_sections.py: rbk_data and rbk_bss of {LINKER_SCRIPT} gather different files")
+    return data
 
 
 def matches(path, patterns):
@@ -44,10 +52,9 @@ def matches(path, patterns):
 def target_names(source):
     """The new names of the data and zeroed data sections of an object, or None."""
     path = os.path.abspath(source).replace(os.sep, "/")
-    if (fnmatch.fnmatchcase(path, "*src/Game/*") and not matches(path, GAME_EXCLUDED)) \
-            or (fnmatch.fnmatchcase(path, "*src/NL/*") and not matches(path, NL_EXCLUDED)) \
-            or fnmatch.fnmatchcase(path, "*src/ode/*"):
-        return b".rbkd$m", b".rbkb$m"
+    for files, excluded in load_rules():
+        if fnmatch.fnmatchcase(path, files) and not matches(path, excluded):
+            return b".rbkd$m", b".rbkb$m"
     return None
 
 
