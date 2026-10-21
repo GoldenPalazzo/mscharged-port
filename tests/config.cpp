@@ -422,10 +422,11 @@ int main()
                 && hostFile.contents.find("[discord]") != std::string::npos, "Saving wrote a Discord application ID");
         // [online] rollback: off, delay 1, no log by default; read, never
         // written, and a delay out of range is refused.
-        Require(!defaults.rollback && defaults.rollback_delay == 1 && defaults.rollback_log.empty(), "Rollback defaults");
-        std::ofstream(path) << "[online]\nrollback = true\nrollback_delay = 3\nrollback_log = rb.txt\n";
+        Require(!defaults.rollback && !defaults.rollback_test && defaults.rollback_delay == 1
+                && defaults.rollback_log.empty(), "Rollback defaults");
+        std::ofstream(path) << "[online]\nrollback = true\nrollback_test = true\nrollback_delay = 3\nrollback_log = rb.txt\n";
         auto rollbackFile = LoadConfig(path);
-        Require(rollbackFile.settings.rollback && rollbackFile.settings.rollback_delay == 3
+        Require(rollbackFile.settings.rollback && rollbackFile.settings.rollback_test && rollbackFile.settings.rollback_delay == 3
                 && rollbackFile.settings.rollback_log == "rb.txt", "Rollback settings read");
         SaveConfig(rollbackFile, rollbackFile.settings);
         Require(LoadConfig(path).contents.find("rollback_delay = 3") != std::string::npos,

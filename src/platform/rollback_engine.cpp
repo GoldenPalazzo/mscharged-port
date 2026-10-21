@@ -537,7 +537,7 @@ struct Install
 {
     Install()
     {
-        // <file>, or 1: on without a log (recharged.ini's [online] rollback).
+        // <file>, or 1: on without a log (recharged.ini's [online] rollback and rollback_test).
         const char* path = std::getenv("RECHARGED_ROLLBACK_TEST");
         const char* network = std::getenv("RECHARGED_ROLLBACK");
         const bool netplay = network && *network;

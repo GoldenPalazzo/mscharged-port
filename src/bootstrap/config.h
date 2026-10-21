@@ -207,7 +207,10 @@ struct Settings
     // rollback_delay (input delay in steps, 0 to 8); rollback_log names a log
     // file (its counts go to <file>.summary). Read only: saving never writes
     // them. The environment's RECHARGED_ROLLBACK, when set, wins.
+    // rollback_test instead rolls every match back while it is played,
+    // offline too (RECHARGED_ROLLBACK_TEST, with the same log).
     bool rollback = false;
+    bool rollback_test = false;
     int rollback_delay = 1;
     std::string rollback_log;
     // gameplay.super_team_side: the team the Super Team tweak dresses as

@@ -308,6 +308,9 @@ rich_presence = true
 # they arrive and differ, instead of waiting for them. Every machine in the
 # match needs it on, with the same rollback_delay (input delay in steps, 0 to
 # 8). rollback_log names a log file; its counts go to <file>.summary.
+# rollback_test = true instead rolls every match back while it is played,
+# offline too, and checks that the replays agree (to test the rollback).
 # rollback = false
+# rollback_test = false
 # rollback_delay = 1
 # rollback_log =
