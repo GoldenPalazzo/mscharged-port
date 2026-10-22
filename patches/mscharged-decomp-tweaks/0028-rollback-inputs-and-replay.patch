@@ -91,7 +91,7 @@ index 0000000..d9dfa8e
 +// matches back with the inputs they had) or RECHARGED_ROLLBACK (network
 +// matches that predict the inputs still on their way) is set. Network
 +// matches' prediction and the audio's heap have headers of their own
-+// (tweak patches 0033 and 0034).
++// (tweak patches 0029 and 0030).
 +
 +#define MSCHARGED_ROLLBACK_MAX_EVENTS 16
 +
