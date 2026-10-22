@@ -40,6 +40,9 @@
 //
 // The hooks the game calls are at the end of this file; the other files of
 // the rollback are listed in rollback_state.h.
+#include "Game/Team.h"
+#include "Game/AI/Fielder.h"
+#include "Game/Goalie.h"
 #include "platform/rollback_state.h"
 
 #if !defined(_WIN32)
@@ -68,15 +71,39 @@ void FlushLog()
     if (sState->out) std::fflush(sState->out);
 }
 
+namespace
+{
+// A mega strike, from its meter through the goalie's part: the game reads the
+// shooter's pad and the goalie's pointer outside the inputs and starts disc
+// reads, so no step of it is predicted (and the step that starts it, when
+// predicted, runs again with the inputs that arrive, as a phase change does).
+bool MegaStrikeUnderway()
+{
+    for (int i = 0; i < 2; ++i)
+    {
+        cTeam* team = g_pTeams[i];
+        if (!team) continue;
+        const cFielder* captain = team->GetCaptain();
+        if (captain && (captain->m_eActionState == ACTION_SHOOT_TO_SCORE
+                        || captain->m_eActionState == ACTION_MEGA_STRIKE))
+            return true;
+        const Goalie* goalie = team->GetGoalie();
+        if (goalie && goalie->mGoalieActionState == GOALIEACTION_MEGA_STRIKE) return true;
+    }
+    return false;
+}
+} // namespace
+
 Phases CurrentPhases()
 {
-    Phases phases{-2, 0, 0};
+    Phases phases{-2, 0, 0, false};
     if (g_pGame) phases.game = g_pGame->GetGameState();
     if (nlTaskManager::m_pInstance)
     {
         phases.current = nlTaskManager::m_pInstance->mCurrentState;
         phases.pending = nlTaskManager::m_pInstance->mPendingState;
     }
+    phases.megaStrike = g_pGame && MegaStrikeUnderway();
     return phases;
 }
 

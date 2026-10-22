@@ -235,7 +235,7 @@ bool PredictablePhases(const Phases& phases)
 {
     return (phases.game == GS_KICKOFF || phases.game == GS_GAMEPLAY || phases.game == GS_OVERTIME)
         && phases.current == TASK_GAMEPLAY && phases.pending == TASK_GAMEPLAY
-        && !g_pNetworkSession->GetPausedMachineMask();
+        && !phases.megaStrike && !g_pNetworkSession->GetPausedMachineMask();
 }
 } // namespace
 

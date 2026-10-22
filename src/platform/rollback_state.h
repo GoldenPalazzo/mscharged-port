@@ -136,6 +136,7 @@ struct Phases
 {
     int game;
     unsigned current, pending;
+    bool megaStrike; // a mega strike, from its meter through the goalie's part
     bool operator==(const Phases&) const = default;
 };
 // One fixed step as it first ran: the save after it, and what its replay needs.
