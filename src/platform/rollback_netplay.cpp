@@ -42,7 +42,11 @@ bool AnyPredicted(const StepInputs& inputs)
 // RECHARGED_ROLLBACK: a replayed step changed the match's phase (the inputs
 // that arrived made a goal, say): the replay ends with it, and the steps after
 // it run again when their inputs have all arrived. A step with inputs still
-// predicted does not change the phase either, and is undone as well.
+// predicted does not change the phase either, and is undone as well, unless a
+// disc read was in flight at the save before it or started since: a restore
+// would take back the read's reservation (its completion then fails) or what
+// it wrote, so the step is kept, and a misprediction in it can no longer be
+// corrected.
 void StopReplayAt(unsigned frame)
 {
     State& s = *sState;
@@ -53,6 +57,15 @@ void StopReplayAt(unsigned frame)
         return;
     }
     const Step& before = s.steps[(frame - 1) % kRing];
+    const Step& step = s.steps[frame % kRing];
+    if (before.reading || step.readsStarted != before.readsStarted)
+    {
+        s.replayEnd = frame;
+        ++s.net.truncated;
+        Log("KEPT PREDICTED FRAME %u: a disc read %s; a misprediction now desyncs\n",
+                frame, before.reading ? "in flight" : "started");
+        return;
+    }
     if (!mscharged::platform::RestoreRollbackSnapshot(before.snapshot))
     {
         ++s.stats.failedRestores;
