@@ -1,0 +1,62 @@
+From: mscharged-port
+Subject: Diagnostic: the rollback's log names the disc reads the game starts
+Upstream-base: 9046e67aa2077a7eb4ed6e28c9df3c1d3b368f84
+
+Rollback study, after tweak patch 0029. A rollback cannot go back across a
+disc read into the game's memory: a network match whose steps started one
+on predicted inputs that then turned out wrong desyncs (a captain's super
+ability, the play after a kickoff). Which reads those are, and where the
+match is when the game starts them, is what a way through them needs.
+
+nlOpen tells the rollback the path and entry number of every file it opens
+(mscharged_rollback_file_opened), and nlReadAsync every read it starts, with
+the file's entry number and where the bytes go
+(mscharged_rollback_read_started), files opened before included. While the
+rollback tracks a match its log names each read with the frame, the task
+running, whether the frame is a first run or a replay and whether inputs
+are still predicted; a rollback a read stops lists the writes under way and
+the files they come from.
+
+Without RECHARGED_ROLLBACK_TEST or RECHARGED_ROLLBACK, or a log, nothing
+changes.
+
+diff --git a/include/mscharged_rollback.h b/include/mscharged_rollback.h
+--- a/include/mscharged_rollback.h
++++ b/include/mscharged_rollback.h
+@@ -46,6 +46,13 @@
+ // after it was undone. Outside tracked steps, everything goes out.
+ bool mscharged_rollback_determ_data_new(int frame, const void* data, unsigned size);
+ #endif
++#if defined(MSCHARGED_TWEAKS)
++// The disc reads, for the log while the rollback tracks a match (a rollback
++// cannot go back across one): a file the game opens, by its path and entry
++// number, and each read the game starts from one, with where it goes.
++void mscharged_rollback_file_opened(const char* path, long entry);
++void mscharged_rollback_read_started(long entry, const void* buffer, unsigned long bytes);
++#endif
+ // The inputs applied for the step about to run.
+ void mscharged_rollback_inputs_applied(const struct MschargedRollbackInputs* inputs);
+ // Between two fixed steps of a match, where the rollback saves the match and
+diff --git a/src/NL/nlFileGC.cpp b/src/NL/nlFileGC.cpp
+--- a/src/NL/nlFileGC.cpp
++++ b/src/NL/nlFileGC.cpp
+@@ -288,6 +288,9 @@
+     nlFile* file;
+ 
+     FileEntrynum = DVDConvertPathToEntrynum(fileName);
++#if defined(MSCHARGED_TWEAKS)
++    mscharged_rollback_file_opened(fileName, FileEntrynum);
++#endif
+     if (FileEntrynum == -1)
+     {
+         file = 0;
+@@ -740,6 +743,9 @@
+         return 0;
+     }
+ #endif
++#if defined(MSCHARGED_TWEAKS)
++    mscharged_rollback_read_started(((DolphinFile*)file)->mEntryNum, buffer, size);
++#endif
+     unsigned long position;
+     unsigned long alignedSize;
+     unsigned long tailSize;

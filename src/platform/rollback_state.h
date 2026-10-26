@@ -114,6 +114,8 @@ constexpr unsigned kSettleSteps = 25;    // RECHARGED_ROLLBACK: steps after trac
 constexpr int kMaxInputDelay = 6;        // RECHARGED_ROLLBACK: steps, while predicting
 constexpr int kMaxLockstepDelay = 10;    // RECHARGED_ROLLBACK: steps, in a phase without prediction
 constexpr int kAccelHysteresis = 6;
+constexpr int kFileNames = 512;          // files opened whose paths the log names reads by
+constexpr int kReadsSeen = 64;           // reads started whose files the log names writes under way by
 
 // The parts of a machine's inputs a misprediction can get wrong: the fields of
 // PackedDetInput (include/Game/PackedDetInput.h), the player states, the
@@ -415,6 +417,23 @@ struct State
     int (*replay)(const MschargedRollbackInputs*);
     unsigned (*checksum)(void);
     bool resimulating;               // a replay is running
+    int runningTask;                 // 1 + the index of the task running now, 0: none yet
+
+    // The disc reads, for the log: the paths of the files opened (by entry
+    // number, the latest first to go) and the last reads started.
+    struct FileName
+    {
+        long entry;
+        char path[96];
+    } fileNames[kFileNames];
+    int fileNameCount;
+    struct ReadSeen
+    {
+        const void* buffer;
+        unsigned long bytes;
+        long entry;
+    } reads[kReadsSeen];
+    unsigned readCount;
     unsigned replayEnd;              // the last step a replay runs
     unsigned saveFrom;               // the first replayed step a later rollback may go back to (0: any)
     mscharged::platform::GameAllocationMark replayMark; // the last kept during a replay
@@ -453,6 +472,7 @@ Phases CurrentPhases();
 FrameRecord& Frame(std::uint64_t frame);
 int fixedIndexOf();
 void Stop(const char* why);
+void LogReadsUnderWay();
 bool RollBack(unsigned target, unsigned replayEnd, int (*replay)(const MschargedRollbackInputs*),
               unsigned (*checksum)(void));
 

@@ -318,6 +318,7 @@ void ReplayFrames(std::uint64_t first, std::uint64_t last, int firstTask, int la
         if (!ran) continue;
         manager->mCurrentTimeDelta = dt;
         manager->mRealTimeDelta = real;
+        s.runningTask = i + 1;
         const std::uint64_t taskStart = NowNs();
         switch (s.tasks.replays[i])
         {
@@ -481,6 +482,7 @@ bool RollBack(unsigned target, unsigned replayEnd, int (*replay)(const Mscharged
         {
             ++s.net.impossible;
             Log("ROLLBACK IMPOSSIBLE to frame %u from %u: %s\n", target, s.latest, why);
+            if (std::strstr(why, "disc read")) LogReadsUnderWay();
         }
         return false;
     }
@@ -738,6 +740,82 @@ extern "C" bool mscharged_rollback_determ_data_new(int frame, const void* data, 
     return true;
 }
 
+// The disc reads (tweak patch 0043): the files' paths, kept from any open,
+// and in the log, while tracking, each read with where the match is (a
+// rollback cannot go back across one). They come from the main thread's
+// tasks and replays, under the hooks' lock already in a replay: no lock of
+// their own.
+extern "C" void mscharged_rollback_file_opened(const char* path, long entry)
+{
+    if (!Running() || entry < 0 || !path) return;
+    State& s = *sState;
+    int slot = 0;
+    while (slot < s.fileNameCount && s.fileNames[slot].entry != entry) ++slot;
+    if (slot == s.fileNameCount)
+    {
+        if (s.fileNameCount < kFileNames) ++s.fileNameCount;
+        else slot = static_cast<int>(entry % kFileNames);
+    }
+    s.fileNames[slot].entry = entry;
+    std::snprintf(s.fileNames[slot].path, sizeof(s.fileNames[slot].path), "%s", path);
+}
+
+namespace
+{
+const char* PathOf(long entry)
+{
+    const State& s = *sState;
+    for (int i = 0; i < s.fileNameCount; ++i)
+        if (s.fileNames[i].entry == entry) return s.fileNames[i].path;
+    return "a file opened before";
+}
+} // namespace
+
+extern "C" void mscharged_rollback_read_started(long entry, const void* buffer, unsigned long bytes)
+{
+    if (!Running()) return;
+    State& s = *sState;
+    s.reads[s.readCount++ % kReadsSeen] = {buffer, bytes, entry};
+    if (!s.active || !s.out) return;
+    const int task = s.runningTask - 1;
+    const char* name = task >= 0 && task < s.tasks.count ? s.tasks.list[task]->GetName() : nullptr;
+    auto* fixed = static_cast<FixedUpdateTask*>(s.tasks.list[fixedIndexOf()]);
+    Log("frame %llu, %s, in %s (fixed update at %d, last step saved %u%s): reads %s, %lu bytes at %p\n",
+        static_cast<unsigned long long>(s.hostFrame), s.resimulating ? "replay" : "first run",
+        name ? name : "no task", static_cast<int>(fixed->GetFrame()), s.latest,
+        s.options.netplay && OldestPredicted() ? ", inputs predicted" : "", PathOf(entry), bytes, buffer);
+}
+
+namespace mscharged::rollback
+{
+// After a rollback a disc read stopped: the writes under way, with the file
+// of the last read started into each.
+void LogReadsUnderWay()
+{
+    const State& s = *sState;
+    mscharged::platform::GamePendingByteWrite writes[16];
+    const std::size_t count = mscharged::platform::ListGamePendingByteWrites(writes, 16);
+    for (std::size_t i = 0; i < count && i < 16; ++i)
+    {
+        if (!writes[i].counted) continue;
+        const char* path = "no read seen";
+        const auto address = reinterpret_cast<std::uintptr_t>(writes[i].address);
+        for (unsigned n = 0; n < kReadsSeen && n < s.readCount; ++n)
+        {
+            const State::ReadSeen& read = s.reads[(s.readCount - 1 - n) % kReadsSeen];
+            const auto start = reinterpret_cast<std::uintptr_t>(read.buffer);
+            if (address >= start && address < start + std::max<unsigned long>(read.bytes, 1))
+            {
+                path = PathOf(read.entry);
+                break;
+            }
+        }
+        Log("  under way: %zu bytes at %p (allocation %p, %zu bytes): %s\n", writes[i].bytes, writes[i].address,
+            writes[i].allocation, writes[i].allocationBytes, path);
+    }
+}
+} // namespace mscharged::rollback
+
 extern "C" void mscharged_rollback_inputs_applied(const MschargedRollbackInputs* inputs)
 {
     if (!Running() || sState->resimulating) return;
@@ -757,6 +835,7 @@ extern "C" void mscharged_rollback_task_time(const void* task, float dt)
     for (int i = 0; i < s.tasks.count; ++i)
         if (task == s.tasks.list[i])
         {
+            s.runningTask = i + 1;
             record.dt[i] = dt;
             record.real[i] = nlTaskManager::m_pInstance->mRealTimeDelta;
             if (s.tasks.replays[i] == kSkip)

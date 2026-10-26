@@ -1885,6 +1885,22 @@ GameByteProducers CurrentGameByteProducers()
     std::lock_guard lock(state.mutex);
     return {static_cast<std::size_t>(state.live_reservations), state.byte_writes_started};
 }
+std::size_t ListGamePendingByteWrites(GamePendingByteWrite* writes, std::size_t capacity)
+{
+    auto& state = State();
+    std::lock_guard lock(state.mutex);
+    std::size_t count = 0;
+    for (const auto& [base, allocation] : state.records)
+        for (const auto& [address, write] : allocation.pending_writes)
+        {
+            if (count < capacity)
+                writes[count] = {reinterpret_cast<const void*>(address), write.bytes,
+                                 reinterpret_cast<const void*>(base), allocation.bytes,
+                                 address < state.ignored_start || address >= state.ignored_end};
+            ++count;
+        }
+    return count;
+}
 void EndGameAllocationCheckpoint()
 {
     auto& state = State();

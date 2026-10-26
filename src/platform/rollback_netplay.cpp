@@ -65,6 +65,7 @@ void StopReplayAt(unsigned frame)
         ++s.net.truncated;
         Log("KEPT PREDICTED FRAME %u: a disc read %s; a misprediction now desyncs\n",
                 frame, before.reading ? "in flight" : "started");
+        LogReadsUnderWay();
         return;
     }
     if (!mscharged::platform::RestoreRollbackSnapshot(before.snapshot))

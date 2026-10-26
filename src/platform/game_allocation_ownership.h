@@ -316,6 +316,19 @@ struct GameByteProducers
     std::uint64_t started;
 };
 GameByteProducers CurrentGameByteProducers();
+// The unfinished producers' writes the records hold now, for a diagnostic:
+// where each writes, how much, the allocation it writes into and whether it
+// counts among the producers (outside the memory IgnoreGameByteProducersIn
+// leaves out). Fills at most capacity; returns how many there are.
+struct GamePendingByteWrite
+{
+    const void* address;
+    std::size_t bytes;
+    const void* allocation;
+    std::size_t allocationBytes;
+    bool counted;
+};
+std::size_t ListGamePendingByteWrites(GamePendingByteWrite* writes, std::size_t capacity);
 // Producers writing into [start, start + bytes) are left out of the counts:
 // memory the rollback leaves alone (the audio's own heap).
 void IgnoreGameByteProducersIn(const void* start, std::size_t bytes);
