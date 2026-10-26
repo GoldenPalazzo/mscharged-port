@@ -1,0 +1,123 @@
+From: mscharged-port
+Subject: Rollback: a rollback cancels the disc reads its replay starts again
+Upstream-base: 9046e67aa2077a7eb4ed6e28c9df3c1d3b368f84
+
+Rollback study, after tweak patches 0031 and 0043. The disc reads' manager
+goes on through rollbacks (tweak patch 0031), so a rollback could not go
+back before a read under way: the read would go on writing into memory the
+restore took back, for a request the match no longer made. A network match
+whose steps started one on predicted inputs that turned out wrong then
+desynced. Most come from tasks a replay runs again: Begin Frame's NIS loads
+(NisPlayer::HandleAsyncs) and the front end's, as superabilityUI.res when a
+captain's super ability starts.
+
+mscharged_rollback_reads_under_way lists the reads under way, by the
+caller's buffer and its bytes (a head and its tail as one), and
+mscharged_rollback_cancel_reads cancels those the rollback accepts as a
+failed read is: AsyncManager::CancelNative, then its file's whole-file load
+(nlAbortEntireFileLoad), without their callbacks. The port cancels only
+reads into memory the rollback restores, started by a step or a task the
+replay runs again, which starts them again; it leaves the audio's streams
+alone.
+
+Without RECHARGED_ROLLBACK_TEST or RECHARGED_ROLLBACK nothing changes.
+
+diff --git a/include/mscharged_rollback.h b/include/mscharged_rollback.h
+--- a/include/mscharged_rollback.h
++++ b/include/mscharged_rollback.h
+@@ -53,6 +53,15 @@
+ void mscharged_rollback_file_opened(const char* path, long entry);
+ void mscharged_rollback_read_started(long entry, const void* buffer, unsigned long bytes);
+ #endif
++#if defined(MSCHARGED_TWEAKS)
++// The game's: the disc reads under way, each by where its bytes go and how
++// many (at most capacity; returns how many there are), and their
++// cancellation before a rollback goes back before them, for those `cancel`
++// accepts: each stops as a failed read does, its file's whole-file load
++// released, without its callbacks. The replay starts it again.
++int mscharged_rollback_reads_under_way(const void** buffers, unsigned long* bytes, int capacity);
++int mscharged_rollback_cancel_reads(int (*cancel)(const void* buffer, unsigned long bytes));
++#endif
+ // The inputs applied for the step about to run.
+ void mscharged_rollback_inputs_applied(const struct MschargedRollbackInputs* inputs);
+ // Between two fixed steps of a match, where the rollback saves the match and
+diff --git a/src/NL/nlFileGC.cpp b/src/NL/nlFileGC.cpp
+--- a/src/NL/nlFileGC.cpp
++++ b/src/NL/nlFileGC.cpp
+@@ -695,6 +695,76 @@
+     return 2;
+ }
+ #endif
++#if defined(MSCHARGED_TWEAKS)
++// The reads under way, by their first entries: a head and its tail are one
++// read of the caller's buffer.
++static int mscharged_rollback_read_heads(AsyncEntry** heads, unsigned long* bytes, int capacity)
++{
++    int count = 0;
++    AsyncEntry* entry = s_pAsyncManager ? nlDLRingGetStart(s_pAsyncManager->m_activeEntryList) : 0;
++    if (entry == 0)
++    {
++        return 0;
++    }
++    do
++    {
++        if (entry->Phase != READ_TAIL)
++        {
++            unsigned long size = entry->m_uSize;
++            AsyncEntry* next = entry->m_next;
++            if (entry->Phase == READ_HEAD && next != entry && next->Phase == READ_TAIL
++                && next->m_pFile == entry->m_pFile)
++            {
++                size += next->m_uSize;
++            }
++            if (count < capacity)
++            {
++                heads[count] = entry;
++                bytes[count] = size;
++            }
++            ++count;
++        }
++        entry = entry->m_next;
++    } while (!nlDLRingIsStart(s_pAsyncManager->m_activeEntryList, entry));
++    return count;
++}
++
++int mscharged_rollback_reads_under_way(const void** buffers, unsigned long* bytes, int capacity)
++{
++    AsyncEntry* heads[64];
++    unsigned long sizes[64];
++    const int count = mscharged_rollback_read_heads(heads, sizes, 64);
++    for (int i = 0; i < count && i < 64 && i < capacity; ++i)
++    {
++        buffers[i] = heads[i]->m_pBuffer;
++        bytes[i] = sizes[i];
++    }
++    return count;
++}
++
++int mscharged_rollback_cancel_reads(int (*cancel)(const void* buffer, unsigned long bytes))
++{
++    AsyncEntry* heads[64];
++    unsigned long sizes[64];
++    const int count = std::min(mscharged_rollback_read_heads(heads, sizes, 64), 64);
++    int cancelled = 0;
++    for (int i = 0; i < count; ++i)
++    {
++        // As a failed read: the request, then its file's whole-file owner.
++        if (!s_pAsyncManager->Contains(heads[i]) || !cancel(heads[i]->m_pBuffer, sizes[i]))
++        {
++            continue;
++        }
++        DolphinFile* file = heads[i]->m_pFile;
++        if (s_pAsyncManager->CancelNative(heads[i], 0))
++        {
++            nlAbortEntireFileLoad(file);
++            ++cancelled;
++        }
++    }
++    return cancelled;
++}
++#endif
+ 
+ void nlInitFileSystem()
+ {

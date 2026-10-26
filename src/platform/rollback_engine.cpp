@@ -35,8 +35,11 @@
 // them.
 //
 // A rollback is skipped when a disc read into the game's memory was in flight
-// or started, or the game or task state changed, in the steps it would undo
-// (their completion, presentation and loading went into memory it restores).
+// at the save it goes back to (the restore takes back what the read wrote
+// until then), or a read under way since is not one a step or a task its
+// replay runs again started (tweak patch 0044); those are cancelled, and the
+// replay starts them again. In the test, it is also skipped when the game or
+// task state changed in the steps it would undo.
 // Tracking stops when no step comes for a quarter of a second (pause, end of
 // match).
 //
@@ -123,7 +126,6 @@ void RecordFrame(Step& step)
     step.timeScale = FixedUpdateTask::GetTargetTimeScale();
     const auto producers = mscharged::platform::CurrentGameByteProducers();
     step.reading = producers.pending != 0;
-    step.readsStarted = producers.started;
 }
 
 // In the log, as a step first ran or replayed: a change of the target time
@@ -411,23 +413,24 @@ void ReplayFrames(std::uint64_t first, std::uint64_t last, int firstTask, int la
 }
 
 // Why a rollback cannot go back to `target`, or null when it can: a disc
-// read in flight or started since (its completion went into memory a restore
-// takes back), more frames than are kept, or (in the test) a change of the
-// game's or tasks' state, or more events than a step keeps.
+// read in flight at its save (the restore takes back what the read wrote
+// until then, and the read goes on), one under way since that the rollback
+// cannot cancel (ReadsCancellable; those it can, it cancels, and the replay
+// starts them again), more frames than are kept, or (in the test) a change
+// of the game's or tasks' state, or more events than a step keeps.
 const char* CannotRollBack(unsigned target)
 {
     State& s = *sState;
-    // The end of the last step's frame counts as well.
-    const auto producers = mscharged::platform::CurrentGameByteProducers();
-    if (producers.pending)
+    if (s.steps[target % kRing].reading)
     {
         ++s.stats.skippedReads;
         return "a disc read in flight";
     }
-    if (producers.started != s.steps[target % kRing].readsStarted)
+    // The end of the last step's frame counts as well.
+    if (mscharged::platform::CurrentGameByteProducers().pending && !ReadsCancellable())
     {
         ++s.stats.skippedStarts;
-        return "a disc read started";
+        return "a disc read its replay would not start again";
     }
     if (!s.options.netplay && !(CurrentPhases() == s.steps[s.latest % kRing].phases))
     {
@@ -442,16 +445,6 @@ const char* CannotRollBack(unsigned target)
     for (unsigned f = target; f <= s.latest; ++f)
     {
         const Step& step = s.steps[f % kRing];
-        if (step.reading)
-        {
-            ++s.stats.skippedReads;
-            return "a disc read in flight";
-        }
-        if (step.readsStarted != s.steps[target % kRing].readsStarted)
-        {
-            ++s.stats.skippedStarts;
-            return "a disc read started";
-        }
         if (!s.options.netplay && !(step.phases == s.steps[s.latest % kRing].phases))
         {
             ++s.stats.skippedPhases;
@@ -491,6 +484,7 @@ bool RollBack(unsigned target, unsigned replayEnd, int (*replay)(const Mscharged
     const bool compare = s.options.compareEvery && s.compare.places && (s.stats.rollbacks + 1) % s.options.compareEvery == 0 && CopyForCompare();
     const std::uint64_t start = NowNs();
     const Step& from = s.steps[target % kRing];
+    if (mscharged::platform::CurrentGameByteProducers().pending) CancelReads();
     if (!mscharged::platform::RestoreRollbackSnapshot(from.snapshot))
     {
         ++s.stats.failedRestores;
@@ -775,9 +769,10 @@ extern "C" void mscharged_rollback_read_started(long entry, const void* buffer, 
 {
     if (!Running()) return;
     State& s = *sState;
-    s.reads[s.readCount++ % kReadsSeen] = {buffer, bytes, entry};
-    if (!s.active || !s.out) return;
     const int task = s.runningTask - 1;
+    const bool replayed = s.resimulating || (task >= 0 && task < s.tasks.count && s.tasks.replays[task] != kSkip);
+    s.reads[s.readCount++ % kReadsSeen] = {buffer, bytes, entry, replayed};
+    if (!s.active || !s.out) return;
     const char* name = task >= 0 && task < s.tasks.count ? s.tasks.list[task]->GetName() : nullptr;
     auto* fixed = static_cast<FixedUpdateTask*>(s.tasks.list[fixedIndexOf()]);
     Log("frame %llu, %s, in %s (fixed update at %d, last step saved %u%s): reads %s, %lu bytes at %p\n",
@@ -813,6 +808,76 @@ void LogReadsUnderWay()
         Log("  under way: %zu bytes at %p (allocation %p, %zu bytes): %s\n", writes[i].bytes, writes[i].address,
             writes[i].allocation, writes[i].allocationBytes, path);
     }
+}
+
+namespace
+{
+// The last read started into `buffer`, or null.
+const State::ReadSeen* SeenRead(const void* buffer)
+{
+    const State& s = *sState;
+    for (unsigned n = 0; n < kReadsSeen && n < s.readCount; ++n)
+    {
+        const State::ReadSeen& read = s.reads[(s.readCount - 1 - n) % kReadsSeen];
+        if (read.buffer == buffer) return &read;
+    }
+    return nullptr;
+}
+
+int CancelRestored(const void* buffer, unsigned long)
+{
+    return !Excluded(reinterpret_cast<std::uintptr_t>(buffer));
+}
+} // namespace
+
+// Whether a rollback may cancel every write under way that it would take
+// back: each must be a disc read into memory it restores, started by a step
+// or a task its replay runs again (which starts the read again). Those into
+// memory it leaves alone (the audio's streams) go on.
+bool ReadsCancellable()
+{
+    mscharged::platform::GamePendingByteWrite writes[64];
+    const std::size_t count = mscharged::platform::ListGamePendingByteWrites(writes, 64);
+    const void* buffers[64];
+    unsigned long bytes[64];
+    const int reads = mscharged_rollback_reads_under_way(buffers, bytes, 64);
+    if (count > 64 || reads > 64) return false;
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        if (!writes[i].counted) continue;
+        const auto address = reinterpret_cast<std::uintptr_t>(writes[i].address);
+        bool covered = false;
+        for (int r = 0; r < reads && !covered; ++r)
+        {
+            const auto start = reinterpret_cast<std::uintptr_t>(buffers[r]);
+            if (address < start || address >= start + std::max<unsigned long>(bytes[r], 1)) continue;
+            const State::ReadSeen* read = SeenRead(buffers[r]);
+            covered = CancelRestored(buffers[r], bytes[r]) && read && read->replayed;
+        }
+        if (!covered) return false;
+    }
+    return true;
+}
+
+// Before a rollback goes back before them (ReadsCancellable): the reads
+// under way into memory it restores stop, and the replay starts them again.
+void CancelReads()
+{
+    State& s = *sState;
+    if (s.out)
+    {
+        const void* buffers[64];
+        unsigned long bytes[64];
+        const int reads = std::min(mscharged_rollback_reads_under_way(buffers, bytes, 64), 64);
+        for (int r = 0; r < reads; ++r)
+            if (CancelRestored(buffers[r], bytes[r]))
+            {
+                const State::ReadSeen* read = SeenRead(buffers[r]);
+                Log("  read cancelled: %lu bytes at %p: %s\n", bytes[r], buffers[r],
+                    read ? PathOf(read->entry) : "no read seen");
+            }
+    }
+    s.stats.readsCancelled += static_cast<std::uint64_t>(mscharged_rollback_cancel_reads(CancelRestored));
 }
 } // namespace mscharged::rollback
 

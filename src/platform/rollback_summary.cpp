@@ -67,11 +67,13 @@ void WriteSummary()
                        "pages written behind the tracking %llu\n",
                  static_cast<unsigned long long>(s.stats.failedRestores), static_cast<unsigned long long>(s.stats.nisInReplay),
                  static_cast<unsigned long long>(s.stats.lossyFrees), static_cast<unsigned long long>(s.stats.untracked));
-    std::fprintf(file, "skipped: disc read in flight %llu, disc read started %llu, game or task state change %llu, "
-                       "too many events %llu, too few steps saved %llu\n",
+    std::fprintf(file, "skipped: disc read in flight %llu, disc read the replay would not start again %llu, game or task "
+                       "state change %llu, too many events %llu, too few steps saved %llu; disc reads cancelled for the "
+                       "replay to start again %llu\n",
                  static_cast<unsigned long long>(s.stats.skippedReads), static_cast<unsigned long long>(s.stats.skippedStarts),
                  static_cast<unsigned long long>(s.stats.skippedPhases),
-                 static_cast<unsigned long long>(s.stats.skippedEvents), static_cast<unsigned long long>(s.stats.skippedShort));
+                 static_cast<unsigned long long>(s.stats.skippedEvents), static_cast<unsigned long long>(s.stats.skippedShort),
+                 static_cast<unsigned long long>(s.stats.readsCancelled));
     std::fprintf(file, "mega strike meter presses received %llu, given again in replays %llu\n",
                  static_cast<unsigned long long>(s.stats.meterReceived), static_cast<unsigned long long>(s.stats.meterRedelivered));
     if (h.saves)

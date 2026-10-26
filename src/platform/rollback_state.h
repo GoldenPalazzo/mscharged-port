@@ -115,7 +115,7 @@ constexpr int kMaxInputDelay = 6;        // RECHARGED_ROLLBACK: steps, while pre
 constexpr int kMaxLockstepDelay = 10;    // RECHARGED_ROLLBACK: steps, in a phase without prediction
 constexpr int kAccelHysteresis = 6;
 constexpr int kFileNames = 512;          // files opened whose paths the log names reads by
-constexpr int kReadsSeen = 64;           // reads started whose files the log names writes under way by
+constexpr int kReadsSeen = 256;          // reads started: their files, and whether a replay starts them again
 
 // The parts of a machine's inputs a misprediction can get wrong: the fields of
 // PackedDetInput (include/Game/PackedDetInput.h), the player states, the
@@ -183,7 +183,6 @@ struct Step
     Phases phases;                  // after it
     float timeScale;                // the fixed update's target time scale after it (below 1: a slow motion)
     bool reading;                   // a disc read in flight after it
-    std::uint64_t readsStarted;     // disc reads started until then
     std::uint64_t hostFrame;        // the frame it ran in
     // The mega strike meter's presses received from the shooter's machine
     // before it, outside the router's inputs.
@@ -298,7 +297,7 @@ struct Stats
 {
     int starts;
     std::uint64_t stepCount, rollbacks, byDepth[kMaxDepth + 1], replayed;
-    std::uint64_t skippedReads, skippedStarts, skippedPhases, skippedEvents, skippedShort;
+    std::uint64_t skippedReads, skippedStarts, skippedPhases, skippedEvents, skippedShort, readsCancelled;
     std::uint64_t meterReceived, meterRedelivered, framesReplayed, framesMerged;
     std::uint64_t mismatches, nisInReplay, lossyFrees, failedRestores, untracked;
     unsigned firstMismatchFrame;
@@ -432,6 +431,7 @@ struct State
         const void* buffer;
         unsigned long bytes;
         long entry;
+        bool replayed;               // started by a step or a task a replay runs again
     } reads[kReadsSeen];
     unsigned readCount;
     unsigned replayEnd;              // the last step a replay runs
@@ -473,6 +473,8 @@ FrameRecord& Frame(std::uint64_t frame);
 int fixedIndexOf();
 void Stop(const char* why);
 void LogReadsUnderWay();
+bool ReadsCancellable();
+void CancelReads();
 bool RollBack(unsigned target, unsigned replayEnd, int (*replay)(const MschargedRollbackInputs*),
               unsigned (*checksum)(void));
 

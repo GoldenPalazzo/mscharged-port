@@ -44,10 +44,10 @@ bool AnyPredicted(const StepInputs& inputs)
 // that arrived made a goal, say): the replay ends with it, and the steps after
 // it run again when their inputs have all arrived. A step with inputs still
 // predicted does not change the phase either, and is undone as well, unless a
-// disc read was in flight at the save before it or started since: a restore
-// would take back the read's reservation (its completion then fails) or what
-// it wrote, so the step is kept, and a misprediction in it can no longer be
-// corrected.
+// disc read was in flight at the save before it, or one under way since is
+// one the rollback cannot cancel (ReadsCancellable): the step is kept, and a
+// misprediction in it can no longer be corrected. Those it can, it cancels,
+// and the steps run again start them again.
 void StopReplayAt(unsigned frame)
 {
     State& s = *sState;
@@ -58,16 +58,17 @@ void StopReplayAt(unsigned frame)
         return;
     }
     const Step& before = s.steps[(frame - 1) % kRing];
-    const Step& step = s.steps[frame % kRing];
-    if (before.reading || step.readsStarted != before.readsStarted)
+    const bool underWay = mscharged::platform::CurrentGameByteProducers().pending != 0;
+    if (before.reading || (underWay && !ReadsCancellable()))
     {
         s.replayEnd = frame;
         ++s.net.truncated;
         Log("KEPT PREDICTED FRAME %u: a disc read %s; a misprediction now desyncs\n",
-                frame, before.reading ? "in flight" : "started");
+                frame, before.reading ? "in flight" : "its replay would not start again");
         LogReadsUnderWay();
         return;
     }
+    if (underWay) CancelReads();
     if (!mscharged::platform::RestoreRollbackSnapshot(before.snapshot))
     {
         ++s.stats.failedRestores;
@@ -322,7 +323,8 @@ namespace
 {
 // Whether step `frame` may run with predicted inputs: the rollback follows the
 // match and could go back before the oldest step predicted, through as many
-// frames as it keeps and without a disc read in between.
+// frames as it keeps, to saves without a disc read in flight, and cancel the
+// reads under way (ReadsCancellable).
 bool CanPredict(unsigned frame)
 {
     State& s = *sState;
@@ -337,8 +339,9 @@ bool CanPredict(unsigned frame)
     if (frame - target > static_cast<unsigned>(kMaxDepth)) return false;
     const Step& from = s.steps[target % kRing];
     if (from.frame != target || s.hostFrame - from.hostFrame >= kFrameRing - 2) return false;
-    const auto producers = mscharged::platform::CurrentGameByteProducers();
-    return !producers.pending && producers.started == from.readsStarted;
+    for (unsigned f = target; f <= s.latest; ++f)
+        if (s.steps[f % kRing].reading) return false;
+    return !mscharged::platform::CurrentGameByteProducers().pending || ReadsCancellable();
 }
 } // namespace
 
